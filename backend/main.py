@@ -1,3 +1,4 @@
+from flask_cors import CORS
 from flask import Flask, jsonify
 from config import Config
 from api.health_routes import health_bp
@@ -8,6 +9,7 @@ from core.auth import generate_token
 
 def create_app():
     app = Flask(__name__)
+    CORS(app)
     app.config.from_object(Config)
     init_sqlite()
     init_chroma()

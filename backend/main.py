@@ -1,9 +1,10 @@
-from flask import Flask
+from flask import Flask, jsonify
 from config import Config
 from api.health_routes import health_bp
 from api.chat_routes import chat_bp
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
+from core.auth import generate_token
 
 def create_app():
     app = Flask(__name__)
@@ -12,6 +13,11 @@ def create_app():
     init_chroma()
     app.register_blueprint(health_bp)
     app.register_blueprint(chat_bp)
+
+    @app.route("/token", methods=["GET"])
+    def token():
+        return jsonify({"token": generate_token()})
+
     return app
 
 if __name__ == "__main__":

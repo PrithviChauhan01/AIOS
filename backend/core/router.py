@@ -1,4 +1,5 @@
 from groq import Groq
+from cerebras.cloud.sdk import Cerebras
 from config import Config
 
 SYSTEM_PROMPT = """You are AIOS — a personal AI operating system built exclusively for Prithvi.
@@ -30,7 +31,24 @@ EXECUTION
 - Do not narrate your process unless asked.
 - One sentence from Prithvi should be enough for any task."""
 
-client = Groq(api_key=Config.GROQ_API_KEY)
+groq_client = Groq(api_key=Config.GROQ_API_KEY)
+cerebras_client = Cerebras(api_key=Config.CEREBRAS_API_KEY)
+
+def _try_groq(messages):
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        max_tokens=1024
+    )
+    return response.choices[0].message.content, response.usage.total_tokens, "groq"
+
+def _try_cerebras(messages):
+    response = cerebras_client.chat.completions.create(
+        model="qwen-3-32b",
+        messages=messages,
+        max_tokens=1024
+    )
+    return response.choices[0].message.content, response.usage.total_tokens, "cerebras"
 
 def chat(message: str, history: list = []) -> dict:
     from core.profile import get_relevant_facts
@@ -43,17 +61,20 @@ def chat(message: str, history: list = []) -> dict:
     messages += history
     messages.append({"role": "user", "content": message})
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        max_tokens=1024
-    )
-
-    reply = response.choices[0].message.content
-    tokens = response.usage.total_tokens
+    for provider_fn in [_try_groq, _try_cerebras]:
+        try:
+            reply, tokens, provider = provider_fn(messages)
+            return {
+                "response": reply,
+                "provider_used": provider,
+                "tokens_used": tokens
+            }
+        except Exception as e:
+            print(f"[router] {provider_fn.__name__} failed: {e}")
+            continue
 
     return {
-        "response": reply,
-        "provider_used": "groq",
-        "tokens_used": tokens
+        "response": "All providers unavailable, Sir.",
+        "provider_used": "none",
+        "tokens_used": 0
     }

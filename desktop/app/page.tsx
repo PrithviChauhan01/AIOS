@@ -66,6 +66,23 @@ export default function Home() {
         <span className="text-xs tracking-widest text-zinc-500 uppercase">AIOS</span>
       </div>
 
+      <div className="border-b border-zinc-800 px-6 py-4 flex gap-3">
+        <input
+          className="flex-1 bg-zinc-900 text-white text-sm px-4 py-2 rounded outline-none placeholder-zinc-600"
+          placeholder="Speak..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          autoFocus
+        />
+        <button
+          onClick={send}
+          className="text-xs text-zinc-500 hover:text-white transition px-3"
+        >
+          Send
+        </button>
+      </div>
+
       <div className="flex-1 overflow-y-auto px-6 py-6 space-y-4">
         {messages.map((m, i) => (
           <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
@@ -85,23 +102,6 @@ export default function Home() {
           <div className="text-zinc-600 text-sm">...</div>
         )}
         <div ref={bottomRef} />
-      </div>
-
-      <div className="border-t border-zinc-800 px-6 py-4 flex gap-3">
-        <input
-          className="flex-1 bg-zinc-900 text-white text-sm px-4 py-2 rounded outline-none placeholder-zinc-600"
-          placeholder="Speak..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          autoFocus
-        />
-        <button
-          onClick={send}
-          className="text-xs text-zinc-500 hover:text-white transition px-3"
-        >
-          Send
-        </button>
       </div>
     </main>
   );

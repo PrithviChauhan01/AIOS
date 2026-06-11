@@ -24,3 +24,12 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Hide the Next.js dev tools indicator (the "N" badge / circle) */
+[data-next-badge-root],
+[data-next-badge],
+[data-nextjs-dev-tools-button],
+#__next-dev-overlay-root,
+#__next-build-watcher {
+  display: none !important;
+}

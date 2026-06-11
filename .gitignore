@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+backend/db/aios.db
+backend/db/chroma/
+node_modules/
+.next/
+.DS_Store

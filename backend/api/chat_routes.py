@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from core.router import chat
 from core.memory import save_message, get_history
+from core.profile import store_fact
 
 chat_bp = Blueprint("chat", __name__)
 
@@ -9,6 +10,12 @@ def chat_endpoint():
     data = request.get_json()
     message = data.get("message", "")
     session_id = data.get("session_id", "default")
+    fact = data.get("fact", None)        # optional: caller can flag a fact to store
+    category = data.get("category", "general")
+
+    # Store explicit fact if provided
+    if fact:
+        store_fact(fact, category)
 
     history = get_history(session_id)
     result = chat(message, history)

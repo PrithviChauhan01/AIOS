@@ -1,8 +1,9 @@
-flask==3.0.3
-flask-cors==4.0.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
 python-dotenv==1.0.1
 pyjwt==2.8.0
-gunicorn==22.0.0
 chromadb==0.5.3
 requests==2.32.3
 pydantic==2.7.4
+groq
+cerebras-cloud-sdk

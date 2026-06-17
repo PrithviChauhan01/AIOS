@@ -1,8 +1,10 @@
 import jwt
 import datetime
-from functools import wraps
-from flask import request, jsonify
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from config import Config
+
+_bearer = HTTPBearer(auto_error=False)
 
 def generate_token() -> str:
     payload = {
@@ -12,17 +14,26 @@ def generate_token() -> str:
     }
     return jwt.encode(payload, Config.JWT_SECRET, algorithm="HS256")
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not token:
-            return jsonify({"error": "No token"}), 401
-        try:
-            jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Token expired"}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({"error": "Invalid token"}), 401
-        return f(*args, **kwargs)
-    return decorated
+def require_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> dict:
+    """FastAPI dependency: validates the Bearer JWT and returns its payload.
+
+    Apply with `dependencies=[Depends(require_auth)]` on a route or router,
+    or inject as a parameter to access the decoded payload.
+    """
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="No token"
+        )
+    token = credentials.credentials
+    try:
+        return jwt.decode(token, Config.JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired"
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )

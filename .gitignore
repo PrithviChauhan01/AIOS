@@ -8,3 +8,7 @@ backend/db/chroma/
 node_modules/
 .next/
 .DS_Store
+*.onnx
+*.bin
+backend/kokoro-v1.0.onnx
+backend/voices-v1.0.bin

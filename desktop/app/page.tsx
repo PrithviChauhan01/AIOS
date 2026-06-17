@@ -1,9 +1,25 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
 
+type Mood = "warm" | "neutral" | "sharp" | "soft";
+
 interface Message {
   role: "user" | "aios";
   content: string;
+  mood?: Mood;
+}
+
+// Subtle per-mood tint for AIOS messages — thin left border + faint glow.
+// Kept dark and minimal so it reads as a hint, not a highlight.
+const MOOD_STYLES: Record<Mood, string> = {
+  warm: "border-amber-500/60 shadow-[-4px_0_12px_-6px_rgba(245,158,11,0.5)]",
+  neutral: "border-zinc-700",
+  sharp: "border-red-500/60 shadow-[-4px_0_12px_-6px_rgba(239,68,68,0.5)]",
+  soft: "border-blue-500/60 shadow-[-4px_0_12px_-6px_rgba(59,130,246,0.5)]",
+};
+
+function moodStyle(mood?: Mood): string {
+  return MOOD_STYLES[mood ?? "neutral"];
 }
 
 export default function Home() {
@@ -13,6 +29,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [onboardingQuestion, setOnboardingQuestion] = useState("");
   const [awaitingOnboarding, setAwaitingOnboarding] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -42,16 +59,17 @@ export default function Home() {
         message: userMsg,
         session_id: "main",
         onboarding_answer: awaitingOnboarding,
+        voice: voiceEnabled,
       }),
     });
 
     const data = await res.json();
-    setMessages((m) => [...m, { role: "aios", content: data.response }]);
+    setMessages((m) => [...m, { role: "aios", content: data.response, mood: data.mood }]);
 
     if (data.onboarding_question) {
       setOnboardingQuestion(data.onboarding_question);
       setAwaitingOnboarding(true);
-      setMessages((m) => [...m, { role: "aios", content: data.onboarding_question }]);
+      setMessages((m) => [...m, { role: "aios", content: data.onboarding_question, mood: data.mood }]);
     } else {
       setAwaitingOnboarding(false);
       setOnboardingQuestion("");
@@ -62,8 +80,32 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-black text-white flex flex-col">
-      <div className="border-b border-zinc-800 px-6 py-4">
+      <div className="border-b border-zinc-800 px-6 py-4 flex items-center justify-between">
         <span className="text-xs tracking-widest text-zinc-500 uppercase">AIOS</span>
+        <button
+          onClick={() => setVoiceEnabled((v) => !v)}
+          aria-pressed={voiceEnabled}
+          title={voiceEnabled ? "Voice on" : "Voice off"}
+          className={`transition ${
+            voiceEnabled ? "text-white" : "text-zinc-600 hover:text-zinc-400"
+          }`}
+        >
+          {voiceEnabled ? (
+            // speaker with sound waves
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+              <path d="M19 5a9 9 0 0 1 0 14" />
+            </svg>
+          ) : (
+            // muted speaker
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <line x1="22" y1="9" x2="16" y2="15" />
+              <line x1="16" y1="9" x2="22" y2="15" />
+            </svg>
+          )}
+        </button>
       </div>
 
       <div className="border-b border-zinc-800 px-6 py-4 flex gap-3">
@@ -89,7 +131,7 @@ export default function Home() {
             <div className={`max-w-xl px-4 py-2 rounded text-sm ${
               m.role === "user"
                 ? "bg-zinc-800 text-white"
-                : "text-zinc-300"
+                : `text-zinc-300 border-l-2 ${moodStyle(m.mood)}`
             }`}>
               {m.role === "aios" && (
                 <span className="text-xs text-zinc-600 mr-2 uppercase tracking-widest">AIOS</span>

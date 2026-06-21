@@ -12,3 +12,4 @@ node_modules/
 *.bin
 backend/kokoro-v1.0.onnx
 backend/voices-v1.0.bin
+backend/privacy.local

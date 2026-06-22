@@ -3,10 +3,8 @@ from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from core.router import chat
-from core.memory import save_message, get_history
+from core.orchestrator import handle_message
 from core.profile import store_fact
-from core.extractor import extract_and_store
 from core.onboarding import get_next_question, get_pending_question, record_question
 
 router = APIRouter()
@@ -29,8 +27,8 @@ class ChatResponse(BaseModel):
     onboarding_question: Optional[str] = None
 
 
-def _handle_chat(data: ChatRequest) -> dict:
-    """Synchronous chat turn — identical logic to the Flask endpoint."""
+@router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
+async def chat_endpoint(data: ChatRequest):
     if data.fact:
         store_fact(data.fact, data.category)
 
@@ -39,29 +37,26 @@ def _handle_chat(data: ChatRequest) -> dict:
         record_question(pending, data.message)
         store_fact(f"{pending} — {data.message}", "preference")
 
-    history = get_history(data.session_id)
-    result = chat(data.message, history)
+    # Orchestrator owns history load, the LLM chain, save_message and fact extraction.
+    # voice_flag=False so it does NOT speak — we speak here, where mood + onboarding live.
+    result = await handle_message(data.message, data.session_id, voice_flag=False)
 
-    save_message(data.session_id, "user", data.message)
-    save_message(data.session_id, "assistant", result["response"])
+    response = {
+        "response": result["response"],
+        "mood": result["mood"],
+        "provider_used": result["provider_used"],
+        "tokens_used": result.get("tokens_used", result.get("tokens", 0)),
+    }
 
-    extract_and_store(data.message, result["response"])
-
-    # Speak response if voice requested
+    # Speak response if voice requested (blocking — keep off the event loop).
     if data.voice:
         from voice.speaker import speak
-        speak(result["response"], result.get("mood", "neutral"))
+        await run_in_threadpool(speak, response["response"], response["mood"])
 
     # Append onboarding question if active
     next_question = get_next_question()
     if next_question:
         record_question(next_question, "")
-        result["onboarding_question"] = next_question
+        response["onboarding_question"] = next_question
 
-    return result
-
-
-@router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
-async def chat_endpoint(data: ChatRequest):
-    # Core logic is blocking (network + DB), so run it off the event loop.
-    return await run_in_threadpool(_handle_chat, data)
+    return response

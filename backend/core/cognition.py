@@ -54,8 +54,12 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
     message = ctx.get("message") or ctx.get("query", "")
 
     # her_memory_of_user — core personal memory (mem_core == the existing
-    # long_term_memory store, read via profile.get_relevant_facts)
-    facts = get_relevant_facts(message)
+    # long_term_memory store, read via profile.get_relevant_facts).
+    # Retrieval guard: if this turn will be answered on a cloud book, only public
+    # facts may be injected. secret turns run local (ollama), so private is allowed
+    # there. The cloud guard must hold regardless — default to the safe side.
+    cloud_bound = ctx.get("sensitivity") != "secret"
+    facts = get_relevant_facts(message, cloud_bound=cloud_bound)
     memory_block = "(nothing relevant)"
     if facts:
         memory_block = "\n".join(f"- {f}" for f in facts)
@@ -139,9 +143,10 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # Persist the turn + mine durable facts — same path /chat uses, off the loop.
     message = ctx.get("message") or ctx.get("query", "")
     session_id = ctx.get("session_id", "default")
+    tier = ctx.get("sensitivity", "public")  # secret → extractor vaults, no cloud
     await asyncio.to_thread(save_message, session_id, "user", message)
     await asyncio.to_thread(save_message, session_id, "assistant", response)
-    await asyncio.to_thread(extract_and_store, message, response)
+    await asyncio.to_thread(extract_and_store, message, response, tier)
 
     return {
         "response": response,

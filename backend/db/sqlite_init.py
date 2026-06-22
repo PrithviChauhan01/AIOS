@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS onboarding (
     asked_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
     week            INTEGER DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS vault (
+    id          TEXT PRIMARY KEY,
+    content     BLOB NOT NULL,
+    meta        TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 def init_sqlite():

@@ -20,6 +20,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    Config.validate()  # fail closed on a weak JWT_SECRET before anything serves
     app = FastAPI(title="AIOS", lifespan=lifespan)
 
     app.add_middleware(

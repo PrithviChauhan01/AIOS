@@ -61,7 +61,7 @@ def _try_groq(messages):
 
 def _try_cerebras(messages):
     response = cerebras_client.chat.completions.create(
-        model="qwen-3-32b",
+        model="gpt-oss-120b",
         messages=messages,
         max_tokens=1024
     )

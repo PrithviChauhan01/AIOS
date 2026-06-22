@@ -54,7 +54,7 @@ Format:
 Rules:
 - sensitivity: secret = IDs/financial/passwords. private = personal/health/journal/relationships. public = everything else.
 - complexity: trivial = greetings/thanks. simple = quick factual. complex = needs real reasoning/multi-step.
-- domain: study = learning/exams/concepts/notes. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = journal/meditation/mood. kitchen = food/recipes. life = schedule/habits/reminders. none = general chat.
+- domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. kitchen = food/recipes. life = schedule/habits/reminders. none = general chat. You MUST pick a domain from this list only — never invent a new one.
 - loop_worthy: true only if complex AND quality matters.
 
 JSON only."""

@@ -1,3 +1,4 @@
+import os
 import uuid
 
 from core.triage import triage
@@ -5,11 +6,13 @@ from core.memory import get_history
 from core.cognition import cognition_pass
 from core.looper import run_looper
 from agents.leadgen import LeadgenTeacher
+from agents.study import StudyTeacher
 
-# Domain → Teacher. Only leadgen exists so far; unknown domains fall through to
-# the short-circuit path (cognition handles them herself, no teacher).
+# Domain → Teacher. Unknown domains fall through to the short-circuit path
+# (cognition handles them herself, no teacher).
 TEACHERS = {
     "leadgen": LeadgenTeacher,
+    "study": StudyTeacher,
 }
 
 
@@ -41,6 +44,8 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     complexity = ctx["complexity"]
     domain = ctx["domain"]
     loop_worthy = ctx["loop_worthy"]
+
+    dossier_text = None  # the detailed structured material, if a teacher produced one
 
     # ── ROUTING ──
     if sensitivity == "secret":
@@ -77,10 +82,34 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
                 material = teach
                 _log(trace_id, "looper", "skipped (not loop_worthy)")
 
+            # Keep the detailed dossier text for a possible file export (NOT cognition's
+            # trimmed chat framing).
+            dossier_text = material if isinstance(material, str) else teach["raw_text"]
+
             # ── [6] COGNITION — her answer ──
             result = await cognition_pass(ctx, material)
 
     _log(trace_id, "cognition", f"provider={result.get('provider_used')} mood={result.get('mood')}")
+
+    # ── EXPORT — on-demand file, only when Sir explicitly asks AND it's a deliverable ──
+    file_path = None
+    low = message.lower()
+    if dossier_text and ctx.get("deliverable") and any(k in low for k in ("pdf", "csv", "export", "download")):
+        fmt = "csv" if "csv" in low else "pdf"  # default pdf
+        export_title = " ".join(message.split()[:6]) or domain
+        try:
+            if fmt == "csv":
+                from tools.csv_gen import make_csv
+                file_path = make_csv(export_title, dossier_text)
+            else:
+                from tools.pdf_gen import make_pdf
+                file_path = make_pdf(export_title, dossier_text)
+            # File replaces the chat dump — short confirmation in her voice, no duplication.
+            result["response"] = f"Done, Sir. Full dossier saved: {os.path.basename(file_path)}."
+            result["mood"] = "neutral"
+            _log(trace_id, "export", f"{fmt} → {file_path}")
+        except Exception as e:
+            _log(trace_id, "export", f"failed: {e}")
 
     # Speak if requested — same path /chat uses.
     if voice_flag:
@@ -97,4 +126,5 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         "domain": domain,
         "sensitivity": sensitivity,
         "trace_id": trace_id,
+        "file_path": file_path,
     }

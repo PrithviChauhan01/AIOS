@@ -54,7 +54,7 @@ Format:
 Rules:
 - sensitivity: secret = IDs/financial/passwords. private = personal/health/journal/relationships. public = everything else.
 - complexity: trivial = greetings/thanks. simple = quick factual. complex = needs real reasoning/multi-step.
-- domain: which area, or none for general chat.
+- domain: study = learning/exams/concepts/notes. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = journal/meditation/mood. kitchen = food/recipes. life = schedule/habits/reminders. none = general chat.
 - loop_worthy: true only if complex AND quality matters.
 
 JSON only."""

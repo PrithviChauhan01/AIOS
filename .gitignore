@@ -13,3 +13,4 @@ node_modules/
 backend/kokoro-v1.0.onnx
 backend/voices-v1.0.bin
 backend/privacy.local
+backend/outputs/

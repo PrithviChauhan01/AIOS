@@ -74,6 +74,24 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
     else:
         material_block = material
 
+    if ctx.get("deliverable"):
+        task_block = (
+            "This is a deliverable for Sir. Open with ONE line in your voice framing it "
+            "(e.g. what this is / your read on it). Then present the material as a CLEAN, "
+            "SCANNABLE STRUCTURED BLOCK — keep the section structure from the raw material "
+            "(headers, fields), do not melt it into a paragraph, do not pad. Tighten and "
+            "format it well; remove filler and any 'unknown' noise that adds nothing. End "
+            "with one line only if a real next step exists. The structure IS the value — "
+            "present it, don't dissolve it."
+        )
+    else:
+        task_block = (
+            "Reason as yourself. Decide how to handle this for Sir, how to present it, whether "
+            "to push back, how to deliver. The material above is input to your thinking, not "
+            "your answer — never hand it back raw, never narrate that you researched it. Speak "
+            "in your own voice, as yourself."
+        )
+
     return f"""{SYSTEM_PROMPT}
 
 ── WHAT YOU KNOW ABOUT SIR (carry quietly, do not recite) ──
@@ -89,10 +107,7 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
 {message}
 
 ── YOUR TASK ──
-Reason as yourself. Decide how to handle this for Sir, how to present it, whether \
-to push back, how to deliver. The material above is input to your thinking, not \
-your answer — never hand it back raw, never narrate that you researched it. Speak \
-in your own voice, as yourself."""
+{task_block}"""
 
 
 async def cognition_pass(ctx: dict, raw_material=None) -> dict:

@@ -22,6 +22,7 @@ class LeadgenTeacher(Teacher):
 
     domain = "leadgen"
     memory_ns = "mem_leadgen"
+    deliverable = True  # lead research is inherently a structured dossier
 
     def required_capability(self, ctx):
         return {"reasoning": "good"}

@@ -65,7 +65,8 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
 
             # ── [3] TEACHER — raw material ──
             teach = await teacher.run(ctx)
-            _log(trace_id, "teacher", f"book={teach.get('book_used')} tokens={teach.get('tokens')}")
+            ctx["deliverable"] = teach.get("deliverable", False)  # let cognition see it
+            _log(trace_id, "teacher", f"book={teach.get('book_used')} tokens={teach.get('tokens')} deliverable={ctx['deliverable']}")
 
             # ── [4/5] LOOPER — conditional quality gate ──
             if loop_worthy:

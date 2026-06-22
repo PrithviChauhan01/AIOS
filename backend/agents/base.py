@@ -12,6 +12,7 @@ class Teacher(ABC):
 
     domain: str = "general"
     memory_ns: str = "long_term_memory"
+    deliverable: bool = False  # True → cognition presents as a structured block, not prose
 
     # ── Subclass contract ──
     @abstractmethod
@@ -60,6 +61,7 @@ class Teacher(ABC):
                 "book_used": result["book_used"],
                 "tokens": result["tokens"],
                 "domain": self.domain,
+                "deliverable": self.deliverable,
                 "self_check": check,
             }
             if check["passes"]:
@@ -74,5 +76,6 @@ class Teacher(ABC):
             "book_used": "none",
             "tokens": 0,
             "domain": self.domain,
+            "deliverable": self.deliverable,
             "self_check": {"passes": False, "feedback": "no book produced output"},
         }

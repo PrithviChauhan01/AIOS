@@ -1,11 +1,12 @@
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from core.orchestrator import handle_message
 from core.profile import store_fact
 from core.onboarding import get_next_question, get_pending_question, record_question
+from core.auth import require_auth
 
 router = APIRouter()
 
@@ -27,7 +28,7 @@ class ChatResponse(BaseModel):
     onboarding_question: Optional[str] = None
 
 
-@router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True)
+@router.post("/chat", response_model=ChatResponse, response_model_exclude_none=True, dependencies=[Depends(require_auth)])
 async def chat_endpoint(data: ChatRequest):
     if data.fact:
         store_fact(data.fact, data.category)

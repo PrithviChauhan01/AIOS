@@ -49,12 +49,13 @@ def _rule_sensitivity(message: str) -> str:
 TRIAGE_PROMPT = """You are a triage classifier. Respond with ONLY a JSON object, nothing else.
 
 Format:
-{"sensitivity": "public|private|secret", "complexity": "trivial|simple|complex", "domain": "none|study|work|leadgen|fitness|spirit|kitchen|life", "loop_worthy": true|false}
+{"sensitivity": "public|private|secret", "complexity": "trivial|simple|complex", "domain": "none|study|work|leadgen|fitness|spirit|brainstorm|life", "loop_worthy": true|false}
 
 Rules:
 - sensitivity: secret = IDs/financial/passwords. private = personal/health/journal/relationships. public = everything else.
 - complexity: trivial = greetings/thanks. simple = quick factual. complex = needs real reasoning/multi-step.
-- domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. kitchen = food/recipes. life = schedule/habits/reminders. none = general chat. You MUST pick a domain from this list only — never invent a new one.
+- domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. brainstorm = discussing/developing ideas, finding directions, next steps, thinking through a problem or strategy. life = schedule/habits/reminders. none = ordinary everyday conversation that needs no specialist and little thinking — casual questions, quick chit-chat, simple how-tos, random one-off asks; the catch-all for anything that isn't a real work/study/fitness/spirit/life/leadgen/brainstorm task; if it's just talk or a trivial ask, it's none. You MUST pick a domain from this list only — never invent a new one.
+- If domain == brainstorm, ALWAYS set sensitivity=secret.
 - loop_worthy: true only if complex AND quality matters.
 
 JSON only."""
@@ -96,6 +97,10 @@ def triage(message: str) -> dict:
                 "domain": parsed.get("domain", "none"),
                 "loop_worthy": bool(parsed.get("loop_worthy", False)),
             })
+            if result["domain"] == "brainstorm":
+                result["sensitivity"] = "secret"
+            if result["sensitivity"] not in _TIER_RANK:
+                result["sensitivity"] = "public"
     except Exception as e:
         print(f"[triage] layer-2 fallback ({e})")
 

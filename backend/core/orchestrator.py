@@ -7,12 +7,22 @@ from core.cognition import cognition_pass
 from core.looper import run_looper
 from agents.leadgen import LeadgenTeacher
 from agents.study import StudyTeacher
+from agents.work import WorkTeacher
+from agents.fitness import FitnessTeacher
+from agents.spirit import SpiritTeacher
+from agents.life import LifeTeacher
+from agents.brainstorm import BrainstormTeacher
 
 # Domain → Teacher. Unknown domains fall through to the short-circuit path
 # (cognition handles them herself, no teacher).
 TEACHERS = {
     "leadgen": LeadgenTeacher,
     "study": StudyTeacher,
+    "work": WorkTeacher,
+    "fitness": FitnessTeacher,
+    "spirit": SpiritTeacher,
+    "life": LifeTeacher,
+    "brainstorm": BrainstormTeacher,
 }
 
 

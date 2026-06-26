@@ -2,15 +2,29 @@ import asyncio
 
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
+from tools.reminders import RemindersTool
 
 # ── THE SHARED POOL — instantiated tools by name. Any teacher draws any tool. ──
 _REGISTRY = {
-    "wikipedia": WikipediaTool(),
+    "wikipedia": WikipediaTool(),   # read-only
+    "reminders": RemindersTool(),   # ACTION — writes state (first of its kind)
 }
 
 
 def get_tool(name: str) -> Tool | None:
     return _REGISTRY.get(name)
+
+
+def is_action_tool(name: str) -> bool:
+    """True if the named tool WRITES state. Actions will later be routed through a
+    confirm gate before execution; read-only tools never need one."""
+    tool = _REGISTRY.get(name)
+    return bool(tool and tool.is_action)
+
+
+def action_tools() -> list:
+    """Names of all state-writing tools in the pool."""
+    return [n for n, t in _REGISTRY.items() if t.is_action]
 
 
 async def fetch_from(names: list, query: str) -> dict:

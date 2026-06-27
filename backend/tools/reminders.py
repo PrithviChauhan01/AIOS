@@ -11,6 +11,7 @@ wraps them so the tool lives in the shared pool (registry) like any other tool,
 and is tagged is_action=True so actions can later route through a confirm gate.
 """
 
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -91,6 +92,17 @@ def _due_is_valid(due_at) -> bool:
 
 
 # ── Connection ──
+def _db_path() -> str:
+    """Absolute path of the SQLite file actually opened. Config.SQLITE_PATH is
+    relative (e.g. './db/aios.db'), so it resolves against the CWD — logging the
+    abspath catches a scheduler-reads-one-db / writer-writes-another mismatch."""
+    return os.path.abspath(Config.SQLITE_PATH)
+
+
+# Print the scheduler's DB path once (on the first tick), not every tick.
+_scheduler_db_logged = False
+
+
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(Config.SQLITE_PATH)
     conn.row_factory = sqlite3.Row
@@ -236,6 +248,8 @@ def set_reminder(title: str, due_at, repeat: str = None) -> dict:
         )
         conn.commit()
         rid = cur.lastrowid
+        # Absolute path proves writer and scheduler open the identical file.
+        print(f"[reminder] WRITE db={_db_path()} id={rid}")
     finally:
         conn.close()
     return {"ok": True, "id": rid, "title": title.strip(), "due_at": due_str,
@@ -296,6 +310,107 @@ def cleanup_reminders() -> list:
     finally:
         conn.close()
     return deleted
+
+
+# ── Firing support (used by core/scheduler.py) ──
+def due_reminders(now: datetime = None) -> list:
+    """Reminders that have come due (due_at <= now) and aren't done yet.
+    Soonest first. String comparison is correct because _DT_FMT sorts.
+
+    Logs every tick: which DB it opened (once), how many pending rows exist
+    before the due filter, and each row's due_at vs now with a DUE/not-yet
+    verdict — so a tick that fires but never matches is immediately visible."""
+    global _scheduler_db_logged
+    now = now or datetime.now()
+    now_str = now.strftime(_DT_FMT)
+
+    if not _scheduler_db_logged:
+        print(f"[reminder] scheduler db={_db_path()}")
+        _scheduler_db_logged = True
+
+    conn = _conn()
+    try:
+        # Pull ALL pending rows (no due filter) so total_pending is honest, then
+        # decide DUE in Python with the same string compare the SQL would use.
+        rows = conn.execute(
+            "SELECT id, title, due_at, repeat, done, created_at FROM reminders "
+            "WHERE done = 0 ORDER BY due_at ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    print(f"[reminder] tick now={now_str} total_pending={len(rows)}")
+    due = []
+    for r in rows:
+        is_due = str(r["due_at"]) <= now_str
+        print(
+            f"[reminder]   row id={r['id']} title={r['title']} "
+            f"due_at={r['due_at']} now={now_str} -> {'DUE' if is_due else 'not-yet'}"
+        )
+        if is_due:
+            due.append(dict(r))
+    return due
+
+
+def reschedule_reminder(id: int, next_due: datetime) -> bool:
+    """Move a recurring reminder's due_at forward. Returns True if updated."""
+    conn = _conn()
+    try:
+        cur = conn.execute(
+            "UPDATE reminders SET due_at = ? WHERE id = ?",
+            (next_due.strftime(_DT_FMT), id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# Bare cadence words → interval. "every N <unit>" is handled by regex below.
+_REPEAT_WORDS = {
+    "minutely": timedelta(minutes=1),
+    "hourly": timedelta(hours=1),
+    "daily": timedelta(days=1),
+    "every day": timedelta(days=1),
+    "weekly": timedelta(weeks=1),
+    "every week": timedelta(weeks=1),
+}
+
+
+def _repeat_interval(repeat):
+    """Parse a repeat phrase → timedelta, or None if it isn't a recognizable
+    cadence. Handles 'daily'/'hourly'/'weekly' and 'every N minutes/hours/days/
+    weeks' (e.g. 'every 20 minutes')."""
+    if not isinstance(repeat, str) or not repeat.strip():
+        return None
+    r = repeat.strip().lower()
+    if r in _REPEAT_WORDS:
+        return _REPEAT_WORDS[r]
+    m = re.search(r"every\s+(\d+)?\s*(minute|min|hour|hr|day|week)s?", r)
+    if m:
+        n = int(m.group(1) or 1)
+        unit = m.group(2)
+        return {
+            "minute": timedelta(minutes=n), "min": timedelta(minutes=n),
+            "hour": timedelta(hours=n), "hr": timedelta(hours=n),
+            "day": timedelta(days=n), "week": timedelta(weeks=n),
+        }[unit]
+    return None
+
+
+def next_occurrence(due_at, repeat, now: datetime = None):
+    """Next due datetime for a recurring reminder, advanced past `now` so the
+    cadence stays anchored to the original time-of-day. Returns None if `repeat`
+    isn't a recognizable cadence (caller then treats the reminder as one-shot)."""
+    interval = _repeat_interval(repeat)
+    if interval is None:
+        return None
+    now = now or datetime.now()
+    nxt = due_at if isinstance(due_at, datetime) else datetime.strptime(due_at, _DT_FMT)
+    nxt += interval
+    while nxt <= now:
+        nxt += interval
+    return nxt
 
 
 # Run directly for the one-off purge: `python -m tools.reminders`

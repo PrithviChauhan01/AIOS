@@ -78,7 +78,18 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
     else:
         material_block = material
 
-    if ctx.get("deliverable"):
+    if ctx.get("action_result") is not None:
+        # The RAW MATERIAL above is the TRUE result of an action that already ran.
+        # She confirms from it — she must not fabricate a success the tool didn't.
+        task_block = (
+            "You just performed a real action for Sir. The RAW MATERIAL above is the "
+            "ACTUAL result — it already happened (the write landed, or it truly did "
+            "not). Confirm it in your voice, minimally and truthfully: name what and "
+            "roughly when in natural language. Invent NOTHING beyond the result. If it "
+            "says the action was NOT done, do not claim success — relay what's needed "
+            "or that nothing matched."
+        )
+    elif ctx.get("deliverable"):
         task_block = (
             "This is a deliverable for Sir. Open with ONE line in your voice framing it "
             "(e.g. what this is / your read on it). Then present the material as a CLEAN, "
@@ -138,9 +149,11 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     tier = ctx.get("sensitivity", "public")  # secret → ollama only (select_book)
 
     # Hard cap on output length, independent of what the model wants to do. A
-    # deliverable earns room for structure; everything else (small-talk, trivial,
-    # short-circuit) is held to a couple of sentences in her voice.
-    max_tokens = 400 if ctx.get("deliverable") else 60
+    # deliverable — or a reminders list, which may run several rows — earns room
+    # for structure; everything else (small-talk, trivial, short-circuit, a one-
+    # line action confirmation) is held to a couple of sentences in her voice.
+    roomy = ctx.get("deliverable") or ctx.get("action") == "list"
+    max_tokens = 400 if roomy else 60
 
     result = None
     for book in select_book(_GEN_SPEC, tier):

@@ -73,11 +73,11 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
-# ── Parsing (PDF / txt / docx) ──
+# ── Parsing (PDF / txt / docx / pptx) ──
 def _parse_file(path: str) -> str:
-    """Extract plain text from a file. PDF via pypdf, docx via python-docx, plain
-    text read directly. Raises ValueError for an unsupported type or a missing
-    parser so save_document can turn it into a clarify, not a crash."""
+    """Extract plain text from a file. PDF via pypdf, docx via python-docx, pptx via
+    python-pptx, plain text read directly. Raises ValueError for an unsupported type
+    or a missing parser so save_document can turn it into a clarify, not a crash."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         try:
@@ -95,6 +95,20 @@ def _parse_file(path: str) -> str:
         except Exception as e:
             raise ValueError(f"DOCX support needs python-docx ({e})")
         return "\n".join(p.text for p in docx.Document(path).paragraphs)
+    if ext == ".pptx":
+        try:
+            from pptx import Presentation
+        except Exception as e:
+            raise ValueError(f"PPTX support needs python-pptx ({e})")
+        parts = []
+        for slide in Presentation(path).slides:
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    parts.append(shape.text_frame.text)
+            notes = slide.notes_slide if slide.has_notes_slide else None
+            if notes is not None and notes.notes_text_frame is not None:
+                parts.append(notes.notes_text_frame.text)
+        return "\n".join(p for p in parts if p)
     raise ValueError(f"unsupported file type {ext or '(none)'}")
 
 
@@ -126,6 +140,13 @@ def _norm_tags(tags) -> str:
     return ",".join(t for t in items if t)
 
 
+def _is_resume(name: str, doc_type: str, tags: str) -> bool:
+    """True if this document is a resume/CV (by type, tag, or name)."""
+    blob = f"{name or ''} {doc_type or ''} {tags or ''}".lower()
+    return (doc_type or "").strip().lower() == "resume" or "resume" in blob \
+        or re.search(r"\bcv\b", blob) is not None
+
+
 def _decide_tier(name: str, doc_type: str, tags: str, text: str) -> str:
     """Decide public/private/secret from the SAME rules triage uses, over both the
     metadata and the parsed content. doc_type in _SECRET_DOC_TYPES forces secret."""
@@ -133,6 +154,11 @@ def _decide_tier(name: str, doc_type: str, tags: str, text: str) -> str:
     tier = _max_tier(_rule_sensitivity(meta), _rule_sensitivity(text))
     if (doc_type or "").strip().lower() in _SECRET_DOC_TYPES:
         tier = "secret"
+    # A resume is personal but NOT secret. Its content (a phone number, etc.) can
+    # trip the secret regex and get it vaulted — which would block the jobs teacher
+    # from matching against it. Keep it embedded (public/private), never secret.
+    if _is_resume(name, doc_type, tags) and tier == "secret":
+        tier = "private"
     return tier
 
 

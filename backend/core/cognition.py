@@ -146,7 +146,21 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     material, is_ensemble = _format_material(raw_material)
     prompt = _build_prompt(ctx, material, is_ensemble)
 
-    tier = ctx.get("sensitivity", "public")  # secret → ollama only (select_book)
+    # ── CLOUD GUARD (covers ALL retrieval: documents, memory, future tools) ──
+    # Any RETRIEVED material injected this turn carries its sensitivity in
+    # ctx["material_tier"]. Per the LLD the cloud guard must filter BOTH private AND
+    # secret: retrieved private/secret content must NEVER reach a cloud book. So we
+    # force the WHOLE pass local (ollama) when it fires — book selection AND the
+    # fact extractor (which is itself a cloud call on the response). This is the one
+    # guard layer; tools only tag ctx["material_tier"], they don't re-route.
+    base_tier = ctx.get("sensitivity", "public")
+    material_tier = ctx.get("material_tier")
+    local_only = base_tier == "secret" or material_tier in ("private", "secret")
+    if material_tier in ("private", "secret"):
+        print(f"[guard] retrieved tier={material_tier} -> local-only")
+    # 'secret' is the system's local-only selector (ollama for books, vault for the
+    # extractor, never cloud). Route the whole turn through it when the guard fires.
+    route_tier = "secret" if local_only else base_tier
 
     # Hard cap on output length, independent of what the model wants to do. A
     # deliverable — or a reminders/jobs list, which may run several rows — earns room
@@ -162,7 +176,7 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # examples in the prompt do the heavy lifting; 8B follows them. Teacher/deliverable
     # paths keep the full 70B where reasoning actually earns its latency.
     fast_lane = ctx.get("complexity") == "trivial" and not ctx.get("deliverable")
-    books = select_fast_book(tier) if fast_lane else select_book(_GEN_SPEC, tier)
+    books = select_fast_book(route_tier) if fast_lane else select_book(_GEN_SPEC, route_tier)
 
     result = None
     for book in books:
@@ -190,10 +204,11 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # Persist the turn + mine durable facts — same path /chat uses, off the loop.
     message = ctx.get("message") or ctx.get("query", "")
     session_id = ctx.get("session_id", "default")
-    tier = ctx.get("sensitivity", "public")  # secret → extractor vaults, no cloud
+    # route_tier carries the guard: private/secret → 'secret' → extractor vaults the
+    # turn locally instead of sending the (private) response to the cloud extractor.
     await asyncio.to_thread(save_message, session_id, "user", message)
     await asyncio.to_thread(save_message, session_id, "assistant", response)
-    await asyncio.to_thread(extract_and_store, message, response, tier)
+    await asyncio.to_thread(extract_and_store, message, response, route_tier)
 
     return {
         "response": response,

@@ -8,6 +8,11 @@ class Tool(ABC):
 
     name: str = "tool"
 
+    # Read-only by default. Action tools (those that WRITE state — reminders,
+    # later calendar/email) set this True so the registry can flag them and a
+    # confirm gate can be wired in front of them later. See tools/reminders.py.
+    is_action: bool = False
+
     @abstractmethod
     async def fetch(self, query: str) -> dict:
         """Returns {source, query, results: list[str], ok: bool}. Must be fail-soft."""

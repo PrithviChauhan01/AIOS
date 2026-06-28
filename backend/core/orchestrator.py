@@ -71,6 +71,13 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         res = run_action(action)
         ctx["action"] = action["action"]
         ctx["action_result"] = res
+        # PRIVACY GUARD: if the result is secret-tier (e.g. a vault document pulled
+        # up), force this turn local — cognition then runs on ollama and the
+        # decrypted content can never reach a cloud provider. Reuses the same tier
+        # switch the rest of the system routes on.
+        if res.get("tier") == "secret":
+            ctx["sensitivity"] = "secret"
+            sensitivity = "secret"
         _log(trace_id, "action", f"tool={action.get('tool')} action={fn_name(action)} result={res}")
         # The [reminder]/[jobs] WRITE line prints on every successful write.
         result = await cognition_pass(ctx, action_material(action, res))

@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     url             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS documents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    doc_type      TEXT,
+    tags          TEXT,
+    source_path   TEXT,
+    tier          TEXT DEFAULT 'private',
+    storage       TEXT NOT NULL,            -- 'chroma' (embedded) | 'vault' (encrypted, local-only)
+    vault_id      TEXT,                     -- set when storage='vault'
+    chunk_count   INTEGER DEFAULT 0,
+    char_count    INTEGER DEFAULT 0,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS leads (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     studio_name     TEXT NOT NULL,

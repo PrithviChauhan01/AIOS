@@ -20,6 +20,7 @@ gate can later sit in front of writes, same as reminders/jobs.
 """
 
 import os
+import re
 import sqlite3
 
 from config import Config
@@ -242,34 +243,81 @@ def list_documents(doc_type: str = None, tag: str = None) -> list:
     return [dict(r) for r in rows]
 
 
+# Words that carry no identity — stripped from both the request and the stored
+# fields so "what's in my id document" matches on the meaningful token ("id"),
+# not on the filler "my"/"document". Without this, raw substring matching either
+# missed the doc or fuzzy-grabbed an unrelated one (e.g. routed "id" to "prd").
+_MATCH_STOP = {
+    "my", "the", "a", "an", "this", "that", "of", "in", "is", "s", "me",
+    "please", "whats", "what", "show", "pull", "up", "get", "open", "find",
+    "fetch", "read", "document", "documents", "doc", "docs", "file", "files",
+}
+
+
+def _norm(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (s or "").lower())).strip()
+
+
+def _id_tokens(s: str) -> set:
+    """Meaningful identity tokens from a string (stopwords removed)."""
+    return {t for t in _norm(s).split() if t and t not in _MATCH_STOP}
+
+
 def _resolve_doc(identifier) -> dict | None:
-    """Find a document row by numeric id or by name (exact, else unique substring).
-    Returns the row dict, the sentinel {'_ambiguous': [...]} when a name matches
-    several, or None if nothing matches."""
+    """Resolve a document by numeric id, or by matching a NAME against each row's
+    name + doc_type + tags. Scoring: an exact normalized name match wins outright;
+    otherwise rows are ranked by how many request tokens they share. Returns the
+    row dict, {'_ambiguous': [...]} when the top score ties across rows, or None
+    when nothing genuinely matches (no fuzzy-grabbing an unrelated doc)."""
     conn = _conn()
     try:
-        # numeric id?
+        # numeric id (real int or a digit string) → direct lookup
         try:
             rid = int(identifier)
             row = conn.execute("SELECT * FROM documents WHERE id = ?", (rid,)).fetchone()
             return dict(row) if row else None
         except (TypeError, ValueError):
             pass
-        name = (identifier or "").strip().lower()
+        name = (identifier or "").strip()
         if not name:
             return None
         rows = [dict(r) for r in conn.execute("SELECT * FROM documents").fetchall()]
     finally:
         conn.close()
-    exact = [r for r in rows if r["name"].lower() == name]
-    if len(exact) == 1:
-        return exact[0]
-    partial = [r for r in rows if name in r["name"].lower()]
-    if len(partial) == 1:
-        return partial[0]
-    if len(partial) > 1:
-        return {"_ambiguous": [{"id": r["id"], "name": r["name"]} for r in partial]}
-    return None
+
+    if not rows:
+        return None
+
+    want = _id_tokens(name)
+    norm_name = _norm(name)
+
+    scored = []
+    for r in rows:
+        row_tokens = _id_tokens(r["name"]) | _id_tokens(r["doc_type"]) | _id_tokens(r["tags"])
+        score = len(want & row_tokens)
+        if norm_name and norm_name == _norm(r["name"]):
+            score += 100  # exact (normalized) name match is decisive
+        if score > 0:
+            scored.append((score, r))
+
+    # No token in common.
+    if not scored:
+        # Request had only filler words (e.g. "my document") — no identity to match
+        # on: one doc → that one, several → ask which. A request that DID name
+        # something specific but matched nothing → say nothing matched, rather than
+        # grab an unrelated doc.
+        if not want:
+            return rows[0] if len(rows) == 1 else {
+                "_ambiguous": [{"id": r["id"], "name": r["name"]} for r in rows]}
+        return None
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[0][0]
+    top_rows = [r for s, r in scored if s == top]
+    if len(top_rows) == 1:
+        return top_rows[0]
+    return {"_ambiguous": [{"id": r["id"], "name": r["name"]} for r in top_rows]}
 
 
 def get_document(identifier) -> dict:
@@ -279,11 +327,18 @@ def get_document(identifier) -> dict:
     chunks in order."""
     row = _resolve_doc(identifier)
     if row is None:
-        return {"ok": False, "needs": "which", "ask": "I don't have a document matching that, Sir."}
-    if "_ambiguous" in row:
-        names = ", ".join(d["name"] for d in row["_ambiguous"])
+        print(f"[documents] get name={str(identifier)!r} -> no match")
         return {"ok": False, "needs": "which",
-                "ask": f"Which one, Sir? I have: {names}."}
+                "ask": f"I don't have a document matching {str(identifier)!r}, Sir."}
+    if "_ambiguous" in row:
+        names = ", ".join(f"'{d['name']}'" for d in row["_ambiguous"])
+        print(f"[documents] get name={str(identifier)!r} -> ambiguous: "
+              + ", ".join(f"id={d['id']} name={d['name']!r}" for d in row["_ambiguous"]))
+        return {"ok": False, "needs": "which",
+                "ask": f"Which one, Sir — {names}?"}
+
+    print(f"[documents] get name={str(identifier)!r} -> matched "
+          f"id={row['id']} name={row['name']!r}")
 
     if row["storage"] == "vault":
         content = vault_get(row["vault_id"]) if row["vault_id"] else None

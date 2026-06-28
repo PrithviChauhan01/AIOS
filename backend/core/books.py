@@ -21,12 +21,17 @@ _COST      = {"free": 0, "ltd": 1}  # lower is cheaper, cheaper preferred
 
 _MODELS = {
     "groq":     "llama-3.3-70b-versatile",
+    "groq_fast":"llama-3.1-8b-instant",
     "cerebras":"gpt-oss-120b",
     "mistral":  "mistral-large-latest",
     "gpt4o":    "gpt-4o",
     "gemini":   "gemini-1.5-pro",
     "ollama":   "llama3.2",
 }
+
+def model_for(book: str) -> str:
+    """The concrete model id behind a book — for logging fast vs full."""
+    return _MODELS.get(book, book)
 
 _MAX_TOKENS = 1024
 
@@ -86,6 +91,23 @@ def select_book(capability_spec: dict, sensitivity_tier: str) -> list:
         -_SPEED[CAPABILITY_MAP[b]["speed"]],
     ))
 
+# ── Fast lane ──
+# Trivial / short-circuit small-talk needs her voice, not reasoning horsepower.
+# This routes it to Groq's small 8B model (sub-second) with the normal good-
+# reasoning chain as fallback if the fast book is benched or fails. 'groq_fast' is
+# deliberately NOT in CAPABILITY_MAP, so the generic selector never reaches it —
+# the 70B stays the default for teacher/deliverable work. Secret stays local-only.
+def select_fast_book(sensitivity_tier: str) -> list:
+    if sensitivity_tier == "secret":
+        return ["ollama"]
+    books = []
+    if _available("groq_fast"):
+        books.append("groq_fast")
+    for b in select_book({"reasoning": "good"}, sensitivity_tier):
+        if b not in books:
+            books.append(b)
+    return books
+
 # ── Provider clients (lazy so the module imports without every SDK/key present) ──
 _clients = {}
 
@@ -114,42 +136,57 @@ def _openai_client():
     return _clients["openai"]
 
 # ── Per-book synchronous calls (run off-thread by call_book) ──
-def _call_groq(prompt: str):
+# max_tokens is per-call: cognition hard-caps length (trivial ~60, deliverable
+# ~900). Defaults to _MAX_TOKENS for callers that don't care (e.g. teachers).
+def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _groq_client().chat.completions.create(
-        model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}], max_tokens=_MAX_TOKENS)
+        model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
-def _call_cerebras(prompt: str):
+def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
+    r = _groq_client().chat.completions.create(
+        model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+    return r.choices[0].message.content, r.usage.total_tokens
+
+def _call_cerebras(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _cerebras_client().chat.completions.create(
-        model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}], max_tokens=_MAX_TOKENS)
+        model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
-def _call_mistral(prompt: str):
+def _call_mistral(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _mistral_client().chat.complete(
-        model=_MODELS["mistral"], messages=[{"role": "user", "content": prompt}], max_tokens=_MAX_TOKENS)
+        model=_MODELS["mistral"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
-def _call_gpt4o(prompt: str):
+def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _openai_client().chat.completions.create(
-        model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}], max_tokens=_MAX_TOKENS)
+        model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
-def _call_gemini(prompt: str):
+def _call_gemini(prompt: str, max_tokens: int = _MAX_TOKENS):
     import google.generativeai as genai
     genai.configure(api_key=Config.GOOGLE_AI_API_KEY)
     model = genai.GenerativeModel(_MODELS["gemini"])
-    r = model.generate_content(prompt)
+    r = model.generate_content(
+        prompt, generation_config={"max_output_tokens": max_tokens})
     tokens = getattr(getattr(r, "usage_metadata", None), "total_token_count", 0)
     return r.text, tokens
 
-def _call_ollama(prompt: str):
+def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
     import ollama
-    r = ollama.chat(model=_MODELS["ollama"], messages=[{"role": "user", "content": prompt}])
+    # num_predict caps the OUTPUT; num_ctx is the whole window (prompt + output).
+    # The default num_ctx (2048) is smaller than a deliverable's prompt+material,
+    # so the model silently drops the tail and the reply ends mid-sentence. Give it
+    # a window big enough to hold the full prompt AND max_tokens of new output.
+    r = ollama.chat(
+        model=_MODELS["ollama"], messages=[{"role": "user", "content": prompt}],
+        options={"num_predict": max_tokens, "num_ctx": 8192})
     tokens = r.get("prompt_eval_count", 0) + r.get("eval_count", 0)
     return r["message"]["content"], tokens
 
 _DISPATCH = {
     "groq": _call_groq,
+    "groq_fast": _call_groq_fast,
     "cerebras": _call_cerebras,
     "mistral": _call_mistral,
     "gpt4o": _call_gpt4o,
@@ -158,12 +195,12 @@ _DISPATCH = {
 }
 
 # ── Invocation ──
-async def call_book(prompt: str, book: str) -> dict:
+async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> dict:
     fn = _DISPATCH.get(book)
     if fn is None:
         raise ValueError(f"unknown book: {book}")
     try:
-        raw_text, tokens = await asyncio.to_thread(fn, prompt)
+        raw_text, tokens = await asyncio.to_thread(fn, prompt, max_tokens)
         return {"raw_text": raw_text, "book_used": book, "tokens": tokens}
     except Exception as e:
         if _is_rate_limit(e):

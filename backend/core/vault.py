@@ -109,6 +109,18 @@ def vault_list() -> list:
     return out
 
 
+def vault_delete(vault_id: str) -> bool:
+    """Remove one vault entry. Returns True if a row was deleted. Used when a
+    secret-tier document is deleted from the document store."""
+    conn = _connect()
+    try:
+        cur = conn.execute("DELETE FROM vault WHERE id = ?", (vault_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def vault_get(vault_id: str) -> str | None:
     """Decrypt and return one entry's content. LOCAL USE ONLY — the returned
     plaintext must never be placed in a cloud-bound prompt. Returns None if the

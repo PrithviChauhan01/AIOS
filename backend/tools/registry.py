@@ -3,11 +3,13 @@ import asyncio
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
 from tools.reminders import RemindersTool
+from tools.jobs import JobsTool
 
 # ── THE SHARED POOL — instantiated tools by name. Any teacher draws any tool. ──
 _REGISTRY = {
     "wikipedia": WikipediaTool(),   # read-only
     "reminders": RemindersTool(),   # ACTION — writes state (first of its kind)
+    "jobs": JobsTool(),             # ACTION — logs job applications
 }
 
 

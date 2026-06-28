@@ -29,10 +29,17 @@ def _load_privacy_rules():
 
 _RULES = _load_privacy_rules()
 
+def _contains_word(msg: str, term: str) -> bool:
+    """Whole-word / whole-phrase match. Naive substring matching over-fired: 'pan'
+    matched inside 'companies', 'bank' inside 'embankment' — wrongly forcing secret
+    on benign queries. Word boundaries keep only genuine triggers (aadhaar, pan,
+    password, …) while still matching multi-word phrases like 'account number'."""
+    return re.search(rf"\b{re.escape(term)}\b", msg) is not None
+
 def _rule_sensitivity(message: str) -> str:
     msg = message.lower()
     for kw in _RULES["patterns"]:
-        if kw in msg:
+        if _contains_word(msg, kw):
             return "secret"
     for pat in _RULES["regex"]:
         try:
@@ -41,7 +48,7 @@ def _rule_sensitivity(message: str) -> str:
         except re.error:
             continue
     for topic in _RULES["topics"]:
-        if topic in msg:
+        if _contains_word(msg, topic):
             return "private"
     return "public"
 
@@ -49,12 +56,12 @@ def _rule_sensitivity(message: str) -> str:
 TRIAGE_PROMPT = """You are a triage classifier. Respond with ONLY a JSON object, nothing else.
 
 Format:
-{"sensitivity": "public|private|secret", "complexity": "trivial|simple|complex", "domain": "none|study|work|leadgen|fitness|spirit|brainstorm|life", "loop_worthy": true|false}
+{"sensitivity": "public|private|secret", "complexity": "trivial|simple|complex", "domain": "none|study|work|leadgen|fitness|spirit|brainstorm|life|jobs", "loop_worthy": true|false}
 
 Rules:
-- sensitivity: secret = IDs/financial/passwords. private = personal/health/journal/relationships. public = everything else.
+- sensitivity: secret = IDs/financial/passwords (aadhaar/PAN/card/account number/OTP/etc.). private = personal/health/journal/relationships. public = everything else — INCLUDING job hunts, role searches and career queries. A job/career search is NOT secret and NOT private unless it literally contains IDs or financials; default such queries to public.
 - complexity: trivial = greetings/thanks. simple = quick factual. complex = needs real reasoning/multi-step.
-- domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. brainstorm = discussing/developing ideas, finding directions, next steps, thinking through a problem or strategy. life = schedule/habits/reminders. none = ordinary everyday conversation that needs no specialist and little thinking — casual questions, quick chit-chat, simple how-tos, random one-off asks; the catch-all for anything that isn't a real work/study/fitness/spirit/life/leadgen/brainstorm task; if it's just talk or a trivial ask, it's none. You MUST pick a domain from this list only — never invent a new one.
+- domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. jobs = job hunting for Sir himself — finding roles/positions to APPLY to, building a shortlist, tailoring an application, or logging/tracking an application he made; finding a JOB to apply for is jobs, whereas researching a company to SELL to is leadgen and a general professional task is work. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. brainstorm = discussing/developing ideas, finding directions, next steps, thinking through a problem or strategy. life = schedule/habits/reminders. none = ordinary everyday conversation that needs no specialist and little thinking — casual questions, quick chit-chat, simple how-tos, random one-off asks; the catch-all for anything that isn't a real work/study/fitness/spirit/life/leadgen/brainstorm task; if it's just talk or a trivial ask, it's none. You MUST pick a domain from this list only — never invent a new one.
 - If domain == brainstorm, ALWAYS set sensitivity=secret.
 - loop_worthy: true only if complex AND quality matters.
 

@@ -1,7 +1,7 @@
 import asyncio
 
 from core.router import SYSTEM_PROMPT, _extract_mood
-from core.books import select_book, call_book
+from core.books import select_book, select_fast_book, call_book, model_for
 from core.profile import get_relevant_facts
 from core.memory import save_message
 from core.extractor import extract_and_store
@@ -149,14 +149,23 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     tier = ctx.get("sensitivity", "public")  # secret → ollama only (select_book)
 
     # Hard cap on output length, independent of what the model wants to do. A
-    # deliverable — or a reminders list, which may run several rows — earns room
+    # deliverable — or a reminders/jobs list, which may run several rows — earns room
     # for structure; everything else (small-talk, trivial, short-circuit, a one-
     # line action confirmation) is held to a couple of sentences in her voice.
+    # 400 truncated multi-row shortlists mid-sentence; 900 lets a full 3–6 role
+    # block (each with several fields) finish cleanly.
     roomy = ctx.get("deliverable") or ctx.get("action") == "list"
-    max_tokens = 400 if roomy else 60
+    max_tokens = 900 if roomy else 60
+
+    # Fast lane: trivial / short-circuit small-talk (no deliverable) needs her voice,
+    # not reasoning horsepower — route it to Groq's 8B (sub-second). The few-shot voice
+    # examples in the prompt do the heavy lifting; 8B follows them. Teacher/deliverable
+    # paths keep the full 70B where reasoning actually earns its latency.
+    fast_lane = ctx.get("complexity") == "trivial" and not ctx.get("deliverable")
+    books = select_fast_book(tier) if fast_lane else select_book(_GEN_SPEC, tier)
 
     result = None
-    for book in select_book(_GEN_SPEC, tier):
+    for book in books:
         try:
             result = await call_book(prompt, book, max_tokens=max_tokens)
             break
@@ -170,6 +179,11 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
             "provider_used": "none",
             "tokens": 0,
         }
+
+    # Surface fast vs full so latency wins are visible per turn.
+    print(f"[cognition] lane={'fast' if fast_lane else 'full'} "
+          f"book={result['book_used']} model={model_for(result['book_used'])} "
+          f"tokens={result['tokens']}")
 
     response, mood = _extract_mood(result["raw_text"])
 

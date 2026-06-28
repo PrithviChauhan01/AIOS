@@ -13,6 +13,7 @@ from agents.fitness import FitnessTeacher
 from agents.spirit import SpiritTeacher
 from agents.life import LifeTeacher
 from agents.brainstorm import BrainstormTeacher
+from agents.jobs import JobsTeacher
 
 # Domain → Teacher. Unknown domains fall through to the short-circuit path
 # (cognition handles them herself, no teacher).
@@ -24,6 +25,7 @@ TEACHERS = {
     "spirit": SpiritTeacher,
     "life": LifeTeacher,
     "brainstorm": BrainstormTeacher,
+    "jobs": JobsTeacher,
 }
 
 
@@ -69,9 +71,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         res = run_action(action)
         ctx["action"] = action["action"]
         ctx["action_result"] = res
-        _log(trace_id, "action", f"action={fn_name(action['action'])} result={res}")
-        # The [reminder] WRITE line (from set_reminder) now prints on every set.
-        result = await cognition_pass(ctx, action_material(action["action"], res))
+        _log(trace_id, "action", f"tool={action.get('tool')} action={fn_name(action)} result={res}")
+        # The [reminder]/[jobs] WRITE line prints on every successful write.
+        result = await cognition_pass(ctx, action_material(action, res))
         _log(trace_id, "cognition", f"provider={result.get('provider_used')} mood={result.get('mood')}")
         if voice_flag:
             try:

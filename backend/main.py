@@ -10,13 +10,18 @@ from api.chat_routes import router as chat_router
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
 from core.auth import generate_token
+from core.scheduler import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_sqlite()
     init_chroma()
-    yield
+    start_scheduler()  # reminder firing — runs whenever the backend is up
+    try:
+        yield
+    finally:
+        stop_scheduler()
 
 
 def create_app() -> FastAPI:

@@ -8,3 +8,8 @@ requests==2.32.3
 pydantic==2.7.4
 groq
 cerebras-cloud-sdk
+dateparser
+apscheduler
+win11toast
+pypdf
+python-docx

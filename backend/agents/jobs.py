@@ -29,6 +29,33 @@ class JobsTeacher(Teacher):
     def required_capability(self, ctx):
         return {"reasoning": "good"}
 
+    def _resume_block(self) -> str:
+        """Build the resume-routing context from Sir's stored resumes. Only the
+        variant + derived skills go into the prompt (no raw resume content → no PII
+        to the cloud book). Fail-soft: a store error just yields no block."""
+        try:
+            from tools.jobs import resume_profiles
+            profiles = resume_profiles()
+        except Exception as e:
+            print(f"[jobs] resume profile load failed: {e}")
+            return ""
+
+        if not profiles:
+            print("[jobs] resume context: none on file")
+            return ("\n\nRESUMES ON FILE: NONE. Sir has not saved a resume yet — do NOT "
+                    "guess a resume per role; set RESUME to \"none on file\" and add one "
+                    "line telling him to save an engineering/design resume so you can match.")
+
+        print("[jobs] resume context: "
+              + "; ".join(f"{p['variant']}({len(p['skills'])} skills)" for p in profiles))
+        lines = "\n".join(
+            f"- {p['variant'].upper()} resume ('{p['name']}') — skills: "
+            f"{', '.join(p['skills']) or 'unknown'}"
+            for p in profiles
+        )
+        return ("\n\nSir's RESUMES ON FILE (route each role to the one whose REAL skills "
+                "fit best — grounded in his actual resumes, do not invent):\n" + lines)
+
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         query = ctx.get("message") or ctx.get("query", "")
         memory_block = ""
@@ -39,12 +66,17 @@ class JobsTeacher(Teacher):
                 + "\n".join(f"- {m}" for m in domain_memory)
             )
 
+        # Resume routing is grounded in Sir's ACTUAL stored resumes (Slice E). We
+        # inject only the variant + derived skills — never raw resume content, so no
+        # PII reaches the cloud book. If none are on file we say so and forbid a guess.
+        resume_block = self._resume_block()
+
         return f"""You are a job-search specialist. Produce a focused, factual SHORTLIST of roles \
 matching Sir's query below. Output RAW structured material only — no greeting, no opinion in your \
 own voice, no cover-letter prose, no sign-off.
 
 QUERY (role + any filters such as company type, location, or stage/seniority):
-{query}{memory_block}
+{query}{memory_block}{resume_block}
 
 Honor every filter Sir gave (company_type, location, stage). Return 3–6 candidate roles. For EACH role, \
 use exactly these fields:
@@ -53,10 +85,9 @@ ROLE N
 COMPANY: the employer.
 ROLE: the job title.
 WHY-FIT: 1–2 concrete sentences on why this fits Sir — match to his background/target, what makes it a good shot.
-RESUME: which resume to send — exactly "engineering" or "design". Decide from the role/JD:
-  - engineering → software / SWE / backend / frontend / full-stack / data / ML / infra / devops / platform / embedded.
-  - design → product design / UX / UI / visual / brand / creative / design-engineer-leaning.
-  When a role straddles both (e.g. "design engineer"), pick the side the day-to-day work leans toward and say so in WHY-FIT.
+RESUME: which of Sir's resumes ON FILE (above) to send — match the role to the resume whose REAL skills fit best, \
+and name a matching skill or two in WHY-FIT. If a resume is on file, the value must be exactly "engineering" or \
+"design". If NO resume is on file, set this to "none on file" and do NOT guess.
 SOURCE/URL: where to find/apply (careers page, board, or "unknown" — never invent a URL).
 
 After the roles, add:

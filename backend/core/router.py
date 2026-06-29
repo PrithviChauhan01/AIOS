@@ -67,10 +67,20 @@ def _try_cerebras(messages):
     )
     return response.choices[0].message.content, response.usage.total_tokens, "cerebras"
 
+# Tolerant of every spacing/case variant the model actually emits — "[mood: warm]",
+# "[ mood: warm ]", "[MOOD:warm]" — and not anchored to end-of-string, so the tag is
+# parsed AND removed wherever it lands. The old anchored, no-space pattern matched
+# none of these, leaking "[ mood: x ]" into the visible reply.
+_MOOD_RE = re.compile(r"\[\s*mood\s*:\s*(\w+)\s*\]", re.IGNORECASE)
+
+
 def _extract_mood(text: str):
-    match = re.search(r"\[mood:\s*(\w+)\]", text)
+    text = text or ""
+    match = _MOOD_RE.search(text)
     mood = match.group(1).lower() if match else "neutral"
-    clean_text = re.sub(r"\s*\[mood:\s*\w+\]\s*$", "", text).strip()
+    # Strip every occurrence of the tag, then tidy any whitespace it left behind.
+    clean_text = _MOOD_RE.sub("", text)
+    clean_text = re.sub(r"[ \t]{2,}", " ", clean_text).strip()
     return clean_text, mood
 
 def chat(message: str, history: list = []) -> dict:

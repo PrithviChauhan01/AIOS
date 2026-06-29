@@ -5,6 +5,7 @@ from tools.wikipedia import WikipediaTool
 from tools.reminders import RemindersTool
 from tools.jobs import JobsTool
 from tools.documents import DocumentsTool
+from tools.mailer import EmailTool
 
 # ── THE SHARED POOL — instantiated tools by name. Any teacher draws any tool. ──
 _REGISTRY = {
@@ -12,6 +13,7 @@ _REGISTRY = {
     "reminders": RemindersTool(),   # ACTION — writes state (first of its kind)
     "jobs": JobsTool(),             # ACTION — logs job applications
     "documents": DocumentsTool(),   # ACTION — general document store (tiered)
+    "email": EmailTool(),           # ACTION — first EXTERNAL action, confirm-gated
 }
 
 

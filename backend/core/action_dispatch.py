@@ -79,6 +79,59 @@ _DOCS_FN_NAME = {
     "delete": "delete_document",
 }
 
+# Email gate: composing/sending an email. The confirm-gate (yes/no/edit on a pending
+# draft) is handled separately in detect_action and does NOT need this gate.
+_EMAIL_GATE = re.compile(r"\bemail\b|\be-mail\b|\bsend\b[^.]*\bmail\b", re.IGNORECASE)
+_EMAIL_FN_NAME = {
+    "draft": "draft_email",
+    "send": "send_email",
+    "revise": "revise_email",
+    "cancel": "cancel_email",
+    "reconfirm": "reconfirm_email",
+    "need_address": "draft_email",
+    "cancel_awaiting": "cancel_email",
+}
+
+# A bare email address — to recognise the recipient on the turn AFTER we asked for it.
+_ADDR_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+# session_id -> {"recipient","topic","subject"} while a draft is waiting on the
+# recipient's address. This is the "draft started, needs the address" phase, distinct
+# from mailer's "draft staged, awaiting yes/no" phase. Providing the address here
+# COMPLETES the draft (stage + show) — it never sends.
+_AWAITING_EMAIL = {}
+
+# Confirm-gate intent on a PENDING email. Precedence: cancel, then edit, then send;
+# anything else re-asks (never an accidental send). Negate is checked first so
+# "no, change it" cancels rather than edits.
+_AFFIRM = re.compile(
+    r"\b(yes|yep|yeah|yup|sure|send( it| that| it now)?|do it|go( ahead)?|"
+    r"confirm(ed)?|ship it|sounds good|looks good|approve[d]?|fire it|that works)\b",
+    re.IGNORECASE,
+)
+_NEGATE = re.compile(
+    r"\b(no|nope|don'?t|do not|cancel|stop|scrap( it)?|never ?mind|forget it|"
+    r"hold off|abort|drop it|discard)\b",
+    re.IGNORECASE,
+)
+_EDIT = re.compile(
+    r"\b(change|edit|revise|rewrite|reword|make it|instead|add|remove|shorter|"
+    r"longer|subject|tone|fix|adjust|tweak|rephrase)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_confirm(message: str) -> str:
+    """Map a reply to a pending email into send | cancel | revise | reconfirm."""
+    msg = message or ""
+    if _NEGATE.search(msg):
+        return "cancel"
+    if _EDIT.search(msg):
+        return "revise"
+    if _AFFIRM.search(msg):
+        return "send"
+    return "reconfirm"
+
 _EXTRACT_PROMPT = """You convert a short spoken command about REMINDERS into strict JSON. Output ONLY a JSON object, nothing else.
 
 Schema:
@@ -237,23 +290,104 @@ def _extract_docs(message: str) -> dict | None:
     }
 
 
-def detect_action(message: str) -> dict | None:
+_EMAIL_EXTRACT_PROMPT = """You convert a command to SEND AN EMAIL into strict JSON. Output ONLY a JSON object, nothing else.
+
+Schema:
+{"action": "draft|none", "to": "<recipient email address if one is explicitly given, else empty>", "recipient": "<recipient name if given, else empty>", "subject": "<subject if Sir dictated one, else empty>", "topic": "<what the email should say / its purpose, in a few words>"}
+
+Rules:
+- draft = Sir wants to compose/send an email ("email Bob about the meeting", "send an email to x@y.com saying ...").
+- none = anything that is NOT an email command.
+- to: copy an email ADDRESS only if present; a name goes in "recipient", not "to".
+- topic: the gist of what to say.
+- If unsure whether it's an email command at all, use "none".
+JSON only."""
+
+
+def _extract_email(message: str) -> dict | None:
+    """Local strict-JSON extraction for an email-draft command. None if it isn't one."""
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": _EMAIL_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            options={"temperature": 0},
+        )
+        text = resp["message"]["content"].strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[orch] email extract failed ({e}) — treating as none")
+        return None
+
+    if (parsed.get("action") or "none").strip().lower() != "draft":
+        return None
+    return {
+        "tool": "email",
+        "action": "draft",
+        "to": (parsed.get("to") or "").strip(),
+        "recipient": (parsed.get("recipient") or "").strip(),
+        "subject": (parsed.get("subject") or "").strip(),
+        "topic": (parsed.get("topic") or "").strip(),
+        "raw_message": message,
+    }
+
+
+def detect_action(message: str, session_id: str = "default") -> dict | None:
     """Cheap per-tool gate, then local extraction. Returns the intent dict (tagged
-    with its "tool") for a real action command, or None for ordinary chat (which
-    then routes normally). Gates are tried in order; a line that gates but fails
-    extraction can still fall through to the next tool's gate."""
+    with its "tool" and the session) for a real action command, or None for ordinary
+    chat. A PENDING email confirmation takes priority over every gate so a bare
+    "yes"/"send it" confirms the draft instead of routing as small-talk."""
     msg = message or ""
+
+    # 0. CONFIRM GATE — a STAGED draft (complete, awaiting yes/no) owns the turn.
+    etool = get_tool("email")
+    if etool is not None and etool.has_pending(session_id):
+        return {"tool": "email", "action": _classify_confirm(msg),
+                "session_id": session_id, "raw_message": msg}
+
+    # 0.5 AWAITING ADDRESS — last turn we asked for the recipient's address. THIS
+    # turn supplies it (complete + show the draft) or cancels. Never sends here.
+    if session_id in _AWAITING_EMAIL:
+        if _NEGATE.search(msg):
+            return {"tool": "email", "action": "cancel_awaiting",
+                    "session_id": session_id, "raw_message": msg}
+        addr = _ADDR_RE.search(msg)
+        if addr:
+            saved = _AWAITING_EMAIL[session_id]
+            return {"tool": "email", "action": "draft", "to": addr.group(0),
+                    "recipient": saved.get("recipient", ""), "subject": saved.get("subject", ""),
+                    "topic": saved.get("topic", ""), "session_id": session_id, "raw_message": msg}
+        return {"tool": "email", "action": "need_address",
+                "session_id": session_id, "raw_message": msg}
+
+    # 1–4. Tool gates in order; a line that gates but fails extraction can fall
+    # through to the next tool's gate.
     if _GATE.search(msg):
         action = _extract(msg)
         if action is not None:
             action["tool"] = "reminders"
+            action["session_id"] = session_id
             return action
     if _JOBS_GATE.search(msg):
         action = _extract_jobs(msg)
         if action is not None:
+            action["session_id"] = session_id
             return action
     if _DOCS_GATE.search(msg):
-        return _extract_docs(msg)
+        action = _extract_docs(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
+    if _EMAIL_GATE.search(msg):
+        action = _extract_email(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
     return None
 
 
@@ -284,7 +418,60 @@ def run_action(action: dict) -> dict:
         return _run_jobs(action)
     if action.get("tool") == "documents":
         return _run_documents(action)
+    if action.get("tool") == "email":
+        return _run_email(action)
     return _run_reminders(action)
+
+
+def _run_email(action: dict) -> dict:
+    """Drive the email confirm-gate. draft → stage (NO send); send → send only after
+    explicit confirm; revise → recompose; cancel → discard; reconfirm → re-show."""
+    name = "email"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    session = action.get("session_id", "default")
+    verb = action["action"]
+    try:
+        if verb == "draft":
+            # Use an address the extractor caught, else one sitting in the raw text.
+            to = (action.get("to") or "").strip()
+            if not _ADDR_RE.fullmatch(to):
+                found = _ADDR_RE.search(action.get("raw_message") or "")
+                to = found.group(0) if found else to
+            draft = tool.draft(to, action.get("recipient"),
+                               action.get("topic"), action.get("raw_message"))
+            if not draft.get("ok"):
+                # Missing the address → remember the rest so the NEXT turn (the
+                # address) completes the draft. Nothing staged, nothing sent.
+                if draft.get("needs") == "to":
+                    _AWAITING_EMAIL[session] = {"recipient": action.get("recipient", ""),
+                                                "topic": action.get("topic", ""),
+                                                "subject": action.get("subject", "")}
+                return {**draft, "stage": "draft"}
+            _AWAITING_EMAIL.pop(session, None)  # address now known — leave the awaiting phase
+            tool.stage(session, draft)          # stage (await confirm) — STILL not sent
+            print("[email] draft -> awaiting confirm")
+            return {"ok": True, "stage": "draft", **draft}
+        if verb == "need_address":
+            who = (_AWAITING_EMAIL.get(session, {}).get("recipient") or "their").strip()
+            return {"ok": False, "needs": "to", "stage": "draft",
+                    "ask": f"I still need {who} email address to draft it, Sir."}
+        if verb == "cancel_awaiting":
+            _AWAITING_EMAIL.pop(session, None)
+            return {"ok": True, "cancelled": True, "had_draft": False}
+        if verb == "send":
+            return tool.confirm_send(session)      # sends ONLY here, after explicit yes
+        if verb == "revise":
+            return tool.revise(session, action.get("raw_message"))
+        if verb == "cancel":
+            return tool.cancel(session)
+        if verb == "reconfirm":
+            return tool.reconfirm(session)
+    except Exception as e:
+        print(f"[orch] email action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown email verb {verb}"}
 
 
 def _run_documents(action: dict) -> dict:
@@ -379,6 +566,8 @@ def fn_name(action: dict) -> str:
         return _JOBS_FN_NAME.get(verb, verb)
     if action.get("tool") == "documents":
         return _DOCS_FN_NAME.get(verb, verb)
+    if action.get("tool") == "email":
+        return _EMAIL_FN_NAME.get(verb, verb)
     return _FN_NAME.get(verb, verb)
 
 
@@ -390,7 +579,49 @@ def action_material(action: dict, res: dict) -> str:
         return _jobs_material(action.get("action"), res)
     if action.get("tool") == "documents":
         return _documents_material(action.get("action"), res)
+    if action.get("tool") == "email":
+        return _email_material(action.get("action"), res)
     return _reminder_material(action.get("action"), res)
+
+
+def _email_material(verb: str, res: dict) -> str:
+    """Render an email action result for cognition. The confirm gate lives here in
+    how she's told to respond: a draft is shown and confirmation requested; a send
+    is reported only from the REAL result."""
+    def _draft_view(r):
+        return (f"TO: {r.get('to')}\nSUBJECT: {r.get('subject')}\n\n{r.get('body')}")
+
+    if verb in ("draft", "revise", "reconfirm", "need_address"):
+        if not res.get("ok"):
+            # draft not built yet (missing recipient/topic) — relay the ask, nothing staged.
+            return (f"ACTION NOT DONE — no draft is staged yet ({res.get('needs') or res.get('error')}). "
+                    f"Do NOT claim anything was sent or drafted. Put this to Sir: {res.get('ask')}")
+        lead = {"draft": "Here is the draft — NOT sent yet",
+                "revise": "Here is the revised draft — still NOT sent",
+                "reconfirm": "This email is still staged, NOT sent"}[verb]
+        return (
+            f"ACTION STAGED (NOT SENT) — {lead}. Show Sir the draft EXACTLY as below "
+            "(do not rewrite the body — this is what will actually send), then ask him "
+            "to confirm: say 'yes'/'send it' to send, 'cancel' to drop it, or tell you "
+            "what to change. Do NOT claim it was sent.\n\n" + _draft_view(res)
+        )
+
+    if verb == "send":
+        if res.get("ok") and res.get("sent"):
+            return (f"ACTION EXECUTED — the email was ACTUALLY SENT to {res.get('to')} "
+                    f"(subject {res.get('subject')!r}). This really happened. Confirm to Sir, minimally.")
+        # not sent — config missing or send error; draft may still be pending.
+        return (f"ACTION NOT DONE — the email was NOT sent ({res.get('error')}). Do NOT "
+                f"claim it sent. Relay to Sir: {res.get('ask')}")
+
+    # cancel
+    if res.get("cancelled"):
+        if res.get("had_draft"):
+            return ("ACTION EXECUTED — the draft was discarded, nothing was sent. "
+                    "Confirm to Sir that it's cancelled.")
+        return ("ACTION EXECUTED — there was no draft to cancel; nothing was sent. "
+                "Tell Sir there was nothing pending.")
+    return "ACTION NOT DONE — nothing to cancel."
 
 
 def _documents_material(verb: str, res: dict) -> str:
@@ -455,13 +686,22 @@ def _jobs_material(verb: str, res: dict) -> str:
     """Render a job-application action result for cognition."""
     if verb == "log":
         if res.get("ok"):
+            if res.get("resume_note") == "no resume on file":
+                resume_part = ("resume=NONE ON FILE (no resume saved to match against — tell "
+                               "Sir to save one and you'll match future logs)")
+                close = ("Confirm the application was logged, and add that there's no resume on "
+                         "file to match — he should save one.")
+            else:
+                resume_part = (f"resume_used={res['resume_used']!r} (matched from his real "
+                               "stored resume)")
+                close = "Confirm to Sir minimally, naming the company, role and which resume."
             return (
                 "ACTION EXECUTED — you just LOGGED a job application to the database. "
                 "This actually happened, the write is done. Details: "
-                f"company={res['company']!r}, role={res['role']!r}, "
-                f"resume_used={res['resume_used']!r}, status={res['status']!r}"
+                f"company={res['company']!r}, role={res['role']!r}, {resume_part}, "
+                f"status={res['status']!r}"
                 + (f", follow_up={res['follow_up_at']!r}" if res.get("follow_up_at") else "")
-                + ". Confirm to Sir minimally, naming the company, role and which resume."
+                + ". " + close
             )
         # clarify path — nothing was written
         return (

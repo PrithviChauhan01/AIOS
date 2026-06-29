@@ -66,11 +66,16 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     # RUN the real tool, and hand cognition the REAL result so her confirmation
     # reflects an actual DB write — never a fabricated "Done, Sir". Extraction is
     # local (ollama), so it runs regardless of sensitivity and leaks nothing.
-    action = detect_action(message)
+    action = detect_action(message, session_id)
     if action is not None:
         res = run_action(action)
         ctx["action"] = action["action"]
         ctx["action_result"] = res
+        # An email draft / revision / re-show is a structured block (to/subject/body)
+        # she must present in full — give cognition deliverable room, not the 60-token
+        # confirmation cap.
+        if action.get("tool") == "email" and action["action"] in ("draft", "revise", "reconfirm"):
+            ctx["deliverable"] = True
         # Hand the retrieved material's sensitivity tier to the cloud guard in
         # cognition. The guard there (not this call site) decides cloud vs local for
         # ALL tiers and tools — private AND secret force local. This stays generic:

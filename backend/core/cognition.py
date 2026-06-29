@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from core.router import SYSTEM_PROMPT, _extract_mood
 from core.books import select_book, select_fast_book, call_book, model_for
@@ -9,6 +10,62 @@ from core.extractor import extract_and_store
 # Her generation never needs raw horsepower the way research does — it needs to
 # reason and sound like herself. "good" keeps the free cloud books in play.
 _GEN_SPEC = {"reasoning": "good"}
+
+# Backstop for prompt scaffolding the model sometimes echoes AFTER her answer —
+# "[Raw material analysis]", a bracketed analysis/reasoning header, then notes on
+# mood/intent. Only her reply should survive, so cut from the first such marker to
+# the end. Keyword-gated so a stray legit bracket in her reply isn't nuked. The mood
+# tag is extracted (and removed) BEFORE this runs, so it's never the trigger here.
+_ANALYSIS_RE = re.compile(
+    r"\s*(?:"
+    r"\[[^\]]*\b(?:raw material|analysis|reasoning|thinking|mood|intent|phrase|delivery|meta)\b[^\]]*\]"
+    r"|\*{0,2}\s*raw material(?:\s+analysis)?\s*\*{0,2}\s*:"
+    r").*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_analysis(text: str) -> str:
+    """Remove any trailing analysis/reasoning scaffolding the model leaked."""
+    return _ANALYSIS_RE.sub("", text or "").strip()
+
+
+# ── Request-aware output sizing ──
+# The deliverable/list tiers below only fire when a TEACHER set the flag. A casual
+# "find me 10 garages" hits no teacher, so without this it fell to the 300 cap and
+# died mid-list. So size the cap to what Sir actually ASKED for, deterministically
+# (no extra LLM): an explicitly-sized list must never truncate.
+_PER_ITEM_TOKENS = 120   # rough room for one list item (name + a line of detail)
+_ROOMY_FLOOR = 1000      # an unsized list still gets the full deliverable floor
+_ROOMY_CEILING = 2500    # hard ceiling so a huge "list 500" can't drain quota
+
+# A count tied to a list ask: "10 garages", "top 5 ideas", "find me 15", "list 20".
+# The noun/verb context keeps it from sizing on incidental numbers in stray prose.
+_COUNT_RE = re.compile(
+    r"\b(?:top\s+)?(\d{1,3})\s+[a-z]"                       # "10 garages", "top 5 ideas"
+    r"|\b(?:give|find|get|show|name|list|fetch)\s+(?:me\s+)?(\d{1,3})\b",  # "find me 10"
+    re.IGNORECASE,
+)
+# A bare list/enumeration ask with no number ("list the …", "every …", "steps to …").
+_LIST_VERB_RE = re.compile(
+    r"\b(list|enumerate|itemi[sz]e|rundown|breakdown|every|all\s+the|"
+    r"steps?\s+to|bullet)\b",
+    re.IGNORECASE,
+)
+
+
+def _request_cap(message: str) -> int | None:
+    """If Sir explicitly sized a list/long answer, return a token cap scaled to it so
+    it can't truncate; else None. ~120 tokens/item when a count is given, floored at
+    the deliverable size and ceilinged to protect quota. Deterministic, no LLM."""
+    msg = message or ""
+    m = _COUNT_RE.search(msg)
+    n = int(next(g for g in m.groups() if g)) if m else None
+    if n is None and not _LIST_VERB_RE.search(msg):
+        return None
+    if n is None:
+        return _ROOMY_FLOOR
+    return max(_ROOMY_FLOOR, min(n * _PER_ITEM_TOKENS, _ROOMY_CEILING))
 
 
 def _format_history(history: list) -> str:
@@ -80,15 +137,25 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
 
     if ctx.get("action_result") is not None:
         # The RAW MATERIAL above is the TRUE result of an action that already ran.
-        # She confirms from it — she must not fabricate a success the tool didn't.
-        task_block = (
-            "You just performed a real action for Sir. The RAW MATERIAL above is the "
-            "ACTUAL result — it already happened (the write landed, or it truly did "
-            "not). Confirm it in your voice, minimally and truthfully: name what and "
-            "roughly when in natural language. Invent NOTHING beyond the result. If it "
-            "says the action was NOT done, do not claim success — relay what's needed "
-            "or that nothing matched."
-        )
+        # Branch on the REAL ok flag so she can never narrate a success the tool did
+        # not return — this is what stops "Email sent successfully" on an ok:False.
+        if ctx["action_result"].get("ok"):
+            task_block = (
+                "You just performed a real action for Sir and it SUCCEEDED. The RAW "
+                "MATERIAL above is the ACTUAL result — confirm it in your voice, minimally "
+                "and truthfully, inventing nothing beyond it. IMPORTANT: if the material "
+                "says the action is STAGED / NOT yet sent (e.g. an email draft awaiting "
+                "confirmation), present it and ASK for confirmation — do NOT say it was "
+                "sent or done."
+            )
+        else:
+            task_block = (
+                "The action you attempted for Sir did NOT succeed — the RAW MATERIAL above "
+                "says ACTION NOT DONE. You MUST NOT claim it worked, sent, saved, or "
+                "completed. Do not use words like 'sent', 'done', or 'successfully'. State "
+                "plainly what actually happened and relay the exact ask / next step from the "
+                "material, in your voice."
+            )
     elif ctx.get("deliverable"):
         task_block = (
             "This is a deliverable for Sir. Open with ONE line in your voice framing it "
@@ -121,6 +188,7 @@ Rules:
 - No coaching, no life-advice tone, no hedging. No "I'd like to clarify", no "I want to make sure", no unprompted clarifying questions — read the room and answer. If it's truly ambiguous, take your best read and go.
 - Expand past two sentences ONLY for a real deliverable — a list, real steps, structure he asked for. Length is earned, never default.
 - You call him "Sir". Confirmations are minimal: "Done." "On it." "Noted." Nothing more unless he needs more.
+- Output ONLY your reply. Never your reasoning, never section headers, never analysis of the raw material or of his mood/intent, never meta-commentary about how you're answering. The thinking is internal; the words you say are all he sees.
 
 {SYSTEM_PROMPT}
 
@@ -137,7 +205,10 @@ Rules:
 {message}
 
 ── YOUR TASK ──
-{task_block}"""
+{task_block}
+
+── OUTPUT (binds last) ──
+Reply with ONLY the words you say to Sir, then the single mood tag the system asked for — nothing else. Do NOT emit any analysis, section header, or bracketed label (e.g. "[Raw material analysis]", "[Raw material]"), and do NOT explain your reasoning, his mood, or his intent. Your reasoning is internal; he sees only the answer."""
 
 
 async def cognition_pass(ctx: dict, raw_material=None) -> dict:
@@ -162,14 +233,27 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # extractor, never cloud). Route the whole turn through it when the guard fires.
     route_tier = "secret" if local_only else base_tier
 
-    # Hard cap on output length, independent of what the model wants to do. A
-    # deliverable — or a reminders/jobs list, which may run several rows — earns room
-    # for structure; everything else (small-talk, trivial, short-circuit, a one-
-    # line action confirmation) is held to a couple of sentences in her voice.
-    # 400 truncated multi-row shortlists mid-sentence; 900 lets a full 3–6 role
-    # block (each with several fields) finish cleanly.
+    # Hard cap on output length, independent of what the model wants to do. Sized to
+    # the REQUEST, not just the deliverable flag — a list Sir explicitly sized ("find
+    # me 10 garages") must never cut off mid-content, even with no teacher behind it.
+    # Order matters: an explicit ask wins over the complexity tiers.
+    #   - request-sized list: scaled to the asked count (~120 tok/item, floor 1000,
+    #     ceiling 2500) so "10 garages" -> 1200, "list 20" -> larger, none truncate.
+    #   - roomy (teacher deliverable or a reminders/jobs list): the 1000 floor, or the
+    #     request size if Sir asked for more.
+    #   - trivial small-talk: a line or two in her voice — 80, kept tight.
+    #   - everything else (simple/complex conversational — explanations, "what do you
+    #     know about me"): 300, a real answer without a wall of text.
+    req_cap = _request_cap(ctx.get("message") or ctx.get("query", ""))
     roomy = ctx.get("deliverable") or ctx.get("action") == "list"
-    max_tokens = 900 if roomy else 60
+    if roomy:
+        max_tokens = max(_ROOMY_FLOOR, req_cap or 0)
+    elif req_cap is not None:
+        max_tokens = req_cap          # Sir sized a list himself — honor it, no teacher needed
+    elif ctx.get("complexity") == "trivial":
+        max_tokens = 80
+    else:
+        max_tokens = 300
 
     # Fast lane: trivial / short-circuit small-talk (no deliverable) needs her voice,
     # not reasoning horsepower — route it to Groq's 8B (sub-second). The few-shot voice
@@ -199,7 +283,10 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
           f"book={result['book_used']} model={model_for(result['book_used'])} "
           f"tokens={result['tokens']}")
 
+    # Mood first (pulls + removes the [mood: x] tag), then strip any leaked analysis
+    # scaffolding so only her spoken reply remains.
     response, mood = _extract_mood(result["raw_text"])
+    response = _strip_analysis(response)
 
     # Persist the turn + mine durable facts — same path /chat uses, off the loop.
     message = ctx.get("message") or ctx.get("query", "")

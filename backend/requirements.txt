@@ -13,3 +13,4 @@ apscheduler
 win11toast
 pypdf
 python-docx
+openpyxl

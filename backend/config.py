@@ -32,6 +32,8 @@ class Config:
     ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
     PICOVOICE_API_KEY = os.getenv("PICOVOICE_API_KEY", "")
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+    # Google Places (New) — real business directory data for leadgen prospecting.
+    GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
     # Fernet key for the encrypted local vault (secret-tier data). Empty → vault
     # generates an ephemeral key at runtime and prints instructions to persist it.

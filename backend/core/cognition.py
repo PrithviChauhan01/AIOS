@@ -38,6 +38,7 @@ def _strip_analysis(text: str) -> str:
 _PER_ITEM_TOKENS = 120   # rough room for one list item (name + a line of detail)
 _ROOMY_FLOOR = 1000      # an unsized list still gets the full deliverable floor
 _ROOMY_CEILING = 2500    # hard ceiling so a huge "list 500" can't drain quota
+_LEADGEN_CEILING = 8000  # leadgen lists are VERIFIED real data — never truncate; size to fit
 
 # A count tied to a list ask: "10 garages", "top 5 ideas", "find me 15", "list 20".
 # The noun/verb context keeps it from sizing on incidental numbers in stray prose.
@@ -246,7 +247,14 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     #     know about me"): 300, a real answer without a wall of text.
     req_cap = _request_cap(ctx.get("message") or ctx.get("query", ""))
     roomy = ctx.get("deliverable") or ctx.get("action") == "list"
-    if roomy:
+    # A leadgen deliverable is a VERIFIED Places list that must NEVER be cut off. Size
+    # the cap to the material itself (≈chars/3 + headroom) so every row survives, up to
+    # a generous ceiling — independent of the modest _ROOMY_CEILING used for prose.
+    leadgen_list = ctx.get("domain") == "leadgen" and ctx.get("deliverable")
+    if leadgen_list and material:
+        sized = int(len(material) / 3) + 500
+        max_tokens = max(_ROOMY_FLOOR, req_cap or 0, min(sized, _LEADGEN_CEILING))
+    elif roomy:
         max_tokens = max(_ROOMY_FLOOR, req_cap or 0)
     elif req_cap is not None:
         max_tokens = req_cap          # Sir sized a list himself — honor it, no teacher needed

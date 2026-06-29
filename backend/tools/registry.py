@@ -2,6 +2,8 @@ import asyncio
 
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
+from tools.search import SearchTool
+from tools.places import PlacesTool
 from tools.reminders import RemindersTool
 from tools.jobs import JobsTool
 from tools.documents import DocumentsTool
@@ -10,6 +12,8 @@ from tools.mailer import EmailTool
 # ── THE SHARED POOL — instantiated tools by name. Any teacher draws any tool. ──
 _REGISTRY = {
     "wikipedia": WikipediaTool(),   # read-only
+    "search": SearchTool(),         # read-only — live web search (Tavily)
+    "places": PlacesTool(),         # read-only — real business directory (Google Places)
     "reminders": RemindersTool(),   # ACTION — writes state (first of its kind)
     "jobs": JobsTool(),             # ACTION — logs job applications
     "documents": DocumentsTool(),   # ACTION — general document store (tiered)

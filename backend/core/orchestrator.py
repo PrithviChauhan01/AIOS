@@ -6,7 +6,7 @@ from core.memory import get_history
 from core.cognition import cognition_pass
 from core.looper import run_looper
 from core.action_dispatch import detect_action, run_action, action_material, fn_name
-from agents.leadgen import LeadgenTeacher
+from agents.leadgen import LeadgenTeacher, get_cached_leadgen, is_export_request
 from agents.study import StudyTeacher
 from agents.work import WorkTeacher
 from agents.fitness import FitnessTeacher
@@ -59,6 +59,7 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     loop_worthy = ctx["loop_worthy"]
 
     dossier_text = None  # the detailed structured material, if a teacher produced one
+    file_path = None     # a real file a teacher/export wrote, surfaced in the response
 
     # ── [2.5] ACTION DISPATCH — the ONLY stage that EXECUTES a tool. ──
     # Cognition only generates text, so without this an action request like
@@ -104,27 +105,37 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
             "file_path": None,
         }
 
+    # ── EXPORT FOLLOW-UP OVERRIDE ──
+    # "Give me a call sheet for those" triages to domain=none and would short-circuit,
+    # losing the prior leadgen results. If this session has a cached leadgen set and the
+    # line is an export request, route it BACK to leadgen so those cached rows become a
+    # real file. Secret is left alone (handled local-only below).
+    if (domain != "leadgen" and sensitivity != "secret"
+            and is_export_request(message) and get_cached_leadgen(session_id)):
+        _log(trace_id, "route",
+             f"export follow-up — domain '{domain}' overridden to leadgen (cached set present)")
+        domain = "leadgen"
+        ctx["domain"] = "leadgen"
+
     # ── ROUTING ──
-    # A teacher (plus its book + looper) costs 2-3 extra LLM calls (~5s). It only earns
-    # that when the line genuinely needs domain knowledge or a deliverable. Trivial
-    # small-talk never does — even when triage tags it domain:life/work/etc. — so it
-    # short-circuits straight to her (one call, ~1.5s). The domain tag must NOT force a
-    # teacher path on a trivial line.
+    # The domain tag decides the path, NOT complexity. If triage routed this to a real
+    # teacher (leadgen, jobs, …), it needs that teacher's real data/tools — a "find
+    # studios" line tagged trivial must still hit leadgen+Places, never short-circuit to
+    # cognition (that path has no tools and hallucinates). So: real teacher → ALWAYS
+    # route through it (any complexity); only domain 'none'/unknown short-circuits to
+    # fast cognition. Secret is the one hard override — stays local-only, no teacher.
     teacher_cls = TEACHERS.get(domain)
     use_teacher = (
         sensitivity != "secret"        # secret stays local-only — no teacher, no cloud
-        and complexity != "trivial"     # trivial small-talk: one call, never a teacher
-        and teacher_cls is not None     # 'none'/unknown domains have no teacher anyway
+        and teacher_cls is not None     # real domain → its teacher; 'none'/unknown → short-circuit
     )
 
     if not use_teacher:
         # Straight to cognition. For secret, select_book forces ollama via the tier in ctx.
         if sensitivity == "secret":
             why = "secret → local-only cognition"
-        elif complexity == "trivial":
-            why = f"trivial (domain '{domain}' ignored)"
         else:
-            why = f"no teacher for domain '{domain}'"
+            why = f"no teacher for domain '{domain}' (complexity={complexity})"
         _log(trace_id, "route", f"short-circuit — {why}")
         result = await cognition_pass(ctx)
 
@@ -135,7 +146,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         # ── [3] TEACHER — raw material ──
         teach = await teacher.run(ctx)
         ctx["deliverable"] = teach.get("deliverable", False)  # let cognition see it
-        _log(trace_id, "teacher", f"book={teach.get('book_used')} tokens={teach.get('tokens')} deliverable={ctx['deliverable']}")
+        file_path = teach.get("file_path")  # leadgen export wrote a real .xlsx, if any
+        _log(trace_id, "teacher", f"book={teach.get('book_used')} tokens={teach.get('tokens')} "
+                                  f"deliverable={ctx['deliverable']} file={file_path}")
 
         # ── [4/5] LOOPER — conditional quality gate ──
         if loop_worthy:
@@ -156,9 +169,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     _log(trace_id, "cognition", f"provider={result.get('provider_used')} mood={result.get('mood')}")
 
     # ── EXPORT — on-demand file, only when Sir explicitly asks AND it's a deliverable ──
-    file_path = None
+    # Skipped when a teacher already wrote a file (leadgen .xlsx) — no double export.
     low = message.lower()
-    if dossier_text and ctx.get("deliverable") and any(k in low for k in ("pdf", "csv", "export", "download")):
+    if not file_path and dossier_text and ctx.get("deliverable") and any(k in low for k in ("pdf", "csv", "export", "download")):
         fmt = "csv" if "csv" in low else "pdf"  # default pdf
         export_title = " ".join(message.split()[:6]) or domain
         try:

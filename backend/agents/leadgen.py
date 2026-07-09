@@ -154,6 +154,13 @@ class LeadgenTeacher(Teacher):
     memory_ns = "mem_leadgen"
     deliverable = True  # lead research is inherently a structured deliverable
 
+    # Leadgen draws Places and Tavily from the SHARED pool itself, via their
+    # STRUCTURED layers (search_places / web_search return dicts — it needs raw
+    # phone/website/address fields for the call sheet, not the registry's string
+    # wrapper). The generic brain fetch skips these so nothing fires twice; the
+    # MANIFEST above stays the hard boundary of what leadgen may reach.
+    owns_tools = ("places", "search")
+
     def reasoning_tier(self, ctx):
         return "fast"  # formats real Places/Tavily data — no heavy reasoning needed
 

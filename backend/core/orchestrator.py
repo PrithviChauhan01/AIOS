@@ -1,9 +1,12 @@
+import asyncio
 import os
 import time
 import uuid
 
+from core.brain import plan
 from core.outcomes import log_outcome
 from core.triage import triage
+from tools.registry import fetch_from, format_pool_block
 from core.secret_mode import detect_toggle, is_secret_mode, set_secret_mode
 from core.memory import get_history
 from core.cognition import cognition_pass
@@ -64,17 +67,93 @@ def _general_complexity(message: str, complexity: str) -> str:
     return complexity
 
 
-def _general_tier(complexity: str, loop_worthy: bool) -> str:
-    """Map general-path complexity → a cognition book tier (consumed via ctx['gen_tier']):
-       trivial → 'fast_lane' (groq_fast, sub-second — no Nemotron on greetings)
-       simple / complex / loop_worthy → 'strong' (nemotron_super → nemotron_ultra →
-         groq 70b → cerebras).
-    Nemotron is the default for real questions: a genuine query ('simple' and up) gets
-    Nemotron Super on the first pass, not the 70b. Only trivial small-talk stays on the
-    fast lane."""
-    if loop_worthy or complexity in ("complex", "simple"):
+def _brain_gen_tier(brain: dict, complexity: str, loop_worthy: bool) -> str:
+    """Map the brain's per-task plan → a cognition book tier (consumed via
+    ctx['gen_tier']):
+       strong/frontier plan, loop_worthy, or complex → 'strong' (nemotron chain)
+       trivial small-talk with NO tools drawn → 'fast_lane' (groq_fast, sub-second)
+       everything else (real lookups, tool-backed asks)  → 'fast' (groq 70b chain)
+    The brain replaces the old pure-complexity mapping, but the complexity heuristics
+    stay as an upgrade-only floor so a brain under-rating can't strand a real question
+    on the small-talk lane."""
+    if brain.get("book_tier") in ("strong", "frontier") or loop_worthy or complexity == "complex":
         return "strong"
-    return "fast_lane"
+    if complexity == "trivial" and not brain.get("tools"):
+        return "fast_lane"
+    return "fast"
+
+
+# ── Slice 8: multi-domain async fan-out ──
+# Hard backstop on top of brain.py's own MAX_FANOUT_DOMAINS cap — quota/latency bound.
+_MAX_FANOUT = 3
+
+
+async def _run_fanout_teacher(domain: str, base_ctx: dict, trace_id: str) -> dict:
+    """Run ONE fanned-out teacher's FULL Slice X flow independently: its OWN per-domain
+    brain call (tools/tier/ensemble scoped to just this domain, not the router brain's
+    plan) → teacher.run() → the same ensemble/looper/plain material resolution the
+    single-domain path uses. Runs concurrently with the other domains via the caller's
+    asyncio.gather — this is what makes each teacher's Slice X flow independent instead
+    of sharing one plan across domains. Never raises: a failed domain contributes no
+    material (an honest gap) rather than crashing the whole multi-domain turn."""
+    domain_ctx = {**base_ctx, "domain": domain}
+    teacher = TEACHERS[domain]()
+
+    sub_brain = await plan(
+        base_ctx.get("message") or "", domain=domain,
+        sensitivity=base_ctx.get("sensitivity", "public"),
+        complexity=base_ctx.get("complexity"), loop_worthy=base_ctx.get("loop_worthy"),
+        default_tier=teacher.reasoning_tier(domain_ctx),
+    )
+    domain_ctx["brain"] = sub_brain
+    _log(trace_id, "fanout_brain",
+         f"domain={domain} source={sub_brain['source']} tools={sub_brain['tools']} "
+         f"tier={sub_brain['book_tier']} ensemble={sub_brain['ensemble']} — {sub_brain['reason']}")
+
+    t0 = time.monotonic()
+    try:
+        teach = await teacher.run(domain_ctx)
+    except Exception as e:
+        _log(trace_id, "fanout_teacher", f"domain={domain} FAILED: {e}")
+        return {"domain": domain, "material": None, "deliverable": False}
+
+    # Same three-way resolution the single-domain path applies (ensemble → skip looper;
+    # loop_worthy → looper; else the plain teach material) — just scoped per domain here.
+    ensemble = teach.get("ensemble")
+    if ensemble:
+        material = "\n\n".join(
+            (r.get("raw_text") or "").strip() for r in ensemble if r.get("raw_text"))
+        out_book = "+".join(r.get("book_used", "?") for r in ensemble)
+        out_passed = any(r.get("self_check", {}).get("passes") for r in ensemble)
+        out_attempts = 1
+    elif base_ctx.get("loop_worthy"):
+        looped = await run_looper(domain_ctx, teacher, teach["raw_text"])
+        material = looped["refined_material"]
+        out_book = looped.get("book_used") or teach.get("book_used", "none")
+        out_passed = looped.get("confidence") == "high"
+        out_attempts = looped.get("attempts", 1)
+    else:
+        material = teach.get("raw_text", "")
+        out_book = teach.get("book_used", "none")
+        out_passed = bool(teach.get("self_check", {}).get("passes"))
+        out_attempts = 1
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    _log(trace_id, "fanout_teacher",
+         f"domain={domain} book={out_book} tokens={teach.get('tokens')} "
+         f"ensemble={bool(ensemble)} deliverable={teach.get('deliverable')} "
+         f"latency_ms={latency_ms}")
+
+    # Same passive outcome row Slice A writes for a single-domain teacher task — one
+    # row per teacher that actually ran, domain-tagged.
+    log_outcome(
+        domain=domain, book_used=out_book, ensemble=bool(ensemble),
+        self_check_passed=out_passed, attempts=out_attempts,
+        tokens=teach.get("tokens", 0), latency_ms=latency_ms,
+        complexity=base_ctx.get("complexity"), session_id=base_ctx.get("session_id", "default"),
+    )
+
+    return {"domain": domain, "material": material, "deliverable": bool(teach.get("deliverable"))}
 
 
 async def handle_message(message: str, session_id: str = "default", voice_flag: bool = False) -> dict:
@@ -212,25 +291,94 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         and teacher_cls is not None     # real domain → its teacher; 'none'/unknown → short-circuit
     )
 
-    if not use_teacher:
+    # ── [2.7] BRAIN — one cheap per-task plan: tools / book tier / ensemble. ──
+    # Runs for BOTH paths (teacher AND general) so a casual "find me hidden gems" can
+    # draw Places from the shared pool instead of hallucinating. The teacher's declared
+    # tier is the brain's default + fallback. plan() is fail-soft (keyword rules) and
+    # clamps itself for secret/private BEFORE any cloud call — privacy can't be routed
+    # around by the selector.
+    teacher = teacher_cls() if use_teacher else None
+    default_tier = teacher.reasoning_tier(ctx) if teacher else None
+    brain = await plan(message, domain=domain, sensitivity=sensitivity,
+                       complexity=complexity, loop_worthy=loop_worthy,
+                       default_tier=default_tier, known_domains=tuple(TEACHERS.keys()))
+    ctx["brain"] = brain
+    _log(trace_id, "brain",
+         f"source={brain['source']} tools={brain['tools']} tier={brain['book_tier']} "
+         f"ensemble={brain['ensemble']} domains={brain['domains']} — {brain['reason']}")
+
+    # ── [2.8] MULTI-DOMAIN FAN-OUT (Slice 8) ──
+    # The brain flagged 2+ genuinely distinct teacher domains for this ONE task
+    # ("plan my week and suggest a workout" → life + fitness). public-only, matching
+    # every other cloud fan-out gate in this file (ensemble, tool draws) — brain.py
+    # already returns domains=[] for secret/private, this is the structural backstop.
+    # Single-domain routing below is completely untouched by this branch existing.
+    fanout_domains = brain.get("domains", [])[:_MAX_FANOUT]
+    multi_domain = sensitivity == "public" and len(fanout_domains) >= 2
+
+    if multi_domain:
+        _log(trace_id, "route",
+             f"multi-domain fan-out — domains={fanout_domains} (parallel via asyncio.gather)")
+        fanout_t0 = time.monotonic()
+        outcomes_list = await asyncio.gather(
+            *(_run_fanout_teacher(d, ctx, trace_id) for d in fanout_domains))
+        _log(trace_id, "route",
+             f"fan-out complete — {len(outcomes_list)} teacher(s) confirmed parallel, "
+             f"wall_ms={int((time.monotonic() - fanout_t0) * 1000)}")
+
+        # Any fanned-out domain may call for a structured block (e.g. study/work/jobs/
+        # leadgen do, life/fitness/spirit/brainstorm don't) — render structured if ANY
+        # source needs it.
+        ctx["deliverable"] = any(o["deliverable"] for o in outcomes_list)
+
+        # Reuse cognition's EXISTING ensemble-combine path — no new combiner. Each
+        # domain contributes ONE labeled text block; _format_material wraps a list of
+        # 2+ strings as "── Source A/B/C ──" and tells cognition to reconcile them —
+        # here that reconciliation is ACROSS DOMAINS instead of across books.
+        material_list = [
+            f"[{o['domain'].upper()}]\n{o['material']}"
+            for o in outcomes_list if o.get("material")
+        ]
+        dossier_text = "\n\n".join(material_list) if material_list else None
+
+        domain = "+".join(fanout_domains)
+        ctx["domain"] = domain
+        result = await cognition_pass(ctx, material_list or None)
+
+    elif not use_teacher:
         # Straight to cognition. For secret, select_book forces ollama via the tier in ctx.
+        material = None
         if sensitivity == "secret":
             why = "secret → local-only cognition"
         else:
-            # General path: size a book tier from complexity instead of always falling
-            # to the 8B fast lane. The heuristic guards against the 3B triage rating a
-            # real question 'trivial'. cognition reads gen_tier (and the upgraded
-            # complexity) to pick the book + token cap; privacy stays absolute downstream.
+            # General path: the brain sized the book tier per task and may have drawn
+            # pool tools; complexity heuristics stay as an upgrade-only floor. cognition
+            # reads gen_tier to pick the book + token cap; privacy stays absolute
+            # downstream.
             complexity = _general_complexity(message, complexity)
             ctx["complexity"] = complexity
-            ctx["gen_tier"] = _general_tier(complexity, loop_worthy)
+            ctx["gen_tier"] = _brain_gen_tier(brain, complexity, loop_worthy)
             why = (f"no teacher for domain '{domain}' "
                    f"(complexity={complexity}, gen_tier={ctx['gen_tier']})")
+            # ── GENERAL PATH TOOL ACCESS — the pool is not teacher-only anymore. ──
+            # The brain's picks are fetched and handed to cognition as REAL material,
+            # so "hidden gems in Delhi" presents Places rows instead of hallucinating.
+            # brain already returns tools=[] for secret/private turns.
+            if brain["tools"]:
+                fetched = await fetch_from(brain["tools"], message)
+                counts = ", ".join(f"{k}({len(v)})" for k, v in fetched.items())
+                _log(trace_id, "pool", f"general-path tools fired: {counts}")
+                block = format_pool_block(fetched)
+                if block:
+                    material = (
+                        "REAL RESULTS from the shared tool pool (fetched live for this "
+                        "turn — use ONLY these as the factual basis for any names, "
+                        "places or facts you present; do not invent beyond them):\n"
+                        + block)
         _log(trace_id, "route", f"short-circuit — {why}")
-        result = await cognition_pass(ctx)
+        result = await cognition_pass(ctx, material)
 
     else:
-        teacher = teacher_cls()
         _log(trace_id, "route", f"teacher — domain '{domain}' → {teacher_cls.__name__} (complexity={complexity})")
 
         # ── [3] TEACHER — raw material ──

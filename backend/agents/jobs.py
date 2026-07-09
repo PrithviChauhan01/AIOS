@@ -29,6 +29,11 @@ class JobsTeacher(Teacher):
     def reasoning_tier(self, ctx):
         return "fast"  # formats real job-board hits into a shortlist — Groq is enough
 
+    # Jobs fetches web search ITSELF with an augmented query ("<query> job openings
+    # hiring") and truthful live/reasoned framing — the generic brain fetch must not
+    # fire the same tool again un-augmented.
+    owns_tools = ("search",)
+
     async def run(self, ctx: dict) -> dict:
         """Pull REAL job-posting results for the query before the book builds the
         shortlist, then hand them in via ctx. Fail-soft: if Tavily has no key or

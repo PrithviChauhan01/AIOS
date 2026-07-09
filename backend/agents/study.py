@@ -1,5 +1,4 @@
 from agents.base import Teacher
-from tools.registry import fetch_from
 
 # ── Refusal / empty signals — a book that punts is a self-check failure ──
 _REFUSALS = (
@@ -16,25 +15,17 @@ _RESEARCH_SIGNALS = (
 
 
 class StudyTeacher(Teacher):
-    """Domain expert for study research. Draws the shared 'wikipedia' tool for real
-    facts BEFORE asking a book to assemble them into a structured study dossier.
-    First consumer of the shared tool pool. Never adds personality, never the answer."""
+    """Domain expert for study research. Real facts (wikipedia, search) arrive via the
+    BRAIN's per-task tool pick — drawn generically from the shared pool in base.run and
+    injected into the prompt — no tool is hardcoded here anymore. Never adds
+    personality, never the answer."""
 
     domain = "study"
     memory_ns = "mem_study"
     deliverable = True  # study research is a structured dossier too
 
     def reasoning_tier(self, ctx):
-        return "strong"  # real research/reasoning — Nemotron Super, not Groq
-
-    async def run(self, ctx: dict) -> dict:
-        # Pull real, verified facts from the shared pool before the book runs.
-        topic = ctx.get("message") or ctx.get("query", "")
-        fetched = await fetch_from(["wikipedia"], topic)
-        ctx["_verified_facts"] = "\n".join(
-            f"- {r}" for results in fetched.values() for r in results
-        )
-        return await super().run(ctx)
+        return "strong"  # default/fallback tier — the brain's per-task pick overrides
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         topic = ctx.get("message") or ctx.get("query", "")
@@ -46,19 +37,11 @@ class StudyTeacher(Teacher):
                 + "\n".join(f"- {m}" for m in domain_memory)
             )
 
-        verified_block = ""
-        facts = ctx.get("_verified_facts", "")
-        if facts:
-            verified_block = (
-                "\n\nUse ONLY these verified facts where available; mark anything not "
-                "covered as 'unknown' — do NOT invent.\nVERIFIED FACTS:\n" + facts
-            )
-
         return f"""You are a study-research analyst. Produce a factual study dossier on the topic below. \
 Output RAW structured research only — no greeting, no opinion of your own voice, no chat framing, no sign-off.
 
 TOPIC:
-{topic}{memory_block}{verified_block}
+{topic}{memory_block}
 
 Return the following sections. If a fact is unknown, write "unknown" — do not invent it.
 

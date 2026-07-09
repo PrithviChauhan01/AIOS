@@ -188,6 +188,21 @@ def _format_history(history: list) -> str:
     return "\n".join(lines)
 
 
+# ── Local-path history window ──
+# The local book (ollama llama3.2, 3B) has a small effective context and latches onto
+# whatever dominates its prompt. A 4-message (2-exchange) window still bled: with secret
+# mode's studios turn immediately followed by a workout ask, the studios turn WAS the
+# most recent exchange, so any window that includes "the last exchange" still hands the
+# 3B "Studio Nine, ..." right before the new question — it doesn't matter how tight the
+# window is if the offending turn is inside it. So the LOCAL/secret path gets NO stored
+# history at all: only the live message (surfaced separately below) drives the reply.
+# This is "last 1 turn max" in the sense that matters — the one turn the 3B sees is the
+# CURRENT one, not anything retrieved from prior storage. Cloud books are completely
+# unaffected — this changes nothing about WHAT may be injected (privacy guard), only how
+# much prior conversation the 3B is ever shown.
+_LOCAL_HISTORY_MSGS = 0
+
+
 def _format_material(raw_material):
     """Normalise teacher output into a text block. Returns (block, is_ensemble).
     A list means run_ensemble handed back >1 book output — she is the combiner."""
@@ -217,7 +232,8 @@ def _format_material(raw_material):
     return (t or None), False
 
 
-def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
+def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
+                  local_history: bool = False) -> str:
     message = ctx.get("message") or ctx.get("query", "")
 
     # her_memory_of_user — core personal memory (mem_core == the existing
@@ -231,7 +247,17 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
     if facts:
         memory_block = "\n".join(f"- {f}" for f in facts)
 
-    history_block = _format_history(ctx.get("history", []))
+    # local_history → this turn answers on the 3B local book: tight window (see
+    # _LOCAL_HISTORY_MSGS) so a stale topic can't bleed into the new answer. Cloud
+    # books keep the full session history unchanged. Sliced explicitly rather than via
+    # history[-_LOCAL_HISTORY_MSGS:] — a negative-zero slice (history[-0:]) is a classic
+    # Python trap that silently returns the WHOLE list, not zero items.
+    history = ctx.get("history", [])
+    if local_history and len(history) > _LOCAL_HISTORY_MSGS:
+        print(f"[cognition] local path — history trimmed to last "
+              f"{_LOCAL_HISTORY_MSGS} of {len(history)} messages")
+        history = history[len(history) - _LOCAL_HISTORY_MSGS:] if _LOCAL_HISTORY_MSGS > 0 else []
+    history_block = _format_history(history)
 
     if material is None:
         material_block = "(none — you're working from yourself here)"
@@ -330,7 +356,6 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     """THE mind. Reasons over the teacher's raw material and speaks HER response
     in HER voice. The raw material is input to her thinking, never her answer."""
     material, is_ensemble = _format_material(raw_material)
-    prompt = _build_prompt(ctx, material, is_ensemble)
 
     # ── CLOUD GUARD (covers ALL retrieval: documents, memory, future tools) ──
     # Any RETRIEVED material injected this turn carries its sensitivity in
@@ -339,6 +364,8 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # force the WHOLE pass local (ollama) when it fires — book selection AND the
     # fact extractor (which is itself a cloud call on the response). This is the one
     # guard layer; tools only tag ctx["material_tier"], they don't re-route.
+    # Computed BEFORE the prompt is built: the local (3B) path needs to know it's
+    # local so it can take the tight history window.
     base_tier = ctx.get("sensitivity", "public")
     material_tier = ctx.get("material_tier")
     local_only = base_tier == "secret" or material_tier in ("private", "secret")
@@ -347,6 +374,11 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # 'secret' is the system's local-only selector (ollama for books, vault for the
     # extractor, never cloud). Route the whole turn through it when the guard fires.
     route_tier = "secret" if local_only else base_tier
+
+    # local_only ⇒ every book candidate is ollama (select_book*/select_fast_book all
+    # return ["ollama"] for tier 'secret') — trim history for the 3B. Cloud turns
+    # keep the full window.
+    prompt = _build_prompt(ctx, material, is_ensemble, local_history=local_only)
 
     # Hard cap on output length, independent of what the model wants to do. Sized to the
     # turn (complexity tier / deliverable / explicit request size / reasoning tier) so a

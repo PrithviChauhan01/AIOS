@@ -4,6 +4,9 @@ from db.chroma_init import get_chroma_client
 from core.books import (
     select_book_for_tier, select_ensemble_books, upgrade_tier, call_book,
 )
+from tools.registry import fetch_from, format_pool_block
+
+_BRAIN_TIERS = ("fast", "strong", "frontier")
 
 
 class Teacher(ABC):
@@ -16,6 +19,12 @@ class Teacher(ABC):
     domain: str = "general"
     memory_ns: str = "long_term_memory"
     deliverable: bool = False  # True → cognition presents as a structured block, not prose
+
+    # Pool tools this teacher fetches ITSELF in a specialized way (structured rows,
+    # augmented queries — e.g. leadgen's Places dicts, jobs' "<query> job openings"
+    # search). The generic brain-driven fetch skips these names so no tool fires twice
+    # for one task. Everything is still drawn from the ONE shared pool either way.
+    owns_tools: tuple = ()
 
     # ── Subclass contract ──
     @abstractmethod
@@ -57,17 +66,43 @@ class Teacher(ABC):
         sensitivity = ctx.get("sensitivity", "public")
         complexity = ctx.get("complexity")
         loop_worthy = ctx.get("loop_worthy")
+
+        # ── BRAIN PLAN (Slice X) — decided upstream, one cheap selector call per task. ──
+        # The brain's per-task book_tier replaces the teacher's fixed tier (the teacher's
+        # declared tier was the brain's default and remains the fallback). No brain in
+        # ctx (direct invocation, tests) → teacher default, no tools, single book.
+        brain = ctx.get("brain") or {}
+        tier = brain.get("book_tier") if brain.get("book_tier") in _BRAIN_TIERS \
+            else declared_tier
+
+        # ── SHARED-POOL TOOLS — the brain picked them; draw them generically. ──
+        # Skip tools this teacher fetches itself (owns_tools) so nothing fires twice.
+        # PUBLIC turns only: every selectable tool egresses the query to an external
+        # API, and the brain already clamps tools=[] for secret/private — this gate is
+        # the structural backstop, not the only line.
+        wanted = [t for t in brain.get("tools", []) if t not in self.owns_tools]
+        if wanted and sensitivity == "public":
+            fetched = await fetch_from(wanted, query)
+            counts = ", ".join(f"{k}({len(v)})" for k, v in fetched.items())
+            print(f"[{self.domain}] pool tools fired: {counts}")
+            block = format_pool_block(fetched)
+            if block:
+                prompt += (
+                    "\n\nSHARED POOL RESULTS (REAL data fetched live for this task — use "
+                    "as your factual basis; mark anything they don't cover as \"unknown\", "
+                    "do not invent):\n" + block)
+
         # Effective tier after the upgrade signal — for the per-turn routing log only.
         eff_tier = "local" if sensitivity == "secret" else upgrade_tier(
-            declared_tier, complexity, loop_worthy)
+            tier, complexity, loop_worthy)
 
-        # ── COMPULSORY ENSEMBLE (public turns only) ──
-        # Every public teacher turn fires TWO different books in parallel; cognition
-        # reconciles both into her answer (her existing ensemble combiner — no new one
-        # here). private/secret never ensemble: secret is ollama-only, and private must
-        # not fan a sensitive turn out to two cloud calls. Those keep the single pass.
-        if sensitivity == "public":
-            books = select_ensemble_books(declared_tier, sensitivity,
+        # ── ENSEMBLE — per-task, brain-decided (the quota guard). ──
+        # Two parallel books ONLY when the brain judged this task genuinely benefits;
+        # cognition reconciles both (her existing combiner). Public turns only — secret
+        # is ollama-only and private never fans out to two cloud calls, and the brain
+        # already returns ensemble=False for both.
+        if bool(brain.get("ensemble")) and sensitivity == "public":
+            books = select_ensemble_books(tier, sensitivity,
                                           complexity=complexity, loop_worthy=loop_worthy)
             if len(books) >= 2:
                 ensembled = await self._ensemble_pass(prompt, books, ctx, eff_tier)
@@ -76,7 +111,7 @@ class Teacher(ABC):
             # only one book family available (rest benched), or both calls failed →
             # fall through to the single best-effort pass below.
 
-        books = select_book_for_tier(declared_tier, sensitivity,
+        books = select_book_for_tier(tier, sensitivity,
                                      complexity=complexity, loop_worthy=loop_worthy)
         return await self._single_pass(prompt, books, ctx, eff_tier)
 

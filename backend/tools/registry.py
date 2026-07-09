@@ -37,6 +37,23 @@ def action_tools() -> list:
     return [n for n, t in _REGISTRY.items() if t.is_action]
 
 
+def format_pool_block(fetched: dict) -> str:
+    """Format fetch_from output as a per-tool text block for injection into a book
+    or cognition prompt. Tools that returned nothing are noted honestly so a model
+    never assumes data it didn't get. Returns "" when NOTHING came back at all —
+    callers then simply skip the block."""
+    if not fetched or not any(fetched.values()):
+        return ""
+    parts = []
+    for name, results in fetched.items():
+        if results:
+            lines = "\n".join(f"- {r}" for r in results)
+            parts.append(f"[{name}]\n{lines}")
+        else:
+            parts.append(f"[{name}] returned no results")
+    return "\n\n".join(parts)
+
+
 async def fetch_from(names: list, query: str) -> dict:
     """Run the named tools concurrently against one query. Returns {tool: results}.
     Unknown or failed tools contribute an empty list — never raises."""

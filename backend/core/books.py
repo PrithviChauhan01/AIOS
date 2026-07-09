@@ -188,7 +188,7 @@ def select_book_for_tier(tier: str, sensitivity_tier: str,
     return avail if avail else order  # all benched → keep order; cooldowns lapse on retry
 
 
-# ── Ensemble book pairing — two DIFFERENT books for a compulsory teacher ensemble ──
+# ── Ensemble book pairing — two DIFFERENT books when the brain decides ensemble=true ──
 # A book's "family": both Nemotrons share one endpoint/quota, so they count as one for
 # ensemble diversity — pairing them would be two calls to the same provider (and both
 # die together on a 429). Collapsing them lets the second slot fall to a genuinely
@@ -203,7 +203,11 @@ def _book_family(book: str) -> str:
 
 def select_ensemble_books(tier: str, sensitivity_tier: str,
                           complexity: str = None, loop_worthy: bool = None) -> list:
-    """Two DISTINCT books (different families) for a compulsory teacher ensemble, best→worst.
+    """Two DISTINCT books (different families), best→worst — the candidate pool for a
+    teacher ensemble. This is NOT compulsory: the caller (agents.base.Teacher.run) only
+    reaches this when the Gemini brain's per-task plan set ensemble=true for a task it
+    judged genuinely benefits from two passes (complex reasoning, a high-stakes
+    deliverable); a straightforward task gets a single book instead — the quota guard.
     The teacher's tier book leads; the second slot is the next-best book from a DIFFERENT
     family (e.g. nemotron_super + groq — never nemotron twice, never the same book twice),
     so the two research passes are genuinely independent. Returns fewer than two only when
@@ -399,21 +403,3 @@ async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> di
         else:
             print(f"[books] {book} failed: {e}")
         raise  # let caller fall back to the next candidate
-
-# ── Ensemble ──
-async def run_ensemble(prompt: str, capability_spec: dict, sensitivity_tier: str) -> list:
-    """Run the top 2 candidates in parallel. Returns a list of raw results —
-    combining/judging is cognition's job, not ours."""
-    if not capability_spec.get("loop_worthy", True):
-        # not loop-worthy: degrade to a single best-effort call
-        for book in select_book(capability_spec, sensitivity_tier):
-            try:
-                return [await call_book(prompt, book)]
-            except Exception:
-                continue
-        return []
-
-    candidates = select_book(capability_spec, sensitivity_tier)[:2]
-    results = await asyncio.gather(
-        *(call_book(prompt, b) for b in candidates), return_exceptions=True)
-    return [r for r in results if isinstance(r, dict)]

@@ -205,7 +205,9 @@ _LOCAL_HISTORY_MSGS = 0
 
 def _format_material(raw_material):
     """Normalise teacher output into a text block. Returns (block, is_ensemble).
-    A list means run_ensemble handed back >1 book output — she is the combiner."""
+    A list means either a per-task book ensemble (agents.base.Teacher._ensemble_pass,
+    fired only when the brain set ensemble=true for this task) or a multi-domain
+    fan-out (Slice 8) handed back >1 raw output — she is the combiner either way."""
     if raw_material is None:
         return None, False
 

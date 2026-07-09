@@ -118,8 +118,13 @@ class Teacher(ABC):
         # Two parallel books ONLY when the brain judged this task genuinely benefits;
         # cognition reconciles both (her existing combiner). Public turns only — secret
         # is ollama-only and private never fans out to two cloud calls, and the brain
-        # already returns ensemble=False for both.
-        if bool(brain.get("ensemble")) and sensitivity == "public":
+        # already returns ensemble=False for both. NOT a blanket "every teacher task
+        # gets 2 books" rule — that's exactly the quota/latency cost this replaces.
+        want_ensemble = bool(brain.get("ensemble")) and sensitivity == "public"
+        print(f"[{self.domain}] ensemble_decision={want_ensemble} source={brain.get('source', 'none')} "
+              f"(brain.ensemble={brain.get('ensemble')} sensitivity={sensitivity})")
+
+        if want_ensemble:
             books = select_ensemble_books(tier, sensitivity,
                                           complexity=complexity, loop_worthy=loop_worthy)
             if len(books) >= 2:
@@ -147,7 +152,8 @@ class Teacher(ABC):
 
         # Both books used this teacher turn, logged together.
         used = "+".join(r["book_used"] for r in passes)
-        print(f"[{self.domain}] teacher_tier={eff_tier} ensemble_books={used}")
+        print(f"[{self.domain}] teacher_tier={eff_tier} ensemble_books={used} "
+              f"books_fired={len(passes)}")
         for r in passes:
             r["self_check"] = self.self_check(r["raw_text"], ctx)
             if not r["self_check"]["passes"]:
@@ -178,7 +184,8 @@ class Teacher(ABC):
             except Exception:
                 continue  # call_book already logged / benched; fall to next candidate
             # Per-turn routing visibility: tier the teacher asked for, book that served it.
-            print(f"[{self.domain}] teacher_tier={eff_tier} chosen_book={result['book_used']}")
+            print(f"[{self.domain}] teacher_tier={eff_tier} chosen_book={result['book_used']} "
+                  f"books_fired=1")
             check = self.self_check(result["raw_text"], ctx)
             last = {
                 "raw_text": result["raw_text"],

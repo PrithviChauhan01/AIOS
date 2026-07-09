@@ -23,8 +23,8 @@ class SpiritTeacher(Teacher):
     memory_ns = "mem_spirit"
     deliverable = False
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "fast"  # reflective scaffolding from Sir's own entry — Groq is enough
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         topic = ctx.get("message") or ctx.get("query", "")

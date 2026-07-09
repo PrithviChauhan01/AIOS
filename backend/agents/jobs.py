@@ -26,8 +26,8 @@ class JobsTeacher(Teacher):
     memory_ns = "mem_jobs"
     deliverable = True  # a role shortlist is inherently a structured block
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "fast"  # formats real job-board hits into a shortlist — Groq is enough
 
     async def run(self, ctx: dict) -> dict:
         """Pull REAL job-posting results for the query before the book builds the

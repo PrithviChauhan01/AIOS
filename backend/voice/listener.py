@@ -4,6 +4,7 @@ openWakeWord listens continuously for the wake word on the mic. On trigger, TEN 
 captures speech from the same stream until a stretch of silence, then returns the buffer.
 
 Both models load once, lazily, and run small/CPU-friendly so whisper keeps the VRAM."""
+import queue
 import time
 from collections import deque
 
@@ -73,11 +74,13 @@ def _pick_mic():
     return best[1]
 
 
-def _log_input_level(stream):
-    """Read ~0.5s off the freshly-opened stream and print mean amplitude. A dead/muted
-    mic shows here immediately (~0.000) instead of looking like a VAD bug downstream."""
+def _log_input_level(src):
+    """Drain ~0.5s off the callback queue (via the 16k wrapper) and print mean amplitude.
+    A dead/muted mic shows here immediately (~0.000) instead of looking like a VAD bug
+    downstream. Reads through _Stream16k because the stream is now callback-driven — you
+    can't blocking-read a callback stream."""
     try:
-        data, _ = stream.read(int(0.5 * stream.samplerate))  # 0.5s at the device's native rate
+        data = src.read(int(0.5 * SR))  # 0.5s at 16k, served from the queue
         amp = float(np.abs(data.astype(np.float32) / 32768.0).mean())
         print(f"[mic] level={amp:.4f}")
         if amp < MIC_SILENCE_FLOOR:
@@ -206,22 +209,48 @@ def _resample_to_16k(block: np.ndarray, device_sr: int) -> np.ndarray:
     return np.clip(np.round(out), -32768, 32767).astype(np.int16)
 
 
-class _Stream16k:
-    """Wraps a native-rate InputStream and serves fixed-size int16 frames AT 16k,
-    resampling each native read on the fly. Both TEN VAD (256) and openWakeWord (1280)
-    require 16k frames, so this keeps that contract no matter the device's native rate."""
+def _open_callback_stream(dev, device_sr):
+    """Open a callback-mode InputStream and return (stream, queue). Each PortAudio block
+    is copied into the queue from the audio thread; _Stream16k drains it. Callback delivery
+    decouples us from PortAudio's blocking read(), which stalled mid-capture on Bluetooth
+    (WASAPI AirPods) — the read would hang, the meter froze, and frames were dropped so VAD
+    missed onset. A steady 30ms native block + high latency absorbs the Bluetooth jitter."""
+    q = queue.Queue()
 
-    def __init__(self, stream):
-        self.stream = stream
-        self.device_sr = int(round(stream.samplerate))
+    def _callback(indata, frames, time_info, status):
+        if status:
+            print(f"[mic] stream status: {status}")
+        # Copy — PortAudio reuses indata's buffer after the callback returns.
+        q.put(indata[:, 0].copy())
+
+    stream = sd.InputStream(samplerate=device_sr, channels=1, dtype="int16",
+                            blocksize=int(device_sr * 0.03), latency="high",
+                            device=dev, callback=_callback)
+    return stream, q
+
+
+class _Stream16k:
+    """Drains a callback queue of native-rate int16 blocks and serves fixed-size int16
+    frames AT 16k, resampling on the fly. Both TEN VAD (256) and openWakeWord (1280) require
+    16k frames, so this keeps that contract no matter the device's native rate."""
+
+    _UNDERFLOW_TIMEOUT = 0.5  # seconds to wait for a block before inserting silence
+
+    def __init__(self, q, device_sr):
+        self.q = q
+        self.device_sr = int(round(device_sr))
+        self._silence_block = np.zeros(int(self.device_sr * 0.03), dtype=np.int16)
         self._pending = np.zeros(0, dtype=np.int16)
 
     def read(self, n: int) -> np.ndarray:
-        """Return exactly n int16 samples at 16k, pulling/resampling native audio as needed."""
+        """Return exactly n int16 samples at 16k, pulling/resampling queued native blocks.
+        On queue underflow (a Bluetooth stall) insert one native block of silence rather
+        than hang — VAD reads it as silence and real speech resumes when blocks flow again."""
         while self._pending.size < n:
-            native = max(1, int(round(n * self.device_sr / SR)))
-            data, _ = self.stream.read(native)
-            block = data.flatten().astype(np.int16)
+            try:
+                block = self.q.get(timeout=self._UNDERFLOW_TIMEOUT).astype(np.int16)
+            except queue.Empty:
+                block = self._silence_block
             if self.device_sr != SR:
                 block = _resample_to_16k(block, self.device_sr)
             self._pending = np.concatenate([self._pending, block])
@@ -229,16 +258,15 @@ class _Stream16k:
         return frame
 
 
-def _capture_speech(stream, src=None) -> np.ndarray:
+def _capture_speech(src) -> np.ndarray:
     """Read 256-sample frames through TEN VAD until trailing silence. float32 [-1,1].
 
-    The stream is opened at the device's NATIVE rate (e.g. 44100); _Stream16k resamples
-    each native read down to SR=16000 and serves exactly HOP_SIZE (256) int16 samples per
-    frame — the shape/rate TEN VAD requires. process() returns (probability, flag). Pass
-    an existing src to reuse a wrapper (so listen()'s wake-word buffer isn't dropped)."""
+    src is a _Stream16k draining the callback queue: the stream is opened at the device's
+    NATIVE rate (e.g. 44100) and _Stream16k resamples each queued block down to SR=16000,
+    serving exactly HOP_SIZE (256) int16 samples per frame — the shape/rate TEN VAD requires.
+    process() returns (probability, flag). Callers share one src so listen()'s wake-word
+    buffer isn't dropped between wake detection and capture."""
     vad = _get_vad()
-    if src is None:
-        src = _Stream16k(stream)
 
     collected = []
     # Rolling buffer of pre-VAD frames. VAD fires a beat after speech onset, so the
@@ -355,9 +383,11 @@ def capture() -> np.ndarray:
     dev = _pick_mic()
     device_sr = _device_samplerate(dev)
     print(f"[mic] device_sr={device_sr} -> resampling to {SR}")
-    with sd.InputStream(samplerate=device_sr, channels=1, dtype="int16", blocksize=0, device=dev) as stream:
-        _log_input_level(stream)
-        return _capture_speech(stream)
+    stream, q = _open_callback_stream(dev, device_sr)
+    with stream:
+        src = _Stream16k(q, device_sr)
+        _log_input_level(src)
+        return _capture_speech(src)
 
 
 def listen() -> np.ndarray:
@@ -368,9 +398,10 @@ def listen() -> np.ndarray:
     dev = _pick_mic()
     device_sr = _device_samplerate(dev)
     print(f"[mic] device_sr={device_sr} -> resampling to {SR}")
-    with sd.InputStream(samplerate=device_sr, channels=1, dtype="int16", blocksize=0, device=dev) as stream:
-        _log_input_level(stream)
-        src = _Stream16k(stream)  # serves 16k frames to oww too — it needs 16k like TEN VAD
+    stream, q = _open_callback_stream(dev, device_sr)
+    with stream:
+        src = _Stream16k(q, device_sr)  # serves 16k frames to oww too — it needs 16k like TEN VAD
+        _log_input_level(src)
         while True:
             frame = src.read(OWW_FRAME)  # int16, 1280 samples @16k
             scores = oww.predict(frame)
@@ -378,4 +409,4 @@ def listen() -> np.ndarray:
                 break
         print("[listener] wake word detected — listening...")
         # 2. capture speech until silence, reusing the open stream AND its resampler buffer
-        return _capture_speech(stream, src)
+        return _capture_speech(src)

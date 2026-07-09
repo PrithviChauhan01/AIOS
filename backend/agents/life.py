@@ -23,8 +23,8 @@ class LifeTeacher(Teacher):
     memory_ns = "mem_life"
     deliverable = False
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "fast"  # schedule/habits/reminders planning — Groq is enough
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         request = ctx.get("message") or ctx.get("query", "")

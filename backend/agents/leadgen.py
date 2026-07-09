@@ -65,6 +65,19 @@ _PROSPECT_NOUNS = (
     "florists", "garages",
 )
 
+# ── Tool manifest — the HARD boundary of what leadgen may reach ──
+# Leadgen reasons over real data from EXACTLY these two tools and no others. A cheap
+# rules-based selection step (below) picks which of them to call per task; every fetch
+# site asserts the tool it's about to hit is in here, so leadgen can never call outside
+# it. "tavily" is the shared pool's Tavily web-search tool (registry name "search");
+# "places" is Google Places. Leadgen uses each tool's STRUCTURED layer (search_places /
+# web_search return dicts) rather than the registry's string wrapper — it needs the raw
+# fields (phone/website/address) for the call sheet — but the two names still name the
+# same tools the registry exposes.
+_PLACES = "places"
+_TAVILY = "search"          # Tavily web search, as named in tools/registry.py
+MANIFEST = (_PLACES, _TAVILY)
+
 # Words that mean "hand me the leads as a file" — any of these in a message is an
 # export request. Leadgen always exports the rich .xlsx call sheet (openpyxl).
 _EXPORT_INTENT_SIGNALS = (
@@ -141,8 +154,8 @@ class LeadgenTeacher(Teacher):
     memory_ns = "mem_leadgen"
     deliverable = True  # lead research is inherently a structured deliverable
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "fast"  # formats real Places/Tavily data — no heavy reasoning needed
 
     # ── Top-level routing ──
     async def run(self, ctx: dict) -> dict:
@@ -155,9 +168,46 @@ class LeadgenTeacher(Teacher):
                 and not self._looks_like_fresh_query(message)):
             return self._export_cached(ctx)
 
-        if self._wants_single_research(message):
-            return await self._run_single_research(ctx)
-        return await self._run_prospecting(ctx)
+        # The brain PICKS its tool(s) for this task — rules only, no LLM call (quota).
+        tools = self._select_tools(message)
+        print(f"[leadgen] tool selection for {message!r}: {tools}")
+
+        if tools == [_PLACES]:
+            return await self._run_prospecting(ctx)      # local directory only
+        if tools == [_TAVILY]:
+            return await self._run_single_research(ctx)  # web dig on one business
+        return await self._run_combined(ctx)             # both: local + web context
+
+    def _select_tools(self, message: str) -> list[str]:
+        """Rules-based (NO LLM — quota) pick of which manifest tool(s) this task needs:
+          * a list/prospecting ask ("find studios in Mumbai")        → [places]
+          * a deep dig on ONE named business ("research Luma Labs")   → [tavily]
+          * an ask that needs a local directory AND web context      → [places, tavily]
+            (e.g. "find studios in Mumbai and research their reputation")
+        Anything ambiguous defaults to Places — the safe superset that returns real data
+        or an honest nothing. The result is intersected with MANIFEST so the boundary is
+        explicit: leadgen can never emit a tool outside it."""
+        low = (message or "").lower()
+        has_single = any(s in low for s in _SINGLE_RESEARCH_SIGNALS)
+        has_list = (any(re.search(rf"\b{re.escape(v)}", low) for v in _LIST_VERBS)
+                    or any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS))
+
+        if has_single and has_list:
+            selected = [_PLACES, _TAVILY]   # named-business research scoped to a local list
+        elif has_single:
+            selected = [_TAVILY]            # one named business, web presence only
+        else:
+            selected = [_PLACES]            # default / prospecting: real directory data
+
+        return [t for t in selected if t in MANIFEST]
+
+    @staticmethod
+    def _assert_in_manifest(name: str) -> None:
+        """Hard boundary: refuse to fetch from any tool leadgen isn't allowed to call.
+        Every fetch site passes through here, so the manifest is enforced, not advisory."""
+        if name not in MANIFEST:
+            raise ValueError(
+                f"leadgen may not call tool {name!r} — manifest is {MANIFEST}")
 
     def _looks_like_fresh_query(self, message: str) -> bool:
         """True if the message names a business CATEGORY ('studios', 'gyms') — i.e. a
@@ -166,27 +216,11 @@ class LeadgenTeacher(Teacher):
         low = (message or "").lower()
         return any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS)
 
-    def _wants_single_research(self, message: str) -> bool:
-        """True only when Sir clearly wants a deep dive on ONE named business (and is
-        NOT asking for a list). Anything list-shaped or ambiguous goes to Places —
-        the safe superset that returns real data or an honest nothing."""
-        low = (message or "").lower()
-        has_single = any(s in low for s in _SINGLE_RESEARCH_SIGNALS)
-        has_list = (any(re.search(rf"\b{re.escape(v)}", low) for v in _LIST_VERBS)
-                    or any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS))
-        return has_single and not has_list
-
     # ── PROSPECTING (Google Places) ──
     async def _run_prospecting(self, ctx: dict) -> dict:
         message = ctx.get("message") or ctx.get("query", "")
         region = self._detect_region(message)
-        try:
-            from tools.places import search_places
-            rows = await search_places(message, region=region)
-        except Exception as e:
-            # search_places is fail-soft, but never let a surprise break cognition.
-            print(f"[leadgen] places lookup errored: {e}")
-            rows = []
+        rows = await self._safe_places(message, region)
 
         print(f"[leadgen] prospecting query={message!r} region={region or 'auto'} "
               f"-> {len(rows)} real result(s)")
@@ -201,6 +235,18 @@ class LeadgenTeacher(Teacher):
             return self._export_call_sheet(message, rows)
 
         return self._places_results(message, rows)
+
+    async def _safe_places(self, message: str, region: str | None) -> list:
+        """Fetch verified Places rows for a query, fail-soft. Asserts Places is in the
+        manifest first (the boundary is enforced at the fetch site). search_places is
+        itself fail-soft, but a surprise error must never break cognition — return []."""
+        self._assert_in_manifest(_PLACES)
+        try:
+            from tools.places import search_places
+            return await search_places(message, region=region)
+        except Exception as e:
+            print(f"[leadgen] places lookup errored: {e}")
+            return []
 
     def _detect_region(self, message: str) -> str | None:
         """ISO region code if the location is OBVIOUS, else None (let Places infer).
@@ -334,12 +380,53 @@ class LeadgenTeacher(Teacher):
         target = ctx.get("message") or ctx.get("query", "")
         if not target.strip():
             return False, []
+        self._assert_in_manifest(_TAVILY)
         try:
             from tools.search import web_search
             return True, await web_search(target)
         except Exception as e:
             print(f"[leadgen] live research unavailable: {e}")
             return False, []
+
+    # ── COMBINED (Places + Tavily → book) ──
+    async def _run_combined(self, ctx: dict) -> dict:
+        """The ask needs a local directory AND web context (e.g. "find studios in Mumbai
+        and research their reputation"). Fetch BOTH manifest tools, inject both real result
+        sets, and let the book reason a dossier grounded in them. If BOTH come back empty →
+        an honest not-found flag (no book call, nothing fabricated)."""
+        message = ctx.get("message") or ctx.get("query", "")
+        region = self._detect_region(message)
+
+        rows = await self._safe_places(message, region)
+        searched, results = await self._gather_research(ctx)
+        relevant = self._filter_relevant(message, results) if searched else []
+
+        print(f"[leadgen] combined query={message!r} -> {len(rows)} places row(s), "
+              f"{len(relevant)} relevant web result(s)")
+
+        if not rows and not relevant:
+            return self._combined_not_found(message)
+
+        # Real Places rows are still a cacheable lead set — a later "call sheet for those"
+        # exports them without re-querying, same as the pure prospecting path.
+        if rows:
+            cache_leadgen_results(ctx.get("session_id", "default"), message, rows)
+
+        ctx = {**ctx, "live_places": rows, "live_research": relevant}
+        return await super().run(ctx)
+
+    def _combined_not_found(self, message: str) -> dict:
+        """Both Places and the web search ran and returned nothing usable. No book call,
+        no fabrication — an honest not-found flag."""
+        query = (message or "").strip()
+        flag = (
+            f"{_NOT_FOUND_PREFIX} neither Google Places nor a live web search returned "
+            f"anything for \"{query}\". Tell Sir plainly nothing was found. Do NOT fabricate "
+            "any names, contacts, ratings, websites, or web-presence details. Suggest he "
+            "broaden the area/category or try different keywords."
+        )
+        return self._final(flag, book="none", deliverable=False,
+                           feedback="places + web ran, zero results — not-found flag")
 
     def _name_tokens(self, target: str) -> set:
         """Distinctive identity tokens from the target — the business's actual name,
@@ -376,6 +463,17 @@ class LeadgenTeacher(Teacher):
         return self._final(flag, book="none", deliverable=False,
                            feedback="research ran, no relevant results — not-found flag")
 
+    def _places_block(self, live_places: list) -> str:
+        """Format verified Places rows as the factual list of businesses to profile — used
+        on the combined path so the dossier is anchored to REAL directory data, not names
+        the book might invent."""
+        if not live_places:
+            return ""
+        lines = "\n".join(self._format_row(i, r) for i, r in enumerate(live_places, start=1))
+        return ("\n\nVERIFIED LOCAL BUSINESSES (REAL Google Places rows — these are the "
+                "businesses to profile; use their name/phone/website/address EXACTLY as given "
+                "and never invent extra leads or alter a field):\n" + lines)
+
     def _research_block(self, live_research: list) -> str:
         """Format real web results as the factual basis for the dossier."""
         if not live_research:
@@ -399,13 +497,20 @@ class LeadgenTeacher(Teacher):
                 + "\n".join(f"- {m}" for m in domain_memory)
             )
 
+        places_block = self._places_block(ctx.get("live_places", []))
         research_block = self._research_block(ctx.get("live_research", []))
+
+        # On the combined path multiple verified businesses may be listed above — profile
+        # each one; otherwise this is a single named target and one dossier is right.
+        per_business = ("\n\nIf multiple VERIFIED LOCAL BUSINESSES are listed above, return "
+                        "one dossier block per business, each with the sections below.") \
+            if places_block else ""
 
         return f"""You are a lead-research analyst. Produce a factual research dossier on the target below. \
 Output RAW structured research only — no greeting, no opinion of your own voice, no outreach copy, no sign-off.
 
 TARGET:
-{target}{memory_block}{research_block}
+{target}{memory_block}{places_block}{research_block}{per_business}
 
 Return the following sections. If a fact is unknown, write "unknown" — do not invent it.
 

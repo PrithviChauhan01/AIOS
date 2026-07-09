@@ -24,8 +24,8 @@ class StudyTeacher(Teacher):
     memory_ns = "mem_study"
     deliverable = True  # study research is a structured dossier too
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "strong"  # real research/reasoning — Nemotron Super, not Groq
 
     async def run(self, ctx: dict) -> dict:
         # Pull real, verified facts from the shared pool before the book runs.

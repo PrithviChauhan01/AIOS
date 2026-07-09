@@ -17,16 +17,22 @@ _THINKING_SIGNALS = (
 class BrainstormTeacher(Teacher):
     """A THINKING partner, not a fact-fetcher. Where the other teachers retrieve and
     structure facts, this one reasons: it opens up idea directions, surfaces options,
-    proposes next steps, and pushes back. No tools, no retrieval. Runs LOCAL-ONLY —
-    triage forces sensitivity=secret, so the orchestrator routes this to ollama and
-    nothing leaves the machine. Raw thinking only: never a polished answer, never a sign-off."""
+    proposes next steps, and pushes back. No tools, no retrieval. Routes like any other
+    domain — cloud allowed by default. Local-only is no longer auto-forced here; it
+    applies only when Sir has explicitly turned on secret mode (core.secret_mode), in
+    which case the orchestrator clamps the whole session to ollama. Raw thinking only:
+    never a polished answer, never a sign-off."""
 
     domain = "brainstorm"
     memory_ns = "mem_brainstorm"
     deliverable = False
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        # Hardest reasoning → Nemotron Ultra. This only applies when NOT in secret/local
+        # mode: secret routing short-circuits before the teacher runs, and the book
+        # selector forces ollama for a secret tier regardless — so 'frontier' here can
+        # never override the privacy clamp.
+        return "frontier"
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         seed = ctx.get("message") or ctx.get("query", "")

@@ -23,8 +23,8 @@ class FitnessTeacher(Teacher):
     memory_ns = "mem_fitness"
     deliverable = False
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "fast"  # structured training material — Groq is enough
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         topic = ctx.get("message") or ctx.get("query", "")

@@ -1,4 +1,4 @@
-from core.books import select_book, call_book
+from core.books import select_book_for_tier, call_book
 
 # Hard cap — every iteration is +1 book call. Cost-bounded by design.
 MAX_ITERATIONS = 2
@@ -21,9 +21,13 @@ async def run_looper(ctx: dict, teacher, book_output: str) -> dict:
     Caller fires this only when loop_worthy is true."""
     check = teacher.self_check(book_output, ctx)
 
-    spec = teacher.required_capability(ctx)
-    tier = ctx.get("sensitivity", "public")
-    candidates = select_book(spec, tier)
+    declared_tier = teacher.reasoning_tier(ctx)
+    sensitivity = ctx.get("sensitivity", "public")
+    # The looper IS the loop_worthy (hardest-reasoning) path — pass loop_worthy=True so
+    # the teacher's declared tier is bumped to its ceiling for the retry candidates.
+    candidates = select_book_for_tier(declared_tier, sensitivity,
+                                      complexity=ctx.get("complexity"),
+                                      loop_worthy=ctx.get("loop_worthy", True))
     book_used = candidates[0] if candidates else "none"
 
     # Original book call already happened — that's attempt 1.

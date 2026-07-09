@@ -2,6 +2,7 @@ import os
 import uuid
 
 from core.triage import triage
+from core.secret_mode import detect_toggle, is_secret_mode, set_secret_mode
 from core.memory import get_history
 from core.cognition import cognition_pass
 from core.looper import run_looper
@@ -33,6 +34,47 @@ def _log(trace_id: str, stage: str, msg: str):
     print(f"[orch:{trace_id[:8]}] {stage}: {msg}")
 
 
+# ── General-path (domain=none) tiering ──
+# The none short-circuit used to ALWAYS hit the 8B fast lane, so real knowledge
+# questions ("explain CAP theorem") got the weakest book and truncated. These two
+# helpers size a book tier from complexity for the general path only — teachers keep
+# their own (already-correct) tiers, and privacy/secret is handled downstream.
+
+# Reasoning verbs that mark a genuine knowledge/analysis question (vs casual chat).
+# The local 3B triage routinely under-rates these as 'trivial'; this lifts them off
+# the fast lane without trusting that guess.
+_REASON_VERBS = ("explain", "compare", "design", "why", "how does",
+                 "walk through", "analyze", "tradeoff")
+_REASON_STARTS = ("explain", "compare", "design", "analyze", "walk through")
+
+
+def _general_complexity(message: str, complexity: str) -> str:
+    """Heuristic UPGRADE for the general path only: a reasoning-verb question is at
+    LEAST 'simple', so it leaves the trivial fast lane. Only ever raises trivial→simple
+    — never downgrades, never touches an already simple/complex rating."""
+    if complexity != "trivial":
+        return complexity
+    low = (message or "").lower().strip()
+    starts = low.startswith(_REASON_STARTS)
+    contains = any(v in low for v in _REASON_VERBS)
+    if starts or (contains and len(low.split()) > 6):
+        return "simple"
+    return complexity
+
+
+def _general_tier(complexity: str, loop_worthy: bool) -> str:
+    """Map general-path complexity → a cognition book tier (consumed via ctx['gen_tier']):
+       trivial → 'fast_lane' (groq_fast, sub-second — no Nemotron on greetings)
+       simple / complex / loop_worthy → 'strong' (nemotron_super → nemotron_ultra →
+         groq 70b → cerebras).
+    Nemotron is the default for real questions: a genuine query ('simple' and up) gets
+    Nemotron Super on the first pass, not the 70b. Only trivial small-talk stays on the
+    fast lane."""
+    if loop_worthy or complexity in ("complex", "simple"):
+        return "strong"
+    return "fast_lane"
+
+
 async def handle_message(message: str, session_id: str = "default", voice_flag: bool = False) -> dict:
     """The spine. Wires triage → (teacher → looper) → cognition end to end.
     A trace_id flows through every stage for debuggability."""
@@ -48,10 +90,48 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     }
     _log(trace_id, "entry", f"session={session_id} len={len(message)}")
 
+    # ── [1.5] SECRET-MODE TOGGLE — explicit, user-driven, checked BEFORE triage. ──
+    # Brainstorm/secret mode is OFF by default and only flips on an explicit command.
+    # A toggle is a CONTROL command, not a query: set the session flag, confirm, and
+    # return — nothing else runs. This is the only thing that turns the local-only
+    # clamp on; triage no longer auto-forces it for brainstorm.
+    toggle = detect_toggle(message)
+    if toggle is not None:
+        set_secret_mode(session_id, toggle == "on")
+        confirm = ("Secret mode on, Sir. Local only." if toggle == "on"
+                   else "Secret mode off, Sir.")
+        _log(trace_id, "secret_mode", f"toggle -> {toggle} (session={session_id})")
+        if voice_flag:
+            try:
+                from voice.speaker import speak
+                speak(confirm, "neutral")
+            except Exception as e:
+                _log(trace_id, "voice", f"failed: {e}")
+        return {
+            "response": confirm,
+            "mood": "neutral",
+            "provider_used": "none",
+            "domain": "control",
+            "sensitivity": "secret" if toggle == "on" else "public",
+            "trace_id": trace_id,
+            "file_path": None,
+        }
+
     # ── [2] TRIAGE — sensitivity / complexity / domain / loop_worthy ──
     verdict = triage(message)  # fail-safe → private+complex defaults live in triage
     ctx.update(verdict)
     _log(trace_id, "triage", str(verdict))
+
+    # ── SECRET-MODE OVERRIDE — explicit session posture beats triage routing. ──
+    # When this session toggled secret mode ON, force EVERY turn local-only (secret)
+    # regardless of domain. This only ever RAISES to secret, never lowers, so triage's
+    # Layer-1 hard privacy rules (PAN/password/account → secret) and the retrieval
+    # guard are untouched — the structural privacy layer can never be weakened by this.
+    secret_mode = is_secret_mode(session_id)
+    if secret_mode:
+        ctx["sensitivity"] = "secret"
+    _log(trace_id, "secret_mode",
+         f"state={'on' if secret_mode else 'off'} -> sensitivity={ctx['sensitivity']}")
 
     sensitivity = ctx["sensitivity"]
     complexity = ctx["complexity"]
@@ -135,7 +215,15 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         if sensitivity == "secret":
             why = "secret → local-only cognition"
         else:
-            why = f"no teacher for domain '{domain}' (complexity={complexity})"
+            # General path: size a book tier from complexity instead of always falling
+            # to the 8B fast lane. The heuristic guards against the 3B triage rating a
+            # real question 'trivial'. cognition reads gen_tier (and the upgraded
+            # complexity) to pick the book + token cap; privacy stays absolute downstream.
+            complexity = _general_complexity(message, complexity)
+            ctx["complexity"] = complexity
+            ctx["gen_tier"] = _general_tier(complexity, loop_worthy)
+            why = (f"no teacher for domain '{domain}' "
+                   f"(complexity={complexity}, gen_tier={ctx['gen_tier']})")
         _log(trace_id, "route", f"short-circuit — {why}")
         result = await cognition_pass(ctx)
 
@@ -147,11 +235,21 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         teach = await teacher.run(ctx)
         ctx["deliverable"] = teach.get("deliverable", False)  # let cognition see it
         file_path = teach.get("file_path")  # leadgen export wrote a real .xlsx, if any
-        _log(trace_id, "teacher", f"book={teach.get('book_used')} tokens={teach.get('tokens')} "
+        ensemble = teach.get("ensemble")  # list of raw book outputs when 2 books ran
+        _log(trace_id, "teacher", f"books={teach.get('book_used')} tokens={teach.get('tokens')} "
+                                  f"ensemble={len(ensemble) if ensemble else 0} "
                                   f"deliverable={ctx['deliverable']} file={file_path}")
 
         # ── [4/5] LOOPER — conditional quality gate ──
-        if loop_worthy:
+        # A teacher ensemble (two parallel books) IS the quality path: hand BOTH raw
+        # outputs to cognition and let her reconcile them. The single-book looper is
+        # bypassed here — it would collapse the two passes back to one. It still runs on
+        # the non-ensemble paths (secret/private turns, or the ensemble fallback).
+        if ensemble:
+            material = ensemble
+            _log(trace_id, "looper",
+                 f"skipped (ensemble of {len(ensemble)} book(s) → cognition combines)")
+        elif loop_worthy:
             looped = await run_looper(ctx, teacher, teach["raw_text"])
             material = looped["refined_material"]
             _log(trace_id, "looper", f"confidence={looped['confidence']} attempts={looped['attempts']}")

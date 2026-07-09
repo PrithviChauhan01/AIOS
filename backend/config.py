@@ -25,6 +25,8 @@ class Config:
 
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
     CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
+    # NVIDIA NIM (OpenAI-compatible) — Nemotron high-reasoning books.
+    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
     GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY", "")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 

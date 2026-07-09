@@ -62,7 +62,6 @@ Rules:
 - sensitivity: secret = IDs/financial/passwords (aadhaar/PAN/card/account number/OTP/etc.). private = personal/health/journal/relationships. public = everything else — INCLUDING job hunts, role searches and career queries. A job/career search is NOT secret and NOT private unless it literally contains IDs or financials; default such queries to public.
 - complexity: trivial = greetings/thanks. simple = quick factual. complex = needs real reasoning/multi-step.
 - domain: study = ANY learning/teaching/explaining/researching a topic, concept, subject, science, history, language, or how-something-works — if Sir wants to understand or learn something, it is study. work = general professional tasks. leadgen = researching a company/studio/business/prospect to pitch or sell to. jobs = job hunting for Sir himself — finding roles/positions to APPLY to, building a shortlist, tailoring an application, or logging/tracking an application he made; finding a JOB to apply for is jobs, whereas researching a company to SELL to is leadgen and a general professional task is work. fitness = workouts/exercise. spirit = Sir's OWN journaling, meditation, mood logging, personal reflection — NOT the science of emotion or the brain, that is study. brainstorm = discussing/developing ideas, finding directions, next steps, thinking through a problem or strategy. life = schedule/habits/reminders. none = ordinary everyday conversation that needs no specialist and little thinking — casual questions, quick chit-chat, simple how-tos, random one-off asks; the catch-all for anything that isn't a real work/study/fitness/spirit/life/leadgen/brainstorm task; if it's just talk or a trivial ask, it's none. You MUST pick a domain from this list only — never invent a new one.
-- If domain == brainstorm, ALWAYS set sensitivity=secret.
 - loop_worthy: true only if complex AND quality matters.
 
 JSON only."""
@@ -104,8 +103,9 @@ def triage(message: str) -> dict:
                 "domain": parsed.get("domain", "none"),
                 "loop_worthy": bool(parsed.get("loop_worthy", False)),
             })
-            if result["domain"] == "brainstorm":
-                result["sensitivity"] = "secret"
+            # NOTE: brainstorm no longer auto-forces secret. Secret/local-only is an
+            # explicit per-session toggle (core.secret_mode), applied in the
+            # orchestrator. Layer-1 hard privacy rules below still force secret.
             if result["sensitivity"] not in _TIER_RANK:
                 result["sensitivity"] = "public"
     except Exception as e:

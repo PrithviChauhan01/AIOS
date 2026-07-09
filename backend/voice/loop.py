@@ -81,7 +81,11 @@ async def _run():
             vad_status = "fired"
 
         t0 = time.perf_counter()
-        text = await asyncio.to_thread(transcribe, audio, diag.get("raw_rms"))
+        text_groq = await asyncio.to_thread(transcribe, audio, diag.get("raw_rms"), False)
+        text_local = await asyncio.to_thread(transcribe, audio, diag.get("raw_rms"), True)
+        print(f"[GROQ ] {text_groq!r}")
+        print(f"[LOCAL] {text_local!r}")
+        text = text_groq
         transcribe_ms = (time.perf_counter() - t0) * 1000.0
 
         if not text:

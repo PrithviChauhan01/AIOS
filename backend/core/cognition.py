@@ -2,7 +2,7 @@ import asyncio
 import re
 
 from core.router import SYSTEM_PROMPT, _extract_mood
-from core.books import select_book, select_fast_book, call_book, model_for
+from core.books import select_book, select_book_for_tier, select_fast_book, call_book, model_for
 from core.profile import get_relevant_facts
 from core.memory import save_message
 from core.extractor import extract_and_store
@@ -30,14 +30,81 @@ def _strip_analysis(text: str) -> str:
     return _ANALYSIS_RE.sub("", text or "").strip()
 
 
+# ── Empty-section guard (deliverables) ──
+# The ensemble combine is done by cognition's model, not code: it's handed two source
+# blocks and told to keep the section structure. Under that load it sometimes prints the
+# section skeleton (OVERVIEW:, KEY CONCEPTS:, …) but drops the body — bare labels with no
+# content beneath. This is the deterministic backstop: after her reply is generated, drop
+# any deliverable section header that has nothing under it, so a bare label can NEVER
+# render. A header that DOES have content (inline or on the lines before the next header)
+# is left untouched, so a full deliverable passes through unchanged.
+#
+# A "section header" here is an ALL-CAPS-style label ending in a colon (OVERVIEW:,
+# KEY CONCEPTS:, FIT SIGNALS:, SOURCE/URL:, WHY-FIT: — the labels every deliverable teacher
+# emits), optionally wrapped in markdown emphasis/bullets. The uppercase-only label keeps
+# it from ever matching her lowercase prose ("Here's the shape, Sir:"). group(2) is any
+# content sitting inline after the colon.
+_SECTION_HEADER_RE = re.compile(
+    r"^\s*(?:[*_#>]+\s*|-\s+)?"          # optional leading emphasis/bullet marks
+    r"([A-Z][A-Z0-9 &/'’\-]{1,38}?)"     # the label — uppercase run, no lowercase prose
+    r"\**\s*:\s*(.*?)\s*$"               # colon (allowing a trailing **) + inline content
+)
+
+
+def _has_real_content(s: str) -> bool:
+    """True when a section body carries actual text — not just leftover emphasis/bullet/
+    dash punctuation or whitespace the model left behind under an empty header."""
+    return re.sub(r"[*_#>\-\s]+", "", s or "") != ""
+
+
+def _drop_empty_sections(text: str) -> str:
+    """Remove every deliverable section header that has no content under it. A header is
+    kept iff it has real text either inline after the colon OR on the lines up to the next
+    header. Non-header prose (her framing line, list items, ROLE N group labels) is never
+    matched, so a fully-filled deliverable renders unchanged."""
+    lines = (text or "").split("\n")
+
+    headers = []  # (line_index, inline_content)
+    for i, ln in enumerate(lines):
+        m = _SECTION_HEADER_RE.match(ln)
+        if m:
+            headers.append((i, m.group(2)))
+
+    if not headers:
+        return text
+
+    drop = set()
+    for k, (i, inline) in enumerate(headers):
+        end = headers[k + 1][0] if k + 1 < len(headers) else len(lines)
+        body = inline + "\n" + "\n".join(lines[i + 1:end])
+        if not _has_real_content(body):
+            drop.update(range(i, end))  # the bare header + the blank span it owns
+
+    if not drop:
+        return text
+    return "\n".join(ln for j, ln in enumerate(lines) if j not in drop).strip()
+
+
 # ── Request-aware output sizing ──
 # The deliverable/list tiers below only fire when a TEACHER set the flag. A casual
 # "find me 10 garages" hits no teacher, so without this it fell to the 300 cap and
 # died mid-list. So size the cap to what Sir actually ASKED for, deterministically
 # (no extra LLM): an explicitly-sized list must never truncate.
 _PER_ITEM_TOKENS = 120   # rough room for one list item (name + a line of detail)
-_ROOMY_FLOOR = 1000      # an unsized list still gets the full deliverable floor
-_ROOMY_CEILING = 2500    # hard ceiling so a huge "list 500" can't drain quota
+
+# ── Output token caps by tier ──
+# Sized so a NORMAL answer FINISHES. The old 300 default cut real explanations (CAP
+# theorem, caching strategy) off mid-sentence, and the 80 trivial cap clipped anything
+# with a second thought. These are OUTPUT caps only — the model stops when it's done, so
+# a larger cap just prevents truncation; it is NOT a target length (her voice stays terse).
+_CAP_BY_COMPLEXITY = {"trivial": 150, "simple": 512, "complex": 1500}
+_CAP_DELIVERABLE = 2048  # a structured deliverable / explicit list — never clip it
+# Nemotron Super/Ultra have HUGE context — a strong/frontier turn must not be pinned at a
+# Groq-ish size. Scale its answer cap up so real multi-part reasoning lands in full.
+_CAP_NEMOTRON = 4096
+
+_ROOMY_FLOOR = _CAP_DELIVERABLE   # an unsized list still gets the full deliverable floor
+_ROOMY_CEILING = _CAP_NEMOTRON    # hard ceiling so a huge "list 500" can't drain quota
 _LEADGEN_CEILING = 8000  # leadgen lists are VERIFIED real data — never truncate; size to fit
 
 # A count tied to a list ask: "10 garages", "top 5 ideas", "find me 15", "list 20".
@@ -67,6 +134,48 @@ def _request_cap(message: str) -> int | None:
     if n is None:
         return _ROOMY_FLOOR
     return max(_ROOMY_FLOOR, min(n * _PER_ITEM_TOKENS, _ROOMY_CEILING))
+
+
+def _output_cap(ctx: dict, material, req_cap: int | None) -> int:
+    """The hard OUTPUT-length cap for this turn, sized to what the turn actually is —
+    complexity tier, deliverable/list flag, an explicit request size, and the reasoning
+    tier (Nemotron gets Nemotron-scale room, never a Groq-ish cap). Deterministic, no LLM.
+
+    Order: leadgen verified list → deliverable/list → general-path gen_tier → complexity;
+    then Nemotron scaling and the explicit request size raise (never lower) the result."""
+    # A leadgen deliverable is a VERIFIED Places list that must NEVER be cut off. Size the
+    # cap to the material itself (≈chars/3 + headroom) so every real row survives, up to a
+    # generous ceiling — independent of the modest prose caps below.
+    if ctx.get("domain") == "leadgen" and ctx.get("deliverable") and material:
+        sized = int(len(material) / 3) + 500
+        return max(_CAP_DELIVERABLE, req_cap or 0, min(sized, _LEADGEN_CEILING))
+
+    gen_tier = ctx.get("gen_tier")
+    # A deliverable or an explicit 'list' action is structured — give it the deliverable
+    # floor so the block never clips. (task_block framing keys off ctx['deliverable']
+    # separately; this only sizes the cap.)
+    if ctx.get("deliverable") or ctx.get("action") == "list":
+        base = _CAP_DELIVERABLE
+    # General path (domain=none): gen_tier already folded complexity/loop_worthy in —
+    # 'strong' is complex-grade reasoning, 'fast' a real short answer, 'fast_lane' small talk.
+    elif gen_tier == "strong":
+        base = _CAP_BY_COMPLEXITY["complex"]
+    elif gen_tier == "fast":
+        base = _CAP_BY_COMPLEXITY["simple"]
+    elif gen_tier == "fast_lane":
+        base = _CAP_BY_COMPLEXITY["trivial"]
+    else:
+        # Teacher/action path (no gen_tier): size off the triage complexity. Unknown →
+        # 'simple', so a real answer never falls back to a small-talk cap.
+        base = _CAP_BY_COMPLEXITY.get(ctx.get("complexity"), _CAP_BY_COMPLEXITY["simple"])
+
+    # Nemotron scaling: a 'strong' (Super) or loop_worthy/frontier (Ultra) turn runs on a
+    # huge-context book — let the answer breathe rather than cap it at a Groq-ish size.
+    if gen_tier == "strong" or ctx.get("loop_worthy"):
+        base = max(base, _CAP_NEMOTRON)
+
+    # An explicitly-sized list ask ("find me 10 garages") can only RAISE the cap.
+    return max(base, req_cap or 0)
 
 
 def _format_history(history: list) -> str:
@@ -162,10 +271,15 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool) -> str:
             "This is a deliverable for Sir. Open with ONE line in your voice framing it "
             "(e.g. what this is / your read on it). Then present the material as a CLEAN, "
             "SCANNABLE STRUCTURED BLOCK — keep the section structure from the raw material "
-            "(headers, fields), do not melt it into a paragraph, do not pad. Tighten and "
-            "format it well; remove filler and any 'unknown' noise that adds nothing. End "
-            "with one line only if a real next step exists. The structure IS the value — "
-            "present it, don't dissolve it."
+            "(headers, fields), do not melt it into a paragraph, do not pad. If TWO research "
+            "passes are shown above, MERGE them into ONE set of sections — fill each section "
+            "with the combined facts from BOTH passes; never print the section set twice and "
+            "never leave a header empty because the two disagreed. FILL every header you "
+            "print with its real content from the material. If a section genuinely has no "
+            "content, OMIT that header entirely — never print a bare label with nothing under "
+            "it. Tighten and format it well; remove filler and any 'unknown' noise that adds "
+            "nothing. End with one line only if a real next step exists. The structure IS the "
+            "value — present it, don't dissolve it."
         )
     else:
         task_block = (
@@ -234,41 +348,38 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # extractor, never cloud). Route the whole turn through it when the guard fires.
     route_tier = "secret" if local_only else base_tier
 
-    # Hard cap on output length, independent of what the model wants to do. Sized to
-    # the REQUEST, not just the deliverable flag — a list Sir explicitly sized ("find
-    # me 10 garages") must never cut off mid-content, even with no teacher behind it.
-    # Order matters: an explicit ask wins over the complexity tiers.
-    #   - request-sized list: scaled to the asked count (~120 tok/item, floor 1000,
-    #     ceiling 2500) so "10 garages" -> 1200, "list 20" -> larger, none truncate.
-    #   - roomy (teacher deliverable or a reminders/jobs list): the 1000 floor, or the
-    #     request size if Sir asked for more.
-    #   - trivial small-talk: a line or two in her voice — 80, kept tight.
-    #   - everything else (simple/complex conversational — explanations, "what do you
-    #     know about me"): 300, a real answer without a wall of text.
+    # Hard cap on output length, independent of what the model wants to do. Sized to the
+    # turn (complexity tier / deliverable / explicit request size / reasoning tier) so a
+    # NORMAL answer finishes — the old 300 default cut explanations off mid-sentence.
+    # _output_cap owns the ordering; see its docstring.
     req_cap = _request_cap(ctx.get("message") or ctx.get("query", ""))
-    roomy = ctx.get("deliverable") or ctx.get("action") == "list"
-    # A leadgen deliverable is a VERIFIED Places list that must NEVER be cut off. Size
-    # the cap to the material itself (≈chars/3 + headroom) so every row survives, up to
-    # a generous ceiling — independent of the modest _ROOMY_CEILING used for prose.
-    leadgen_list = ctx.get("domain") == "leadgen" and ctx.get("deliverable")
-    if leadgen_list and material:
-        sized = int(len(material) / 3) + 500
-        max_tokens = max(_ROOMY_FLOOR, req_cap or 0, min(sized, _LEADGEN_CEILING))
-    elif roomy:
-        max_tokens = max(_ROOMY_FLOOR, req_cap or 0)
-    elif req_cap is not None:
-        max_tokens = req_cap          # Sir sized a list himself — honor it, no teacher needed
-    elif ctx.get("complexity") == "trivial":
-        max_tokens = 80
-    else:
-        max_tokens = 300
+    max_tokens = _output_cap(ctx, material, req_cap)
+    print(f"[cognition] max_tokens={max_tokens} complexity={ctx.get('complexity')} "
+          f"gen_tier={ctx.get('gen_tier')} deliverable={bool(ctx.get('deliverable'))} "
+          f"action={ctx.get('action')} domain={ctx.get('domain')} req_cap={req_cap}")
 
-    # Fast lane: trivial / short-circuit small-talk (no deliverable) needs her voice,
-    # not reasoning horsepower — route it to Groq's 8B (sub-second). The few-shot voice
-    # examples in the prompt do the heavy lifting; 8B follows them. Teacher/deliverable
-    # paths keep the full 70B where reasoning actually earns its latency.
-    fast_lane = ctx.get("complexity") == "trivial" and not ctx.get("deliverable")
-    books = select_fast_book(route_tier) if fast_lane else select_book(_GEN_SPEC, route_tier)
+    # Book selection. The general (domain=none) path is sized by the orchestrator and
+    # handed down as ctx['gen_tier'] (fast_lane / fast / strong) so a real knowledge
+    # question can't fall to the 8B just because the 3B triage under-rated it:
+    #   - fast_lane → Groq's 8B (sub-second small-talk lane). The few-shot voice
+    #     examples carry it; teacher/deliverable paths never reach here.
+    #   - fast / strong → the tier book pool (groq 70b, or nemotron_super → groq →
+    #     cerebras), honoring the same availability/fallback rules as the teachers.
+    # Teacher/action turns set no gen_tier and keep the original behavior unchanged.
+    gen_tier = ctx.get("gen_tier")
+    fast_lane = (gen_tier == "fast_lane") or (
+        gen_tier is None and ctx.get("complexity") == "trivial"
+        and not ctx.get("deliverable"))
+    if fast_lane:
+        books = select_fast_book(route_tier)
+    elif gen_tier in ("fast", "strong"):
+        # gen_tier is ALREADY the final tier — the orchestrator folded complexity /
+        # loop_worthy into it (complex/loop_worthy → 'strong'). Do NOT pass them again
+        # or the upgrade signal would double-fire (strong→frontier→Ultra).
+        books = select_book_for_tier(gen_tier, route_tier)
+    else:
+        books = select_book(_GEN_SPEC, route_tier,
+                            complexity=ctx.get("complexity"), loop_worthy=ctx.get("loop_worthy"))
 
     result = None
     for book in books:
@@ -286,15 +397,20 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
             "tokens": 0,
         }
 
-    # Surface fast vs full so latency wins are visible per turn.
+    # Surface fast vs full so latency wins are visible per turn. max_tokens is the cap we
+    # imposed; tokens is what the call actually used (prompt + completion).
     print(f"[cognition] lane={'fast' if fast_lane else 'full'} "
           f"book={result['book_used']} model={model_for(result['book_used'])} "
-          f"tokens={result['tokens']}")
+          f"max_tokens={max_tokens} tokens={result['tokens']}")
 
     # Mood first (pulls + removes the [mood: x] tag), then strip any leaked analysis
     # scaffolding so only her spoken reply remains.
     response, mood = _extract_mood(result["raw_text"])
     response = _strip_analysis(response)
+    # Deliverables only: drop any section header the combine left empty (bare 'CONTEXT:'
+    # with no body) so a hollow skeleton can never render. Full sections pass untouched.
+    if ctx.get("deliverable"):
+        response = _drop_empty_sections(response)
 
     # Persist the turn + mine durable facts — same path /chat uses, off the loop.
     message = ctx.get("message") or ctx.get("query", "")

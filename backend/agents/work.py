@@ -23,8 +23,8 @@ class WorkTeacher(Teacher):
     memory_ns = "mem_work"
     deliverable = True  # a working brief is inherently a structured block
 
-    def required_capability(self, ctx):
-        return {"reasoning": "good"}
+    def reasoning_tier(self, ctx):
+        return "strong"  # professional reasoning — Nemotron Super, not Groq
 
     def build_book_prompt(self, ctx: dict, domain_memory: list) -> str:
         task = ctx.get("message") or ctx.get("query", "")

@@ -1,6 +1,8 @@
 import os
+import time
 import uuid
 
+from core.outcomes import log_outcome
 from core.triage import triage
 from core.secret_mode import detect_toggle, is_secret_mode, set_secret_mode
 from core.memory import get_history
@@ -232,6 +234,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         _log(trace_id, "route", f"teacher — domain '{domain}' → {teacher_cls.__name__} (complexity={complexity})")
 
         # ── [3] TEACHER — raw material ──
+        # Wall-clock timer spans the teacher's work + any looper refinement (the material-
+        # production stage), for the passive outcomes log below. Cognition is timed apart.
+        teach_t0 = time.monotonic()
         teach = await teacher.run(ctx)
         ctx["deliverable"] = teach.get("deliverable", False)  # let cognition see it
         file_path = teach.get("file_path")  # leadgen export wrote a real .xlsx, if any
@@ -247,15 +252,41 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         # the non-ensemble paths (secret/private turns, or the ensemble fallback).
         if ensemble:
             material = ensemble
+            # Log BOTH books comma-joined; passed if either pass cleared its self-check.
+            out_book = ",".join(r.get("book_used", "?") for r in ensemble)
+            out_passed = any(r.get("self_check", {}).get("passes") for r in ensemble)
+            out_attempts = 1  # each book called once, in parallel — no retries
             _log(trace_id, "looper",
                  f"skipped (ensemble of {len(ensemble)} book(s) → cognition combines)")
         elif loop_worthy:
             looped = await run_looper(ctx, teacher, teach["raw_text"])
             material = looped["refined_material"]
+            out_book = looped.get("book_used") or teach.get("book_used", "none")
+            out_passed = looped.get("confidence") == "high"
+            out_attempts = looped.get("attempts", 1)
             _log(trace_id, "looper", f"confidence={looped['confidence']} attempts={looped['attempts']}")
         else:
             material = teach
+            out_book = teach.get("book_used", "none")
+            out_passed = bool(teach.get("self_check", {}).get("passes"))
+            out_attempts = 1
             _log(trace_id, "looper", "skipped (not loop_worthy)")
+
+        # ── OUTCOME LOG (Slice A — passive, write-only, fail-soft) ──
+        # One row per completed teacher task. No routing decision is taken from it yet;
+        # it just accumulates data. log_outcome swallows its own errors, so this can
+        # never break the response.
+        log_outcome(
+            domain=domain,
+            book_used=out_book,
+            ensemble=bool(ensemble),
+            self_check_passed=out_passed,
+            attempts=out_attempts,
+            tokens=teach.get("tokens", 0),
+            latency_ms=int((time.monotonic() - teach_t0) * 1000),
+            complexity=complexity,
+            session_id=session_id,
+        )
 
         # Keep the detailed dossier text for a possible file export (NOT cognition's
         # trimmed chat framing).

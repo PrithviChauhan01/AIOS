@@ -90,6 +90,30 @@ CREATE TABLE IF NOT EXISTS vault (
 );
 """
 
+# ── Routing outcomes (Slice A — passive outcome log) ──
+# One row per completed teacher task: which domain, which book(s), whether the
+# self-check passed, how many attempts, tokens, and wall-clock latency. Write-only for
+# now — a later slice reads it to drive experience-based routing. Kept as a standalone
+# constant so the writer (core.outcomes) can defensively ensure the table exists without
+# re-running the whole schema, while this file stays the single source of truth.
+ROUTING_OUTCOMES_DDL = """
+CREATE TABLE IF NOT EXISTS routing_outcomes (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 DATETIME DEFAULT CURRENT_TIMESTAMP,
+    domain             TEXT,
+    book_used          TEXT,
+    ensemble           INTEGER DEFAULT 0,   -- bool: two books ran in parallel
+    self_check_passed  INTEGER DEFAULT 0,   -- bool
+    attempts           INTEGER DEFAULT 1,
+    tokens             INTEGER DEFAULT 0,
+    latency_ms         INTEGER DEFAULT 0,
+    complexity         TEXT,
+    session_id         TEXT
+);
+"""
+
+SCHEMA += ROUTING_OUTCOMES_DDL
+
 def init_sqlite():
     os.makedirs(os.path.dirname(Config.SQLITE_PATH), exist_ok=True)
     conn = sqlite3.connect(Config.SQLITE_PATH)

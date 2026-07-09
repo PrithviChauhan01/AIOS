@@ -107,8 +107,10 @@ async def _run_fanout_teacher(domain: str, base_ctx: dict, trace_id: str) -> dic
     )
     domain_ctx["brain"] = sub_brain
     _log(trace_id, "fanout_brain",
-         f"domain={domain} source={sub_brain['source']} tools={sub_brain['tools']} "
-         f"tier={sub_brain['book_tier']} ensemble={sub_brain['ensemble']} — {sub_brain['reason']}")
+         f"domain={domain} source={sub_brain['source']} "
+         f"prompt={'composed' if sub_brain.get('composed_prompt') else 'static-template'} "
+         f"tools={sub_brain['tools']} tier={sub_brain['book_tier']} "
+         f"ensemble={sub_brain['ensemble']} — {sub_brain['reason']}")
 
     t0 = time.monotonic()
     try:
@@ -304,7 +306,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
                        default_tier=default_tier, known_domains=tuple(TEACHERS.keys()))
     ctx["brain"] = brain
     _log(trace_id, "brain",
-         f"source={brain['source']} tools={brain['tools']} tier={brain['book_tier']} "
+         f"source={brain['source']} "
+         f"prompt={'composed' if brain.get('composed_prompt') else 'static-template'} "
+         f"tools={brain['tools']} tier={brain['book_tier']} "
          f"ensemble={brain['ensemble']} domains={brain['domains']} — {brain['reason']}")
 
     # ── [2.8] MULTI-DOMAIN FAN-OUT (Slice 8) ──

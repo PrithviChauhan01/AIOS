@@ -1,10 +1,12 @@
-"""Teacher brain — one cheap per-task selector call (Slice X + Slice 8).
+"""Teacher brain — one per-task selector + prompt-COMPOSER call (Slice X + Slice 8 + v2).
 
-Runs BEFORE the answer book. A single groq_8b (groq_fast) call reasons about the
-task and returns a strict-JSON plan:
+Runs BEFORE the answer book, on a DEDICATED model: Google Gemini 2.5 Flash via
+GOOGLE_AI_API_KEY. Deliberately NOT an NVIDIA/pool book — NVIDIA quota is reserved
+for answer books + TTS; the brain's quota is separate by design. ONE call per task
+(the same single call Slice X made — composition folds into it, no extra call):
 
     {"tools": [...], "book_tier": "fast|strong|frontier", "ensemble": bool,
-     "domains": [...], "reason": "..."}
+     "domains": [...], "composed_prompt": "...", "reason": "..."}
 
   * tools     — which SHARED-POOL tools this task needs (may be empty). Read-only
                 fetch tools only; action tools (reminders/email/…) stay behind the
@@ -21,27 +23,64 @@ task and returns a strict-JSON plan:
                 caller (orchestrator) treats len(domains) >= 2 as a signal to fan
                 out those teachers concurrently — this module only DETECTS the
                 split, it never runs anything itself.
+  * composed_prompt — (v2) a full, task-specific, PERSONALIZED instruction for the
+                answer book, written by the brain FOR THIS TASK using relevant
+                mem_core facts about Sir (public-tier only — the hard Chroma filter
+                in profile.get_relevant_facts(cloud_bound=True)). The executor
+                (agents.base) runs THIS instead of the teacher's static
+                build_book_prompt() template, with tool results appended the same
+                way. Empty/thin/malformed → None → the static template runs —
+                worst case is exactly today's behavior.
 
-Fail-soft by contract: a failed call or malformed JSON falls back to deterministic
-keyword rules + the caller's default tier + ensemble=False + domains=[given domain].
-plan() NEVER raises.
+Fail-soft by contract: a failed/timed-out Gemini call or malformed JSON falls back
+to deterministic keyword rules + the caller's default tier + ensemble=False +
+domains=[given domain] + composed_prompt=None (static template). plan() NEVER
+raises, and a slow Gemini is cut off at _BRAIN_TIMEOUT_S so it can never hang a turn.
 
 Privacy is absolute and clamps BEFORE any cloud call: secret/private turns never
-send their text to the cloud selector, never get cloud-egress tools, never
-ensemble, and never fan out to multiple domains (domains=[] — no multi-domain
-signal, so the caller keeps its existing single-domain routing unchanged). Book
-routing itself keeps the existing guard (secret → ollama only via select_book*;
-the retrieval guard in cognition) — this module can only ever RESTRICT a turn,
-never widen one.
+send their text OR mem_core to the cloud brain (Gemini included), never get
+cloud-egress tools, never ensemble, never fan out, and never get a composed prompt
+(static template + ollama only). Book routing itself keeps the existing guard
+(secret → ollama only via select_book*; the retrieval guard in cognition) — this
+module can only ever RESTRICT a turn, never widen one.
 """
 
+import asyncio
 import json
 import re
 
-from core.books import call_book
+from config import Config
 
-# The selector book — cheapest lane. This is routing, not answering.
-BRAIN_BOOK = "groq_fast"
+# ── The dedicated brain model — Gemini 2.5 Flash, NEVER an NVIDIA/pool book. ──
+# Separate quota from the answer books by design. Lazy client so the module imports
+# without the SDK/key present (same pattern as core.books' provider clients). Uses the
+# current google-genai SDK (`from google import genai`) — the older google-generativeai
+# package is deprecated/unmaintained and prints a FutureWarning on every import.
+BRAIN_MODEL = "gemini-2.5-flash"
+_BRAIN_TIMEOUT_S = 10   # a slow Gemini must never hang a turn — timeout → static fallback
+_gemini_client = None
+
+
+def _get_gemini():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        _gemini_client = genai.Client(api_key=Config.GOOGLE_AI_API_KEY)
+    return _gemini_client
+
+
+async def _call_brain_model(prompt: str) -> str:
+    """One Gemini call, hard-capped at _BRAIN_TIMEOUT_S. Raises on missing key,
+    timeout, or any SDK error — plan() turns every raise into the static fallback."""
+    if not (Config.GOOGLE_AI_API_KEY or "").strip():
+        raise RuntimeError("GOOGLE_AI_API_KEY not set")
+    client = _get_gemini()
+    resp = await asyncio.wait_for(
+        asyncio.to_thread(
+            client.models.generate_content, model=BRAIN_MODEL, contents=prompt),
+        timeout=_BRAIN_TIMEOUT_S,
+    )
+    return resp.text or ""
 
 # Read-only pool tools the brain may draw. Action tools are deliberately absent.
 SELECTABLE_TOOLS = ("places", "search", "wikipedia")
@@ -81,13 +120,14 @@ _DOMAIN_DESCRIPTIONS = {
     "life": "schedule/habits/reminders/organizing Sir's day or week",
 }
 
-_BRAIN_PROMPT = """You are the routing brain of a personal AI system. Decide, for the task below, \
-which shared tools to draw, how much model power the answer needs, and which specialist \
-domain(s) it requires. Respond with ONLY a JSON object, nothing else.
+_BRAIN_PROMPT = """You are the routing brain of a personal AI system serving one user ("Sir"). \
+For the task below: decide which shared tools to draw, how much model power the answer needs, \
+which specialist domain(s) it requires — and WRITE the working prompt the answer model will run. \
+Respond with ONLY a JSON object, nothing else.
 
 Format:
 {{"tools": [], "book_tier": "fast|strong|frontier", "ensemble": true|false, "domains": ["{domain}"], \
-"reason": "one line"}}
+"composed_prompt": "full instruction for the answer model", "reason": "one line"}}
 
 Tools exist ONLY to fetch EXTERNAL data the system does not already have. The DEFAULT is \
 tools=[] — most turns are conversation and need NOTHING. Draw a tool only when the task truly \
@@ -131,6 +171,23 @@ touches adjacent ideas — most tasks are ONE domain. Max 3.
 Domain meanings:
 {domain_meanings}
 
+composed_prompt: write the FULL instruction the answer model will execute for this task — you are \
+composing its working prompt, not answering the task yourself. Rules for it:
+- Frame the answer model as a domain analyst for the picked domain, working THIS specific task — \
+restate the task concretely, not generically.
+- PERSONALIZE it using WHAT IS KNOWN ABOUT SIR below: fold in whatever is genuinely relevant \
+(his goals, background, preferences); ignore what isn't. Never invent facts about him.
+- Demand RAW structured material only: clearly labeled ALL-CAPS section headers suited to the task \
+(e.g. OVERVIEW / KEY CONCEPTS / EXAMPLES, or OBJECTIVE / APPROACH / RISKS, or SERVICES / CONTACT / \
+FIT SIGNALS), no greeting, no personality, no sign-off.
+- Demand facts only: anything unknown is written as "unknown", never invented. If live tool data is \
+provided with the prompt, it must be used as the factual basis and never contradicted.
+- Keep it under ~250 words. It must stand alone — the answer model sees ONLY your composed prompt \
+plus tool data.
+
+WHAT IS KNOWN ABOUT SIR (public-tier memory; relevant facts only, may be empty):
+{sir_context}
+
 Task (domain={domain}, complexity={complexity}):
 {message}
 
@@ -172,13 +229,59 @@ def _clean_domains(raw, known_domains: tuple, given_domain: str) -> list:
     return cleaned[:MAX_FANOUT_DOMAINS]
 
 
+def _extract_json(text: str) -> dict:
+    """Parse the brain's reply into a dict, tolerating Gemini's habits: markdown
+    code fences and prose around the object are stripped; the greedy first-{ to
+    last-} span is what gets parsed (composed_prompt legitimately contains braces
+    almost never, but nested braces inside the object survive a greedy span).
+    Raises on anything unparseable — plan() turns that into the static fallback."""
+    t = re.sub(r"```(?:json)?", "", text or "")
+    match = re.search(r"\{.*\}", t, re.DOTALL)
+    if not match:
+        raise ValueError("no JSON object in brain reply")
+    return json.loads(match.group(0))
+
+
+def _sir_context(message: str) -> str:
+    """Relevant mem_core facts about Sir for personalizing the composed prompt.
+    HARD privacy line: cloud_bound=True — profile.get_relevant_facts filters to
+    tier='public' AT THE CHROMA QUERY, so private/secret facts can never reach
+    Gemini even here on a public turn. (plan() never calls this for secret/private
+    turns at all — the clamp returns first.) Fail-soft: any store error just means
+    composing without personal context."""
+    try:
+        from core.profile import get_relevant_facts
+        facts = get_relevant_facts(message, cloud_bound=True)
+        if facts:
+            return "\n".join(f"- {f}" for f in facts)
+    except Exception as e:
+        print(f"[brain] mem_core retrieval failed ({e}) — composing without personal context")
+    return "(nothing relevant on file)"
+
+
+# Bounds on a usable composed prompt: under the floor it's a stub (treat as absent →
+# static template); over the ceiling it's runaway generation (truncate — the answer
+# book's instruction, not an essay).
+_COMPOSED_MIN_CHARS = 80
+_COMPOSED_MAX_CHARS = 6000
+
+
+def _clean_composed(raw) -> str | None:
+    composed = str(raw).strip() if raw else ""
+    if len(composed) < _COMPOSED_MIN_CHARS:
+        return None
+    return composed[:_COMPOSED_MAX_CHARS]
+
+
 def _fallback(message: str, default_tier: str | None, complexity: str,
               loop_worthy: bool, why: str, known_domains: tuple,
               given_domain: str) -> dict:
     """Keyword-rule plan. Tier from the caller's default (teacher's declared tier)
     or complexity; ensemble always False — the fallback never spends two books.
-    domains is NEVER guessed from keywords here — too fragile to safely widen scope
-    on a failure — it's always just the caller's existing single given_domain."""
+    composed_prompt is None — the teacher's static template runs, i.e. exactly
+    today's behavior. domains is NEVER guessed from keywords here — too fragile to
+    safely widen scope on a failure — it's always just the caller's existing single
+    given_domain."""
     low = message or ""
     tools = []
     if _PLACES_RE.search(low):
@@ -195,6 +298,7 @@ def _fallback(message: str, default_tier: str | None, complexity: str,
 
     return {"tools": tools, "book_tier": tier, "ensemble": False,
             "domains": _clean_domains([], known_domains, given_domain),
+            "composed_prompt": None,
             "reason": f"keyword fallback ({why})", "source": "fallback"}
 
 
@@ -224,8 +328,10 @@ def _validate(parsed: dict, default_tier: str | None, complexity: str,
         "book_tier": tier,
         "ensemble": bool(parsed.get("ensemble", False)),
         "domains": _clean_domains(parsed.get("domains", []), known_domains, given_domain),
+        # None (too thin / absent) → executor falls back to the static template.
+        "composed_prompt": _clean_composed(parsed.get("composed_prompt")),
         "reason": str(parsed.get("reason", ""))[:200] or "no reason given",
-        "source": "brain",
+        "source": "gemini",
     }
 
 
@@ -233,42 +339,46 @@ async def plan(message: str, *, domain: str = "none", sensitivity: str = "public
                complexity: str = None, loop_worthy: bool = False,
                default_tier: str | None = None,
                known_domains: tuple = DEFAULT_TEACHER_DOMAINS) -> dict:
-    """The brain step. One cheap selector call → {tools, book_tier, ensemble,
-    domains, reason, source}. NEVER raises; never weakens privacy.
+    """The brain step. ONE Gemini 2.5 Flash call → {tools, book_tier, ensemble,
+    domains, composed_prompt, reason, source}. NEVER raises; never weakens privacy;
+    never spends NVIDIA/pool quota (the compose runs on Gemini's own key).
 
-    source: 'brain' (selector answered), 'fallback' (keyword rules), or
-    'privacy' (secret/private clamp — no cloud call was made at all).
+    source: 'gemini' (brain answered — composed_prompt may still be None if it came
+    back thin), 'fallback' (keyword rules + static template), or 'privacy'
+    (secret/private clamp — no cloud call, no mem_core egress, static template).
 
     domains (Slice 8): len>=2 is the caller's signal to fan out those teachers
     concurrently. secret/private always get domains=[] — no multi-domain signal —
     so a sensitive turn's existing single-domain routing is never touched by this."""
-    # ── PRIVACY CLAMP — before ANY cloud call. ──
-    # secret/private text never reaches the cloud selector, cloud-egress tools are
-    # disallowed (every selectable fetch tool sends the query to an external API),
-    # ensemble is off, and there is no multi-domain fan-out (no fan-out of a
-    # sensitive turn to multiple teachers/books). Book selection keeps the existing
-    # absolute guard downstream (secret → ollama only).
+    # ── PRIVACY CLAMP — before ANY cloud call, INCLUDING mem_core retrieval. ──
+    # secret/private text never reaches the cloud brain (Gemini included), mem_core
+    # is never even queried for the compose (no personal facts egress), cloud-egress
+    # tools are disallowed, ensemble is off, no multi-domain fan-out, and
+    # composed_prompt=None means the local path runs the teacher's static template.
+    # Book selection keeps the existing absolute guard downstream (secret → ollama).
     if sensitivity in ("secret", "private"):
         return {"tools": [], "book_tier": default_tier if default_tier in _TIERS else "fast",
-                "ensemble": False, "domains": [],
-                "reason": f"{sensitivity} turn — privacy clamp: no cloud selector, "
-                          "no cloud tools, no ensemble, no multi-domain fan-out",
+                "ensemble": False, "domains": [], "composed_prompt": None,
+                "reason": f"{sensitivity} turn — privacy clamp: no cloud brain, no "
+                          "mem_core egress, no cloud tools, no ensemble, no fan-out",
                 "source": "privacy"}
 
     domain_list = ", ".join(known_domains)
     domain_meanings = "\n".join(
         f'- "{d}": {_DOMAIN_DESCRIPTIONS.get(d, "")}' for d in known_domains)
+    # mem_core → the compose. Public turns only (the clamp above already returned for
+    # secret/private) and cloud_bound=True besides — public-tier facts only, filtered
+    # at the Chroma query itself.
+    sir_context = _sir_context(message)
     prompt = _BRAIN_PROMPT.format(domain=domain, complexity=complexity or "unknown",
                                   domain_list=domain_list, domain_meanings=domain_meanings,
+                                  sir_context=sir_context,
                                   message=(message or "")[:2000])
     try:
-        result = await call_book(prompt, BRAIN_BOOK, max_tokens=200)
-        match = re.search(r"\{.*\}", result["raw_text"] or "", re.DOTALL)
-        if not match:
-            raise ValueError("no JSON object in selector reply")
-        return _validate(json.loads(match.group(0)), default_tier, complexity, loop_worthy,
+        raw = await _call_brain_model(prompt)
+        return _validate(_extract_json(raw), default_tier, complexity, loop_worthy,
                          known_domains, domain)
     except Exception as e:
-        print(f"[brain] selector failed ({e}) -> keyword fallback")
+        print(f"[brain] gemini brain failed ({e}) -> keyword fallback + static template")
         return _fallback(message, default_tier, complexity, loop_worthy, str(e)[:80],
                          known_domains, domain)

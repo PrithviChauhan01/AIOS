@@ -60,20 +60,38 @@ class Teacher(ABC):
     async def run(self, ctx: dict) -> dict:
         query = ctx.get("message") or ctx.get("query", "")
         domain_memory = self.retrieve_memory(query)
-        prompt = self.build_book_prompt(ctx, domain_memory)
 
         declared_tier = self.reasoning_tier(ctx)
         sensitivity = ctx.get("sensitivity", "public")
         complexity = ctx.get("complexity")
         loop_worthy = ctx.get("loop_worthy")
 
-        # ── BRAIN PLAN (Slice X) — decided upstream, one cheap selector call per task. ──
+        # ── BRAIN PLAN (Slice X + v2) — decided upstream, one Gemini call per task. ──
         # The brain's per-task book_tier replaces the teacher's fixed tier (the teacher's
         # declared tier was the brain's default and remains the fallback). No brain in
         # ctx (direct invocation, tests) → teacher default, no tools, single book.
         brain = ctx.get("brain") or {}
         tier = brain.get("book_tier") if brain.get("book_tier") in _BRAIN_TIERS \
             else declared_tier
+
+        # ── BOOK PROMPT — the brain's COMPOSED prompt when it wrote one, else the ──
+        # static template. Public turns only (a composed prompt was personalized with
+        # mem_core and written by a cloud brain; the local/sensitive path always runs
+        # the static template — brain.py already returns None there, this is the
+        # structural backstop). The teacher's own domain memory (mem_study etc.) is
+        # appended to the composed prompt so switching prompts never loses it — the
+        # static template folds it in itself.
+        composed = (brain.get("composed_prompt") or "").strip()
+        if composed and sensitivity == "public":
+            prompt = composed
+            if domain_memory:
+                prompt += ("\n\nKNOWN DOMAIN CONTEXT (from memory — fold in where "
+                           "relevant):\n" + "\n".join(f"- {m}" for m in domain_memory))
+            prompt_src = "composed(gemini)"
+        else:
+            prompt = self.build_book_prompt(ctx, domain_memory)
+            prompt_src = "static-template"
+        print(f"[{self.domain}] book_prompt={prompt_src}")
 
         # ── SHARED-POOL TOOLS — the brain picked them; draw them generically. ──
         # Skip tools this teacher fetches itself (owns_tools) so nothing fires twice.

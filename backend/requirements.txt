@@ -15,5 +15,3 @@ pypdf
 python-docx
 openpyxl
 openai
-google-generativeai
-google-genai

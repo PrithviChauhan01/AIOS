@@ -66,7 +66,7 @@ class Teacher(ABC):
         complexity = ctx.get("complexity")
         loop_worthy = ctx.get("loop_worthy")
 
-        # ── BRAIN PLAN (Slice X + v2) — decided upstream, one Gemini call per task. ──
+        # ── BRAIN PLAN (Slice X + v2) — decided upstream, one brain call per task. ──
         # The brain's per-task book_tier replaces the teacher's fixed tier (the teacher's
         # declared tier was the brain's default and remains the fallback). No brain in
         # ctx (direct invocation, tests) → teacher default, no tools, single book.
@@ -87,7 +87,7 @@ class Teacher(ABC):
             if domain_memory:
                 prompt += ("\n\nKNOWN DOMAIN CONTEXT (from memory — fold in where "
                            "relevant):\n" + "\n".join(f"- {m}" for m in domain_memory))
-            prompt_src = "composed(gemini)"
+            prompt_src = "composed(brain)"
         else:
             prompt = self.build_book_prompt(ctx, domain_memory)
             prompt_src = "static-template"

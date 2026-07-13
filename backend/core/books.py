@@ -10,7 +10,6 @@ CAPABILITY_MAP = {
     "cerebras": {"speed": "high", "reasoning": "good",   "context": "med",   "cost": "free", "tier": "cloud"},
     "mistral":  {"speed": "med",  "reasoning": "good",   "context": "huge",  "cost": "free", "tier": "cloud"},
     "gpt4o":    {"speed": "med",  "reasoning": "best",   "context": "large", "cost": "ltd",  "tier": "cloud"},
-    "gemini":   {"speed": "med",  "reasoning": "strong", "context": "huge",  "cost": "ltd",  "tier": "cloud"},
     # NVIDIA Nemotron 3 (OpenAI-compatible via NVIDIA NIM) — high-reasoning, free, cloud.
     "nemotron_super": {"speed": "med", "reasoning": "best",     "context": "huge", "cost": "free", "tier": "cloud"},
     "nemotron_ultra": {"speed": "low", "reasoning": "frontier", "context": "huge", "cost": "free", "tier": "cloud"},
@@ -29,7 +28,6 @@ _MODELS = {
     "cerebras":"gpt-oss-120b",
     "mistral":  "mistral-large-latest",
     "gpt4o":    "gpt-4o",
-    "gemini":   "gemini-1.5-pro",
     "nemotron_super": "nvidia/nemotron-3-super-120b-a12b",
     "nemotron_ultra": "nvidia/nemotron-3-ultra-550b-a55b",
     "ollama":   "llama3.2",
@@ -205,7 +203,7 @@ def select_ensemble_books(tier: str, sensitivity_tier: str,
                           complexity: str = None, loop_worthy: bool = None) -> list:
     """Two DISTINCT books (different families), best→worst — the candidate pool for a
     teacher ensemble. This is NOT compulsory: the caller (agents.base.Teacher.run) only
-    reaches this when the Gemini brain's per-task plan set ensemble=true for a task it
+    reaches this when the brain's per-task plan set ensemble=true for a task it
     judged genuinely benefits from two passes (complex reasoning, a high-stakes
     deliverable); a straightforward task gets a single book instead — the quota guard.
     The teacher's tier book leads; the second slot is the next-best book from a DIFFERENT
@@ -247,7 +245,9 @@ def select_fast_book(sensitivity_tier: str) -> list:
 # ── Provider clients (lazy so the module imports without every SDK/key present) ──
 _clients = {}
 
-def _groq_client():
+def groq_client():
+    # Public: core.brain runs the routing brain (Groq 70b) on this same shared client, so
+    # there is exactly one Groq connection pool in the process.
     if "groq" not in _clients:
         from groq import Groq
         _clients["groq"] = Groq(api_key=Config.GROQ_API_KEY)
@@ -272,9 +272,11 @@ def _openai_client():
     return _clients["openai"]
 
 # NVIDIA NIM is OpenAI-compatible — same SDK, just a different base_url + key.
+# Public: core.brain runs the routing brain (Qwen) on the same endpoint and shares this
+# lazily-built client, so there is exactly one NIM connection pool in the process.
 _NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-def _nvidia_client():
+def nvidia_client():
     if "nvidia" not in _clients:
         from openai import OpenAI
         _clients["nvidia"] = OpenAI(api_key=Config.NVIDIA_API_KEY, base_url=_NVIDIA_BASE_URL)
@@ -284,12 +286,12 @@ def _nvidia_client():
 # max_tokens is per-call: cognition hard-caps length (trivial ~60, deliverable
 # ~900). Defaults to _MAX_TOKENS for callers that don't care (e.g. teachers).
 def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
-    r = _groq_client().chat.completions.create(
+    r = groq_client().chat.completions.create(
         model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
 def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
-    r = _groq_client().chat.completions.create(
+    r = groq_client().chat.completions.create(
         model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
@@ -310,7 +312,7 @@ def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
 
 # Nemotron Super — standard chat completion, no reasoning-budget params.
 def _call_nemotron_super(prompt: str, max_tokens: int = _MAX_TOKENS):
-    r = _nvidia_client().chat.completions.create(
+    r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_super"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
@@ -332,7 +334,7 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     # max_tokens is the FINAL-ANSWER budget; reasoning gets its own budget on top.
     answer_cap = max(max_tokens, _ULTRA_MIN_ANSWER_TOKENS)
     api_max = _ULTRA_REASONING_BUDGET + answer_cap
-    r = _nvidia_client().chat.completions.create(
+    r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_ultra"], messages=[{"role": "user", "content": prompt}],
         max_tokens=api_max,
         extra_body={"chat_template_kwargs": {"enable_thinking": True},
@@ -347,15 +349,6 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     # reply can never carry the thinking trace.
     answer = _THINK_BLOCK_RE.sub("", answer).strip()
     return answer, r.usage.total_tokens
-
-def _call_gemini(prompt: str, max_tokens: int = _MAX_TOKENS):
-    import google.generativeai as genai
-    genai.configure(api_key=Config.GOOGLE_AI_API_KEY)
-    model = genai.GenerativeModel(_MODELS["gemini"])
-    r = model.generate_content(
-        prompt, generation_config={"max_output_tokens": max_tokens})
-    tokens = getattr(getattr(r, "usage_metadata", None), "total_token_count", 0)
-    return r.text, tokens
 
 def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
     import ollama
@@ -375,7 +368,6 @@ _DISPATCH = {
     "cerebras": _call_cerebras,
     "mistral": _call_mistral,
     "gpt4o": _call_gpt4o,
-    "gemini": _call_gemini,
     "nemotron_super": _call_nemotron_super,
     "nemotron_ultra": _call_nemotron_ultra,
     "ollama": _call_ollama,

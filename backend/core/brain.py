@@ -1,9 +1,10 @@
 """Teacher brain — one per-task selector + prompt-COMPOSER call (Slice X + Slice 8 + v2).
 
-Runs BEFORE the answer book, on a DEDICATED model: Google Gemini 2.5 Flash via
-GOOGLE_AI_API_KEY. Deliberately NOT an NVIDIA/pool book — NVIDIA quota is reserved
-for answer books + TTS; the brain's quota is separate by design. ONE call per task
-(the same single call Slice X made — composition folds into it, no extra call):
+Runs BEFORE the answer book, on a DEDICATED model: Groq llama-3.3-70b-versatile, keyed
+by GROQ_API_KEY. It therefore SHARES Groq quota with the Groq answer book — an accepted
+trade: a brain 429 raises, and plan() degrades to the keyword fallback + static template
+exactly as it does for any other failure. ONE call per task (the same single call Slice X
+made — composition folds into it, no extra call):
 
     {"tools": [...], "book_tier": "fast|strong|frontier", "ensemble": bool,
      "domains": [...], "composed_prompt": "...", "reason": "..."}
@@ -32,13 +33,14 @@ for answer books + TTS; the brain's quota is separate by design. ONE call per ta
                 way. Empty/thin/malformed → None → the static template runs —
                 worst case is exactly today's behavior.
 
-Fail-soft by contract: a failed/timed-out Gemini call or malformed JSON falls back
+Fail-soft by contract: a failed/timed-out brain call or malformed JSON falls back
 to deterministic keyword rules + the caller's default tier + ensemble=False +
 domains=[given domain] + composed_prompt=None (static template). plan() NEVER
-raises, and a slow Gemini is cut off at _BRAIN_TIMEOUT_S so it can never hang a turn.
+raises, and a slow brain is cut off at _BRAIN_TIMEOUT_S so it can never hang a turn.
 
-Privacy is absolute and clamps BEFORE any cloud call: secret/private turns never
-send their text OR mem_core to the cloud brain (Gemini included), never get
+Privacy is absolute and clamps BEFORE any cloud call — it is MODEL-AGNOSTIC and sits
+above the model choice, so swapping the brain cannot weaken it: secret/private turns
+never send their text OR mem_core to the cloud brain (Groq included), never get
 cloud-egress tools, never ensemble, never fan out, and never get a composed prompt
 (static template + ollama only). Book routing itself keeps the existing guard
 (secret → ollama only via select_book*; the retrieval guard in cognition) — this
@@ -51,36 +53,40 @@ import re
 
 from config import Config
 
-# ── The dedicated brain model — Gemini 2.5 Flash, NEVER an NVIDIA/pool book. ──
-# Separate quota from the answer books by design. Lazy client so the module imports
-# without the SDK/key present (same pattern as core.books' provider clients). Uses the
-# current google-genai SDK (`from google import genai`) — the older google-generativeai
-# package is deprecated/unmaintained and prints a FutureWarning on every import.
-BRAIN_MODEL = "gemini-2.5-flash"
-_BRAIN_TIMEOUT_S = 10   # a slow Gemini must never hang a turn — timeout → static fallback
-_gemini_client = None
+# ── The dedicated brain model — Groq llama-3.3-70b-versatile. ──
+# On api.groq.com, keyed by GROQ_API_KEY. It reuses core.books' shared Groq client (the
+# same one the Groq answer book rides), so the brain and the answer book share ONE Groq
+# connection pool AND one quota — an accepted trade: on a 429 the call raises and plan()
+# degrades to the keyword fallback + static template, identical to any other brain
+# failure. Groq is fast enough (sub-second to a few seconds) that the brain step stays
+# imperceptible per turn — the earlier NVIDIA-NIM Qwen brain ran 130-200s/call and was
+# abandoned. The call is capped at _BRAIN_TIMEOUT_S so a slow brain can't hang a turn.
+BRAIN_MODEL = "llama-3.3-70b-versatile"
+_BRAIN_TIMEOUT_S = 8    # a slow brain must never hang a turn — timeout → static fallback
+_BRAIN_MAX_TOKENS = 1200  # room for the composed prompt (~250 words) + the routing JSON
 
 
-def _get_gemini():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai
-        _gemini_client = genai.Client(api_key=Config.GOOGLE_AI_API_KEY)
-    return _gemini_client
+def _call_brain_sync(prompt: str) -> str:
+    """Blocking Groq chat completion — run off-thread by _call_brain_model. Returns the
+    model's text content (the routing JSON)."""
+    from core.books import groq_client
+    r = groq_client().chat.completions.create(
+        model=BRAIN_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=_BRAIN_MAX_TOKENS,
+    )
+    return r.choices[0].message.content or ""
 
 
 async def _call_brain_model(prompt: str) -> str:
-    """One Gemini call, hard-capped at _BRAIN_TIMEOUT_S. Raises on missing key,
-    timeout, or any SDK error — plan() turns every raise into the static fallback."""
-    if not (Config.GOOGLE_AI_API_KEY or "").strip():
-        raise RuntimeError("GOOGLE_AI_API_KEY not set")
-    client = _get_gemini()
-    resp = await asyncio.wait_for(
-        asyncio.to_thread(
-            client.models.generate_content, model=BRAIN_MODEL, contents=prompt),
+    """One Groq (llama-3.3-70b) call, hard-capped at _BRAIN_TIMEOUT_S. Raises on missing
+    key, timeout, or any SDK error — plan() turns every raise into the static fallback."""
+    if not (Config.GROQ_API_KEY or "").strip():
+        raise RuntimeError("GROQ_API_KEY not set")
+    return await asyncio.wait_for(
+        asyncio.to_thread(_call_brain_sync, prompt),
         timeout=_BRAIN_TIMEOUT_S,
     )
-    return resp.text or ""
 
 # Read-only pool tools the brain may draw. Action tools are deliberately absent.
 SELECTABLE_TOOLS = ("places", "search", "wikipedia")
@@ -230,7 +236,7 @@ def _clean_domains(raw, known_domains: tuple, given_domain: str) -> list:
 
 
 def _extract_json(text: str) -> dict:
-    """Parse the brain's reply into a dict, tolerating Gemini's habits: markdown
+    """Parse the brain's reply into a dict, tolerating a model's habits: markdown
     code fences and prose around the object are stripped; the greedy first-{ to
     last-} span is what gets parsed (composed_prompt legitimately contains braces
     almost never, but nested braces inside the object survive a greedy span).
@@ -245,8 +251,8 @@ def _extract_json(text: str) -> dict:
 def _sir_context(message: str) -> str:
     """Relevant mem_core facts about Sir for personalizing the composed prompt.
     HARD privacy line: cloud_bound=True — profile.get_relevant_facts filters to
-    tier='public' AT THE CHROMA QUERY, so private/secret facts can never reach
-    Gemini even here on a public turn. (plan() never calls this for secret/private
+    tier='public' AT THE CHROMA QUERY, so private/secret facts can never reach the
+    cloud brain even here on a public turn. (plan() never calls this for secret/private
     turns at all — the clamp returns first.) Fail-soft: any store error just means
     composing without personal context."""
     try:
@@ -331,7 +337,7 @@ def _validate(parsed: dict, default_tier: str | None, complexity: str,
         # None (too thin / absent) → executor falls back to the static template.
         "composed_prompt": _clean_composed(parsed.get("composed_prompt")),
         "reason": str(parsed.get("reason", ""))[:200] or "no reason given",
-        "source": "gemini",
+        "source": "groq",
     }
 
 
@@ -339,11 +345,12 @@ async def plan(message: str, *, domain: str = "none", sensitivity: str = "public
                complexity: str = None, loop_worthy: bool = False,
                default_tier: str | None = None,
                known_domains: tuple = DEFAULT_TEACHER_DOMAINS) -> dict:
-    """The brain step. ONE Gemini 2.5 Flash call → {tools, book_tier, ensemble,
-    domains, composed_prompt, reason, source}. NEVER raises; never weakens privacy;
-    never spends NVIDIA/pool quota (the compose runs on Gemini's own key).
+    """The brain step. ONE Groq llama-3.3-70b call → {tools, book_tier, ensemble,
+    domains, composed_prompt, reason, source}. NEVER raises; never weakens privacy.
+    Shares Groq quota with the Groq answer book (accepted — the fallback chain handles
+    exhaustion).
 
-    source: 'gemini' (brain answered — composed_prompt may still be None if it came
+    source: 'groq' (brain answered — composed_prompt may still be None if it came
     back thin), 'fallback' (keyword rules + static template), or 'privacy'
     (secret/private clamp — no cloud call, no mem_core egress, static template).
 
@@ -351,11 +358,13 @@ async def plan(message: str, *, domain: str = "none", sensitivity: str = "public
     concurrently. secret/private always get domains=[] — no multi-domain signal —
     so a sensitive turn's existing single-domain routing is never touched by this."""
     # ── PRIVACY CLAMP — before ANY cloud call, INCLUDING mem_core retrieval. ──
-    # secret/private text never reaches the cloud brain (Gemini included), mem_core
-    # is never even queried for the compose (no personal facts egress), cloud-egress
-    # tools are disallowed, ensemble is off, no multi-domain fan-out, and
-    # composed_prompt=None means the local path runs the teacher's static template.
-    # Book selection keeps the existing absolute guard downstream (secret → ollama).
+    # This is MODEL-AGNOSTIC: it returns before _call_brain_model is ever reached, so the
+    # brain model (Groq, or anything it's swapped for) is never even constructed on a
+    # sensitive turn. secret/private text never reaches the cloud brain, mem_core is never
+    # queried for the compose (no personal facts egress), cloud-egress tools are
+    # disallowed, ensemble is off, no multi-domain fan-out, and composed_prompt=None means
+    # the local path runs the teacher's static template. Book selection keeps the existing
+    # absolute guard downstream (secret → ollama).
     if sensitivity in ("secret", "private"):
         return {"tools": [], "book_tier": default_tier if default_tier in _TIERS else "fast",
                 "ensemble": False, "domains": [], "composed_prompt": None,
@@ -376,9 +385,13 @@ async def plan(message: str, *, domain: str = "none", sensitivity: str = "public
                                   message=(message or "")[:2000])
     try:
         raw = await _call_brain_model(prompt)
-        return _validate(_extract_json(raw), default_tier, complexity, loop_worthy,
-                         known_domains, domain)
+        plan_out = _validate(_extract_json(raw), default_tier, complexity, loop_worthy,
+                             known_domains, domain)
+        print(f"[brain] brain=groq composed "
+              f"(prompt={'yes' if plan_out['composed_prompt'] else 'none'} "
+              f"tools={plan_out['tools']} tier={plan_out['book_tier']})")
+        return plan_out
     except Exception as e:
-        print(f"[brain] gemini brain failed ({e}) -> keyword fallback + static template")
+        print(f"[brain] brain=groq failed ({e}) -> fallback: keyword rules + static template")
         return _fallback(message, default_tier, complexity, loop_worthy, str(e)[:80],
                          known_domains, domain)

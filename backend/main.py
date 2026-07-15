@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import Config
 from api.health_routes import router as health_router
 from api.chat_routes import router as chat_router
+from api.dashboard_routes import router as dashboard_router
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
 from core.auth import generate_token
@@ -33,6 +34,8 @@ def create_app() -> FastAPI:
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
+            "http://localhost:5173",   # dashboard/ — Vite dev server
+            "http://127.0.0.1:5173",
         ],
         allow_credentials=True,
         allow_methods=["*"],
@@ -41,6 +44,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(chat_router)
+    app.include_router(dashboard_router)
 
     @app.get("/token")
     async def token():

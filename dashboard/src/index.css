@@ -1,0 +1,26 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d0f;
+  --panel: #111417;
+  --border: #24292e;
+  --fg: #d7dde3;
+  --dim: #7b8794;
+  --accent: #3ee08c;
+  --danger: #e0603e;
+  font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", ui-monospace,
+    Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+#root {
+  min-height: 100vh;
+}

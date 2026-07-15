@@ -1,5 +1,7 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import { useToken } from "@/lib/token-context";
+import { API_BASE } from "@/lib/api";
 
 type Mood = "warm" | "neutral" | "sharp" | "soft";
 
@@ -10,10 +12,11 @@ interface Message {
 }
 
 // Subtle per-mood tint for AIOS messages — thin left border + faint glow.
-// Kept dark and minimal so it reads as a hint, not a highlight.
+// Kept dark and minimal so it reads as a hint, not a highlight. "neutral" uses
+// the fg token (not a fixed zinc shade) so it stays a quiet hint in both themes.
 const MOOD_STYLES: Record<Mood, string> = {
   warm: "border-amber-500/60 shadow-[-4px_0_12px_-6px_rgba(245,158,11,0.5)]",
-  neutral: "border-zinc-700",
+  neutral: "border-fg/30",
   sharp: "border-red-500/60 shadow-[-4px_0_12px_-6px_rgba(239,68,68,0.5)]",
   soft: "border-blue-500/60 shadow-[-4px_0_12px_-6px_rgba(59,130,246,0.5)]",
 };
@@ -23,20 +26,14 @@ function moodStyle(mood?: Mood): string {
 }
 
 export default function Home() {
+  const { token } = useToken();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [token, setToken] = useState("");
   const [loading, setLoading] = useState(false);
   const [onboardingQuestion, setOnboardingQuestion] = useState("");
   const [awaitingOnboarding, setAwaitingOnboarding] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    fetch("http://127.0.0.1:5000/token")
-      .then((r) => r.json())
-      .then((d) => setToken(d.token));
-  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -49,7 +46,7 @@ export default function Home() {
     setMessages((m) => [...m, { role: "user", content: userMsg }]);
     setLoading(true);
 
-    const res = await fetch("http://127.0.0.1:5000/chat", {
+    const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -79,15 +76,22 @@ export default function Home() {
   };
 
   return (
-    <main className="min-h-screen bg-black text-white flex flex-col">
-      <div className="border-b border-zinc-800 px-6 py-4 flex items-center justify-between">
-        <span className="text-xs tracking-widest text-zinc-500 uppercase">AIOS</span>
+    <main className="flex-1 flex flex-col bg-bg text-fg">
+      <div className="border-b border-border px-6 py-4 flex items-center gap-3">
+        <input
+          className="flex-1 bg-panel text-fg text-sm px-4 py-2 rounded outline-none placeholder-fg-dim"
+          placeholder="Speak..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          autoFocus
+        />
         <button
           onClick={() => setVoiceEnabled((v) => !v)}
           aria-pressed={voiceEnabled}
           title={voiceEnabled ? "Voice on" : "Voice off"}
           className={`transition ${
-            voiceEnabled ? "text-white" : "text-zinc-600 hover:text-zinc-400"
+            voiceEnabled ? "text-fg" : "text-fg-dim hover:text-fg"
           }`}
         >
           {voiceEnabled ? (
@@ -106,20 +110,9 @@ export default function Home() {
             </svg>
           )}
         </button>
-      </div>
-
-      <div className="border-b border-zinc-800 px-6 py-4 flex gap-3">
-        <input
-          className="flex-1 bg-zinc-900 text-white text-sm px-4 py-2 rounded outline-none placeholder-zinc-600"
-          placeholder="Speak..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          autoFocus
-        />
         <button
           onClick={send}
-          className="text-xs text-zinc-500 hover:text-white transition px-3"
+          className="text-xs text-fg-dim hover:text-fg transition px-3"
         >
           Send
         </button>
@@ -130,18 +123,18 @@ export default function Home() {
           <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
             <div className={`max-w-xl px-4 py-2 rounded text-sm ${
               m.role === "user"
-                ? "bg-zinc-800 text-white"
-                : `text-zinc-300 border-l-2 ${moodStyle(m.mood)}`
+                ? "bg-fg/10 text-fg"
+                : `text-fg/90 border-l-2 ${moodStyle(m.mood)}`
             }`}>
               {m.role === "aios" && (
-                <span className="text-xs text-zinc-600 mr-2 uppercase tracking-widest">AIOS</span>
+                <span className="text-xs text-fg-dim mr-2 uppercase tracking-widest">AIOS</span>
               )}
               {m.content}
             </div>
           </div>
         ))}
         {loading && (
-          <div className="text-zinc-600 text-sm">...</div>
+          <div className="text-fg-dim text-sm">...</div>
         )}
         <div ref={bottomRef} />
       </div>

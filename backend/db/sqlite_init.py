@@ -74,6 +74,22 @@ CREATE TABLE IF NOT EXISTS habits (
     done        INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS fitness_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    activity        TEXT NOT NULL,
+    duration_min    INTEGER,
+    notes           TEXT,
+    logged_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS study_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic           TEXT NOT NULL,
+    duration_min    INTEGER,
+    notes           TEXT,
+    logged_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS onboarding (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     question_asked  TEXT,

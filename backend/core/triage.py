@@ -113,4 +113,12 @@ def triage(message: str) -> dict:
 
     # Layer 1 wins on sensitivity — can only raise, never lower
     result["sensitivity"] = _max_tier(result["sensitivity"], rule_tier)
+
+    # ── Slice 8 field parity ──
+    # Multi-domain fan-out is DETECTED by the 70b brain (core.brain.plan → brain['domains']),
+    # not here — the 3B triage is deliberately not trusted to split domains. This field is a
+    # backward-compat mirror only: domains[0] == domain always, so any consumer reading a
+    # `domains` list off the triage verdict sees the single routed domain. It carries no
+    # fan-out signal on its own (the orchestrator keys fan-out off brain['domains']).
+    result["domains"] = [result["domain"]]
     return result

@@ -46,6 +46,16 @@ def get_study_sessions() -> list:
     )
 
 
+def get_reminders() -> list:
+    # Pending first, then completed; soonest-due first within each group — the order
+    # the panel renders, so the client never has to re-sort. due_at is stored in a
+    # lexicographically sortable format (tools/reminders.py:_DT_FMT).
+    return _rows(
+        "SELECT id, title, due_at, repeat, done, created_at "
+        "FROM reminders ORDER BY done ASC, due_at ASC"
+    )
+
+
 def get_habits() -> list:
     # Raw per-day rows, most recent first — the caller groups by name if it wants
     # a per-habit day grid; nothing here assumes a shape the (currently empty,

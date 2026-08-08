@@ -1,43 +1,395 @@
 @import "tailwindcss";
 
 /* ── Theme tokens ── */
-/* Dark is the default (no class yet = dark), .light overrides. The class is
+/* Dark (near-black void + frosted glass) is the default (no class yet = dark),
+   .light overrides with the same glass language on a bright void. The class is
    set on <html> by an inline beforeInteractive script in layout.tsx (reads
    localStorage before paint) and kept in sync by ThemeProvider afterward —
    see lib/theme-context.tsx. */
 :root {
-  --bg: #0b0d0f;
-  --panel: #111417;
-  --border: #24292e;
-  --fg: #d7dde3;
-  --fg-dim: #7b8794;
-  --accent: #3ee08c;
+  --bg: #050506;
+  --panel: rgba(255, 255, 255, 0.04);
+  --glass: rgba(255, 255, 255, 0.04);
+  --glass-2: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.07);
+  --border-hi: rgba(255, 255, 255, 0.14);
+  --fg: rgba(255, 255, 255, 0.92);
+  --fg-2: rgba(255, 255, 255, 0.7);
+  --fg-dim: rgba(255, 255, 255, 0.45);
+  --user-bubble: rgba(255, 255, 255, 0.09);
+  --accent: #4ade80;
+  --shadow: 0 24px 70px -24px rgba(0, 0, 0, 0.8);
 }
 
 :root.light {
-  --bg: #ffffff;
-  --panel: #f1f3f5;
-  --border: #e2e5e9;
-  --fg: #16181c;
-  --fg-dim: #6b7280;
+  --bg: #f3f3f5;
+  --panel: rgba(10, 10, 10, 0.035);
+  --glass: rgba(10, 10, 10, 0.035);
+  --glass-2: rgba(10, 10, 10, 0.06);
+  --border: rgba(10, 10, 10, 0.08);
+  --border-hi: rgba(10, 10, 10, 0.16);
+  --fg: rgba(10, 10, 10, 0.9);
+  --fg-2: rgba(10, 10, 10, 0.65);
+  --fg-dim: rgba(10, 10, 10, 0.42);
+  --user-bubble: rgba(10, 10, 10, 0.055);
   --accent: #16a34a;
+  --shadow: 0 24px 70px -24px rgba(0, 0, 0, 0.2);
 }
 
 @theme inline {
   --color-bg: var(--bg);
   --color-panel: var(--panel);
+  --color-glass: var(--glass);
+  --color-glass-2: var(--glass-2);
   --color-border: var(--border);
+  --color-border-hi: var(--border-hi);
   --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
   --color-fg-dim: var(--fg-dim);
+  --color-user-bubble: var(--user-bubble);
   --color-accent: var(--accent);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-figtree);
+  --font-mono: var(--font-dm-mono);
 }
 
 body {
   background: var(--bg);
   color: var(--fg);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-figtree), -apple-system, system-ui, sans-serif;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  width: 0;
+}
+
+/* ambient light field behind the chat — gives the glass bubbles something to
+   blur; without it backdrop-blur has nothing but flat void behind it */
+.ambient-field::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(closest-side at 18% 22%, rgba(60, 220, 130, 0.16), transparent 70%),
+    radial-gradient(closest-side at 82% 68%, rgba(40, 200, 160, 0.13), transparent 70%),
+    radial-gradient(closest-side at 55% 90%, rgba(120, 230, 90, 0.1), transparent 70%);
+  filter: blur(30px);
+}
+.ambient-field > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── shared glass components (design-reference.html ported 1:1) ── */
+
+.brand-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 12px rgba(74, 222, 128, 0.9), 0 0 4px rgba(74, 222, 128, 1);
+}
+
+.nav-pill {
+  position: relative;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--glass);
+  border: 1px solid var(--border);
+}
+/* Fixed-size slots + a fixed-size indicator that only ever translateX's
+   between them — width is never derived from label content/state, so
+   nothing here can reflow when the active tab changes. Slot width (110px)
+   and the slot-1 offset (112px = 110px slot + 2px gap) are the two numbers
+   that must stay in sync if a link label ever changes. */
+.nav-pill-indicator {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 110px;
+  height: 32px;
+  border-radius: 999px;
+  background: var(--glass-2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.15), 0 2px 8px -3px rgba(0, 0, 0, 0.5);
+  transition: transform 0.2s ease;
+  pointer-events: none;
+  z-index: 0;
+  transform: translateX(0);
+}
+.nav-pill[data-active="1"] .nav-pill-indicator {
+  transform: translateX(112px);
+}
+:root.light .nav-pill-indicator {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 2px 8px -3px rgba(0, 0, 0, 0.12);
+}
+.nav-link {
+  position: relative;
+  z-index: 1;
+  width: 110px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  border-radius: 999px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.nav-link:hover {
+  color: var(--fg-2);
+}
+.nav-link.on {
+  color: var(--fg);
+}
+
+/* inward-bevel round icon button (nav theme toggle, chat header icons) */
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--fg);
+  cursor: pointer;
+  background: linear-gradient(160deg, rgba(0, 0, 0, 0.35), rgba(255, 255, 255, 0.02) 60%, rgba(255, 255, 255, 0.06));
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.65), inset 0 -1px 1px rgba(255, 255, 255, 0.12),
+    0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: box-shadow 0.15s ease;
+}
+.icon-btn:hover {
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.75), inset 0 -1px 1px rgba(255, 255, 255, 0.15),
+    0 1px 0 rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+.icon-btn:active {
+  box-shadow: inset 0 3px 7px rgba(0, 0, 0, 0.85), inset 0 -1px 1px rgba(255, 255, 255, 0.08);
+}
+:root.light .icon-btn {
+  background: linear-gradient(160deg, rgba(0, 0, 0, 0.06), rgba(255, 255, 255, 0.4) 60%, rgba(255, 255, 255, 0.7));
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.12), inset 0 -1px 1px rgba(255, 255, 255, 0.5),
+    0 1px 0 rgba(255, 255, 255, 0.4);
+}
+:root.light .icon-btn:hover {
+  color: #000;
+}
+
+/* raised 3D white button (send, mic) */
+.raised-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #0a0a0c;
+  cursor: pointer;
+  background: linear-gradient(160deg, #ffffff, #e3e3e8 60%, #c8c8d0);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.9), inset 0 -2px 4px rgba(0, 0, 0, 0.25),
+    0 5px 12px -2px rgba(0, 0, 0, 0.6), 0 1px 2px rgba(0, 0, 0, 0.4);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  border: none;
+}
+.raised-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.9), inset 0 -2px 4px rgba(0, 0, 0, 0.25),
+    0 7px 16px -2px rgba(0, 0, 0, 0.7), 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.raised-btn:active {
+  transform: translateY(1px) scale(0.96);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.3);
+}
+.raised-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+/* voice on/off pill (orb rail) */
+.voice-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 18px 9px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: var(--glass);
+  border: 1px solid var(--border-hi);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: all 0.2s ease;
+  border: none;
+}
+.voice-toggle:hover {
+  background: var(--glass-2);
+}
+.voice-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  opacity: 0.5;
+  transition: all 0.2s ease;
+}
+.voice-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  transition: color 0.2s ease;
+}
+.voice-toggle.on .voice-dot {
+  background: #4ade80;
+  opacity: 1;
+  box-shadow: 0 0 10px rgba(74, 222, 128, 0.9);
+}
+.voice-toggle.on .voice-label {
+  color: var(--fg);
+}
+
+/* chat bubbles */
+.bubble {
+  padding: 12px 16px;
+  border-radius: 18px;
+  font-size: 14px;
+  line-height: 1.55;
+  letter-spacing: 0.005em;
+}
+.bubble-user {
+  background: var(--user-bubble);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border-hi);
+  color: var(--fg-2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.bubble-aios {
+  position: relative;
+  background: var(--glass-2);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  border: 1px solid var(--border-hi);
+  color: var(--fg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+}
+.bubble-aios.mood-warm {
+  box-shadow: inset 0 0 20px -9px rgba(245, 180, 90, 0.55);
+}
+.bubble-aios.mood-soft {
+  box-shadow: inset 0 0 20px -9px rgba(110, 160, 255, 0.55);
+}
+.bubble-aios.mood-sharp {
+  box-shadow: inset 0 0 20px -9px rgba(255, 90, 90, 0.5);
+}
+
+/* markdown content inside an AIOS bubble (deliverables: numbered lead/job
+   lists, bold names, multi-line fields). Tailwind's preflight zeroes list
+   style/margin globally, so it's restored here, scoped to the bubble only —
+   user bubbles never render markdown and are untouched. */
+.bubble-aios p {
+  margin: 0;
+}
+.bubble-aios p + p,
+.bubble-aios p + ol,
+.bubble-aios p + ul,
+.bubble-aios ol + p,
+.bubble-aios ul + p {
+  margin-top: 0.6em;
+}
+.bubble-aios ol,
+.bubble-aios ul {
+  margin: 0.3em 0 0;
+  padding-left: 1.3em;
+}
+.bubble-aios ol {
+  list-style: decimal;
+}
+.bubble-aios ul {
+  list-style: disc;
+}
+.bubble-aios li {
+  margin-top: 0.5em;
+}
+.bubble-aios li:first-child {
+  margin-top: 0;
+}
+.bubble-aios li > p {
+  margin: 0;
+}
+.bubble-aios strong {
+  font-weight: 700;
+}
+.bubble-aios a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* composer pill */
+.composer-pill {
+  padding: 6px 6px 6px 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  position: relative;
+  z-index: 1;
+  border: 1px solid var(--border-hi);
+  border-radius: 999px;
+  background: var(--glass-2);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 8px 24px -14px rgba(0, 0, 0, 0.6);
+}
+
+/* dashboard glass surfaces */
+.glass-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+.glass-pill {
+  font-size: 9px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--glass-2);
+  border: 1px solid var(--border);
+  color: var(--fg-2);
+  letter-spacing: 0.1em;
+}
+.glass-pill.ok {
+  color: var(--fg);
+  border-color: var(--border-hi);
+}
+.empty {
+  padding: 22px 0;
+  text-align: center;
+  font-family: var(--font-dm-mono), monospace;
+  font-size: 10px;
+  color: var(--fg-dim);
+  letter-spacing: 0.08em;
+}
+.pill-btn {
+  font-size: 12px;
+  padding: 7px 16px;
+  border-radius: 999px;
+  background: var(--glass);
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  letter-spacing: 0.02em;
+}
+.convo-row {
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.convo-row:last-child {
+  border-bottom: none;
 }
 
 /* Hide the Next.js dev tools indicator (the "N" badge / circle) */

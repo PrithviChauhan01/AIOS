@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIOS — Design Reference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --sans:'Figtree',-apple-system,system-ui,sans-serif;
+  --mono:'DM Mono',ui-monospace,monospace;
+  --void:#050506;
+  --text:rgba(255,255,255,0.92);
+  --text-2:rgba(255,255,255,0.7);
+  --text-3:rgba(255,255,255,0.45);
+  --glass:rgba(255,255,255,0.04);
+  --glass-2:rgba(255,255,255,0.07);
+  --border:rgba(255,255,255,0.07);
+  --border-hi:rgba(255,255,255,0.14);
+  --user:rgba(255,255,255,0.09);
+  --shadow:0 24px 70px -24px rgba(0,0,0,0.8);
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#0d0d10;font-family:var(--sans);color:var(--text);-webkit-font-smoothing:antialiased;padding:40px 20px 80px;min-height:100vh;}
+.page-head{max-width:1200px;margin:0 auto 34px;}
+.page-head h1{font-size:15px;letter-spacing:0.4em;text-transform:uppercase;color:var(--text-2);font-weight:500;}
+.page-head p{font-family:var(--mono);font-size:11px;color:var(--text-3);margin-top:8px;letter-spacing:0.05em;}
+.section-label{font-family:var(--mono);font-size:10px;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-3);margin:0 auto 16px;max-width:1200px;padding-top:20px;}
+
+.grid{max-width:1200px;margin:0 auto;display:flex;flex-wrap:wrap;gap:36px;align-items:flex-start;}
+
+/* ---------- PHONE FRAME ---------- */
+.phone{
+  width:300px;height:640px;border-radius:44px;position:relative;overflow:hidden;
+  background:var(--void);border:1px solid rgba(255,255,255,0.09);
+  box-shadow:var(--shadow),inset 0 0 0 6px #0a0a0c;flex:0 0 auto;
+}
+.phone .notch{position:absolute;top:12px;left:50%;transform:translateX(-50%);width:96px;height:24px;background:#000;border-radius:14px;z-index:20;}
+.phone-screen{position:absolute;inset:0;display:flex;flex-direction:column;}
+.p-status{height:44px;display:flex;align-items:flex-end;justify-content:space-between;padding:0 26px 4px;font-family:var(--mono);font-size:10px;color:var(--text-2);z-index:15;}
+
+/* ---------- LAPTOP FRAME ---------- */
+.laptop{flex:1 1 640px;min-width:560px;}
+.laptop-screen{
+  border-radius:14px;overflow:hidden;background:var(--void);
+  border:1px solid rgba(255,255,255,0.09);box-shadow:var(--shadow);
+  height:520px;display:flex;flex-direction:column;position:relative;
+}
+.laptop-base{height:14px;background:linear-gradient(#141418,#0a0a0c);border-radius:0 0 12px 12px;
+  margin:0 auto;width:80%;box-shadow:0 10px 20px -8px rgba(0,0,0,0.6);}
+.laptop-base::after{content:"";display:block;width:60px;height:5px;background:#000;border-radius:0 0 6px 6px;margin:0 auto;}
+
+/* ---------- CANVAS ORB ---------- */
+canvas.orb-c{display:block;width:100%;height:100%;}
+/* orb containers must clip so the sphere + glow stay inside the rounded frame */
+.orb-wrap{overflow:hidden;position:relative;}
+
+/* ---------- SHARED UI PARTS ---------- */
+.nav{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;
+  border-bottom:1px solid var(--border);backdrop-filter:blur(24px) saturate(1.3);background:rgba(255,255,255,0.025);z-index:10;}
+.brand{display:flex;align-items:center;gap:10px;}
+.brand .d{width:7px;height:7px;border-radius:50%;background:#4ade80;box-shadow:0 0 12px rgba(74,222,128,0.9),0 0 4px rgba(74,222,128,1);}
+.brand .n{font-family:var(--sans);font-size:14px;font-weight:600;letter-spacing:0.14em;color:rgba(255,255,255,0.95);}
+.nav-links{display:flex;gap:2px;padding:3px;border-radius:999px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);}
+.nl{font-family:var(--sans);font-size:12px;font-weight:500;letter-spacing:0.01em;padding:7px 20px;border-radius:999px;color:var(--text-3);cursor:pointer;transition:all .2s ease;}
+.nl:hover{color:var(--text-2);}
+.nl.on{color:#fff;background:rgba(255,255,255,0.10);box-shadow:inset 0 1px 0 rgba(255,255,255,0.15),0 2px 8px -3px rgba(0,0,0,0.5);}
+.ic{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;color:var(--text);cursor:pointer;
+  background:linear-gradient(160deg, rgba(0,0,0,0.35), rgba(255,255,255,0.02) 60%, rgba(255,255,255,0.06));
+  border:1px solid rgba(255,255,255,0.06);
+  box-shadow:
+    inset 0 2px 5px rgba(0,0,0,0.65),
+    inset 0 -1px 1px rgba(255,255,255,0.12),
+    0 1px 0 rgba(255,255,255,0.05);
+  transition:transform .15s ease, box-shadow .15s ease;}
+.ic:hover{box-shadow:inset 0 2px 6px rgba(0,0,0,0.75),inset 0 -1px 1px rgba(255,255,255,0.15),0 1px 0 rgba(255,255,255,0.05);color:#fff;}
+.ic:active{box-shadow:inset 0 3px 7px rgba(0,0,0,0.85),inset 0 -1px 1px rgba(255,255,255,0.08);}
+
+/* chat */
+.chat{flex:1;display:flex;flex-direction:column;min-height:0;position:relative;overflow:hidden;}
+/* ambient light field behind chat — gives the glass bubbles something to blur */
+.chat::before{content:"";position:absolute;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(closest-side at 18% 22%, rgba(60,220,130,0.16), transparent 70%),
+    radial-gradient(closest-side at 82% 68%, rgba(40,200,160,0.13), transparent 70%),
+    radial-gradient(closest-side at 55% 90%, rgba(120,230,90,0.10), transparent 70%);
+  filter:blur(30px);}
+.chat > *{position:relative;z-index:1;}
+.msgs{flex:1;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:14px;}
+.msgs::-webkit-scrollbar{width:0;}
+.m{max-width:80%;display:flex;flex-direction:column;gap:5px;}
+.m.u{align-self:flex-end;align-items:flex-end;}
+.m.a{align-self:flex-start;}
+.m .w{font-family:var(--sans);font-size:10px;font-weight:600;letter-spacing:0.06em;color:var(--text-2);padding:0 3px;}
+.b{padding:12px 16px;border-radius:18px;font-size:14px;line-height:1.55;letter-spacing:0.005em;}
+.m.u .b{background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.14);color:rgba(255,255,255,0.85);box-shadow:inset 0 1px 0 rgba(255,255,255,0.12);}
+.m.a .b{position:relative;background:rgba(255,255,255,0.07);backdrop-filter:blur(24px) saturate(1.5);-webkit-backdrop-filter:blur(24px) saturate(1.5);border:1px solid rgba(255,255,255,0.16);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,0.18), 0 8px 24px -12px rgba(0,0,0,0.6);}
+.m.a.warm .b{box-shadow:inset 0 0 20px -9px rgba(245,180,90,0.55);}
+.m.a.soft .b{box-shadow:inset 0 0 20px -9px rgba(110,160,255,0.55);}
+.m.a.sharp .b{box-shadow:inset 0 0 20px -9px rgba(255,90,90,0.5);}
+.mtag{font-family:var(--sans);font-size:9px;font-weight:500;letter-spacing:0.02em;color:var(--text-3);padding:0 3px;}
+.composer{margin:14px;padding:6px 6px 6px 18px;display:flex;align-items:center;gap:10px;position:relative;z-index:1;
+  border:1px solid rgba(255,255,255,0.16);border-radius:999px;background:rgba(255,255,255,0.07);
+  backdrop-filter:blur(24px) saturate(1.5);-webkit-backdrop-filter:blur(24px) saturate(1.5);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.18), 0 8px 24px -14px rgba(0,0,0,0.6);}
+.composer input{flex:1;background:none;border:none;outline:none;color:var(--text);font-family:var(--sans);font-size:13px;}
+.composer input::placeholder{color:var(--text-3);}
+.send{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;color:#0a0a0c;cursor:pointer;
+  background:linear-gradient(160deg,#ffffff,#e3e3e8 60%,#c8c8d0);
+  box-shadow:
+    inset 0 1px 1px rgba(255,255,255,0.9),
+    inset 0 -2px 4px rgba(0,0,0,0.25),
+    0 5px 12px -2px rgba(0,0,0,0.6),
+    0 1px 2px rgba(0,0,0,0.4);
+  transition:transform .15s ease, box-shadow .15s ease;}
+.send:hover{transform:translateY(-1px);box-shadow:inset 0 1px 1px rgba(255,255,255,0.9),inset 0 -2px 4px rgba(0,0,0,0.25),0 7px 16px -2px rgba(0,0,0,0.7),0 1px 2px rgba(0,0,0,0.4);}
+.send:active{transform:translateY(1px) scale(0.96);box-shadow:inset 0 2px 5px rgba(0,0,0,0.3);}
+.mic{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;color:#0a0a0c;cursor:pointer;
+  background:linear-gradient(160deg,#ffffff,#e3e3e8 60%,#c8c8d0);
+  box-shadow:
+    inset 0 1px 1px rgba(255,255,255,0.9),
+    inset 0 -2px 4px rgba(0,0,0,0.25),
+    0 5px 12px -2px rgba(0,0,0,0.6),
+    0 1px 2px rgba(0,0,0,0.4);
+  transition:transform .15s ease, box-shadow .15s ease;}
+.mic:hover{transform:translateY(-1px);box-shadow:inset 0 1px 1px rgba(255,255,255,0.9),inset 0 -2px 4px rgba(0,0,0,0.25),0 7px 16px -2px rgba(0,0,0,0.7),0 1px 2px rgba(0,0,0,0.4);}
+.mic:active{transform:translateY(1px);box-shadow:inset 0 2px 5px rgba(0,0,0,0.3);}
+
+/* phone home */
+.home{flex:1;position:relative;display:flex;flex-direction:column;overflow:hidden;}
+.home canvas{position:absolute;inset:0;}
+.home-foot{position:absolute;bottom:0;left:0;right:0;padding:26px 24px 34px;text-align:center;z-index:5;}
+.mic-big{width:64px;height:64px;border-radius:50%;margin:0 auto;display:grid;place-items:center;cursor:pointer;color:#0a0a0c;
+  background:linear-gradient(160deg,#ffffff,#e3e3e8 60%,#c8c8d0);
+  box-shadow:inset 0 1px 2px rgba(255,255,255,0.9),inset 0 -2px 5px rgba(0,0,0,0.2),0 8px 22px -4px rgba(0,0,0,0.7),0 0 0 6px rgba(255,255,255,0.04);
+  transition:transform .15s ease,box-shadow .15s ease;}
+.mic-big:hover{transform:translateY(-2px);box-shadow:inset 0 1px 2px rgba(255,255,255,0.9),inset 0 -2px 5px rgba(0,0,0,0.2),0 12px 28px -4px rgba(0,0,0,0.8),0 0 0 8px rgba(255,255,255,0.05);}
+.mic-big:active{transform:translateY(1px) scale(0.97);}
+.mic-label{margin-top:16px;text-align:center;font-family:var(--sans);font-size:12px;letter-spacing:0.04em;color:var(--text-3);}
+/* laptop voice toggle */
+.rail-foot{position:absolute;bottom:22px;left:0;right:0;display:flex;justify-content:center;z-index:3;}
+.v-toggle{display:flex;align-items:center;gap:9px;padding:9px 18px 9px 14px;border-radius:999px;cursor:pointer;
+  background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);transition:all .2s ease;}
+.v-toggle:hover{background:rgba(255,255,255,0.07);}
+.v-dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.25);transition:all .2s ease;}
+.v-label{font-family:var(--sans);font-size:12px;font-weight:500;color:var(--text-3);transition:color .2s ease;}
+.v-toggle.on .v-dot{background:#4ade80;box-shadow:0 0 10px rgba(74,222,128,0.9);}
+.v-toggle.on .v-label{color:#fff;}
+.home-state{font-family:var(--mono);font-size:10px;letter-spacing:0.4em;text-transform:uppercase;color:var(--text-2);}
+.home-hint{font-family:var(--mono);font-size:9px;letter-spacing:0.18em;color:var(--text-3);margin-top:8px;}
+.home-pill{margin:22px auto 0;width:fit-content;padding:10px 22px;border:1px solid var(--border);border-radius:999px;
+  font-family:var(--mono);font-size:10px;letter-spacing:0.2em;color:var(--text-2);background:var(--glass);backdrop-filter:blur(12px);}
+
+/* dashboard */
+.dash{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px;}
+.dash::-webkit-scrollbar{width:0;}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+.stat{padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--glass);backdrop-filter:blur(16px);}
+.stat .l{font-family:var(--mono);font-size:9px;letter-spacing:0.14em;text-transform:uppercase;color:var(--text-3);}
+.stat .v{font-size:30px;font-weight:500;margin-top:8px;letter-spacing:-0.02em;}
+.stat .s{font-family:var(--mono);font-size:9px;color:var(--text-3);margin-top:3px;}
+.prow{display:grid;grid-template-columns:1.5fr 1fr;gap:14px;}
+.panel{padding:18px;border:1px solid var(--border);border-radius:12px;background:var(--glass);backdrop-filter:blur(16px);}
+.panel h3{font-family:var(--mono);font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:var(--text-3);margin-bottom:14px;font-weight:500;}
+.r{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border);}
+.r:last-child{border:none;}
+.r .mn{font-size:13px;}
+.r .mt{font-family:var(--mono);font-size:10px;color:var(--text-3);margin-top:3px;}
+.pill{font-family:var(--mono);font-size:9px;padding:4px 10px;border-radius:999px;background:var(--glass-2);border:1px solid var(--border);color:var(--text-2);letter-spacing:0.1em;}
+.pill.ok{color:#fff;border-color:var(--border-hi);}
+.empty{padding:22px 0;text-align:center;font-family:var(--mono);font-size:10px;color:var(--text-3);letter-spacing:0.08em;}
+.convo{padding:11px 0;border-bottom:1px solid var(--border);cursor:pointer;}
+.convo:last-child{border:none;}
+.convo .cp{font-size:12.5px;}
+.convo .cs{font-family:var(--mono);font-size:9px;color:var(--text-3);margin-top:4px;}
+
+@media(max-width:1000px){.laptop{min-width:0;flex-basis:100%;}}
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>AIOS — Interface</h1>
+  <p>spatial glass · monochrome · plasma presence · black phone / dark laptop</p>
+</div>
+
+<div class="section-label">Phone — black only</div>
+<div class="grid">
+
+  <!-- PHONE 1: HOME / ORB -->
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="phone-screen">
+      <div class="p-status"><span>9:41</span><span>AIOS</span></div>
+      <div class="home">
+        <canvas class="orb-c" data-orb="idle"></canvas>
+        <div class="home-foot">
+          <div class="mic-big"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg></div>
+          <div class="mic-label">hold to speak</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHONE 2: CHAT -->
+  <div class="phone">
+    <div class="notch"></div>
+    <div class="phone-screen">
+      <div class="p-status"><span>9:42</span><span>AIOS</span></div>
+      <div class="nav">
+        <div class="brand"><span class="d"></span><span class="n">AIOS</span></div>
+        <div class="ic">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>
+        </div>
+      </div>
+      <div class="chat">
+        <div class="msgs">
+          <div class="m a soft"><span class="w">AIOS</span><div class="b">One application at Haptik, three reminders pending. LSBF module is two days out — I'd start there.</div><span class="mtag">soft</span></div>
+          <div class="m u"><div class="b">draft a follow-up to Haptik</div></div>
+          <div class="m a warm"><span class="w">AIOS</span><div class="b">Drafted. Held for your review — say the word.</div><span class="mtag">warm</span></div>
+        </div>
+        <div class="composer">
+          <input placeholder="Speak…">
+          <div class="send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="section-label">Laptop — dark (light mode also supported)</div>
+<div class="grid">
+
+  <!-- LAPTOP: CHAT with orb -->
+  <div class="laptop">
+    <div class="laptop-screen">
+      <div class="nav">
+        <div class="brand"><span class="d"></span><span class="n">AIOS</span></div>
+        <div class="nav-links"><span class="nl on">Chat</span><span class="nl">Dashboard</span></div>
+        <div class="ic">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </div>
+      </div>
+      <div style="flex:1;display:flex;min-height:0;">
+        <!-- orb rail -->
+        <div class="orb-wrap" style="width:200px;border-right:1px solid var(--border);flex:0 0 auto;">
+          <canvas class="orb-c" data-orb="idle" style="position:absolute;inset:0;"></canvas>
+          <div class="rail-foot">
+            <div class="v-toggle on" onclick="this.classList.toggle('on')">
+              <span class="v-dot"></span>
+              <span class="v-label">Voice</span>
+            </div>
+          </div>
+        </div>
+        <!-- chat -->
+        <div class="chat">
+          <div class="msgs">
+            <div class="m a"><span class="w">AIOS</span><div class="b">Good evening, Sir. Everything's in order.</div></div>
+            <div class="m u"><div class="b">what's on my plate this week</div></div>
+            <div class="m a soft"><span class="w">AIOS</span><div class="b">One application logged at Haptik, three reminders pending, and the LSBF module is two days out. I'd start with the module.</div><span class="mtag">soft</span></div>
+            <div class="m u"><div class="b">you were slow yesterday</div></div>
+            <div class="m a sharp"><span class="w">AIOS</span><div class="b">Noted. Won't happen twice.</div><span class="mtag">sharp</span></div>
+          </div>
+          <div class="composer">
+            <input placeholder="Speak…">
+            <div class="send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="laptop-base"></div>
+  </div>
+
+</div>
+
+<div class="section-label">Laptop — dashboard</div>
+<div class="grid">
+  <div class="laptop">
+    <div class="laptop-screen">
+      <div class="nav">
+        <div class="brand"><span class="d"></span><span class="n">AIOS</span></div>
+        <div class="nav-links"><span class="nl">Chat</span><span class="nl on">Dashboard</span></div>
+        <div class="ic">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </div>
+      </div>
+      <div class="dash">
+        <div class="stats">
+          <div class="stat"><div class="l">Applications</div><div class="v">1</div><div class="s">1 this week</div></div>
+          <div class="stat"><div class="l">Leads</div><div class="v">0</div><div class="s">none yet</div></div>
+          <div class="stat"><div class="l">Study</div><div class="v">0</div><div class="s">this week</div></div>
+          <div class="stat"><div class="l">Reminders</div><div class="v">3</div><div class="s">pending</div></div>
+        </div>
+        <div class="prow">
+          <div class="panel">
+            <h3>Applications</h3>
+            <div class="r"><div><div class="mn">Haptik — AI Product Engineer</div><div class="mt">engineering résumé · Jul 15</div></div><span class="pill ok">applied</span></div>
+            <div class="empty">No other applications yet.</div>
+          </div>
+          <div class="panel">
+            <h3>Conversations</h3>
+            <div class="convo"><div class="cp">what's on my plate this week</div><div class="cs">main · 404 turns · today</div></div>
+            <div class="convo"><div class="cp">research studios in Mumbai</div><div class="cs">leadgen · 12 turns · Jul 14</div></div>
+            <div class="convo"><div class="cp">explain the triage layer</div><div class="cs">study · 8 turns · Jul 12</div></div>
+          </div>
+        </div>
+        <div class="prow">
+          <div class="panel"><h3>Fitness</h3><div class="empty">No workouts logged.</div></div>
+          <div class="panel"><h3>Habits</h3><div class="empty">No habits tracked yet.</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="laptop-base"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---- Reusable plasma orb (final shader) ----
+function initOrb(canvas, state){
+  const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  function size(){const r=canvas.getBoundingClientRect();renderer.setSize(r.width,r.height,false);cam.aspect=r.width/r.height;cam.updateProjectionMatrix();fitOrb();}
+  const scene=new THREE.Scene();
+  const cam=new THREE.PerspectiveCamera(45,1,0.1,100); cam.position.z=3.4;
+  // orb sizing: keep the sphere comfortably INSIDE the canvas with margin,
+  // so it never bleeds past the rounded frame. Farther camera = smaller, contained orb.
+  function fitOrb(){
+    const r=canvas.getBoundingClientRect();
+    const minSide=Math.min(r.width,r.height);
+    // narrow rails need the camera FARther (relative to height) so the sphere fits the width;
+    // base distance keeps ~30% margin around the sphere.
+    const aspect=r.width/Math.max(r.height,1);
+    let z=4.6;                                   // base: contained with margin
+    if(aspect<0.9) z=4.6/aspect*0.9;             // tall/narrow rail → pull back to fit width
+    z=THREE.MathUtils.clamp(z,4.2,7.5);
+    cam.position.z=z;
+  }
+
+  const uniforms={uTime:{value:0},uActivity:{value:0},uBeat:{value:0},
+    uColorA:{value:new THREE.Color(0xff2fb0)},uColorB:{value:new THREE.Color(0x28d8ff)},uHot:{value:new THREE.Color(0xffffff)}};
+
+  const vert=`varying vec3 vN;varying vec3 vView;void main(){vN=normal;vec4 mv=modelViewMatrix*vec4(position,1.0);vView=normalize(-mv.xyz);gl_Position=projectionMatrix*mv;}`;
+  const frag=`precision highp float;varying vec3 vN;varying vec3 vView;
+  uniform float uTime,uActivity,uBeat,uFront;uniform vec3 uColorA,uColorB,uHot;
+  vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x,289.0);}vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+  float snoise(vec3 v){const vec2 C=vec2(1.0/6.0,1.0/3.0);const vec4 D=vec4(0.0,0.5,1.0,2.0);vec3 i=floor(v+dot(v,C.yyy));vec3 x0=v-i+dot(i,C.xxx);vec3 g=step(x0.yzx,x0.xyz);vec3 l=1.0-g;vec3 i1=min(g.xyz,l.zxy);vec3 i2=max(g.xyz,l.zxy);vec3 x1=x0-i1+C.xxx;vec3 x2=x0-i2+C.yyy;vec3 x3=x0-D.yyy;i=mod(i,289.0);vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));float n_=1.0/7.0;vec3 ns=n_*D.wyz-D.xzx;vec4 j=p-49.0*floor(p*ns.z*ns.z);vec4 x_=floor(j*ns.z);vec4 y_=floor(j-7.0*x_);vec4 x=x_*ns.x+ns.yyyy;vec4 y=y_*ns.x+ns.yyyy;vec4 h=1.0-abs(x)-abs(y);vec4 b0=vec4(x.xy,y.xy);vec4 b1=vec4(x.zw,y.zw);vec4 s0=floor(b0)*2.0+1.0;vec4 s1=floor(b1)*2.0+1.0;vec4 sh=-step(h,vec4(0.0));vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;vec3 p0=vec3(a0.xy,h.x);vec3 p1=vec3(a0.zw,h.y);vec3 p2=vec3(a1.xy,h.z);vec3 p3=vec3(a1.zw,h.w);vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0);m=m*m;return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));}
+  float fbm(vec3 p){float s=0.0,a=0.55;for(int i=0;i<5;i++){s+=a*snoise(p);p*=2.02;a*=0.5;}return s;}
+  void main(){
+    float t=uTime*(0.18+uActivity*0.6);vec3 n=normalize(vN);
+    vec3 q=n*(1.7+uActivity*0.7);
+    float warp=fbm(q+vec3(t*0.4,t*0.3,-t*0.35));
+    float f=fbm(q*1.35+warp*1.8+vec3(-t*0.5,t*0.4,t*0.25));
+    // WIRED: thin sharp filament lines — narrow band around each ridge, hard falloff
+    float ridge=1.0-abs(f);
+    ridge=pow(ridge,9.0+uActivity*3.0);
+    ridge=smoothstep(0.5,0.78,ridge);          // tighter band = thin wire
+    float ridge2=1.0-abs(warp);
+    ridge2=pow(ridge2,8.0);
+    ridge2=smoothstep(0.55,0.82,ridge2);
+    float veins=clamp(ridge*1.2+ridge2*0.7,0.0,1.6);
+    float fres=pow(1.0-max(dot(n,vView),0.0),2.0);
+    float mixv=0.5+0.5*sin(f*2.6+t+n.y*2.0);
+    vec3 plasma=mix(uColorA,uColorB,mixv);
+    // light tints of the two colors (no white) for the hottest points
+    vec3 lightA=mix(uColorA,vec3(1.0),0.55);   // light pink
+    vec3 lightB=mix(uColorB,vec3(1.0),0.55);   // light cyan
+    vec3 lightTint=mix(lightA,lightB,mixv);
+    vec3 col=plasma*veins;
+    col+=lightTint*pow(veins,4.0)*(0.35+uActivity*0.4);  // bright wire cores in tinted color
+    col+=plasma*fres*0.28;
+    col*=0.72+uBeat*0.35+uActivity*0.2;
+    col=pow(col,vec3(1.3));
+    float depthDim=mix(0.28,1.0,uFront);col*=depthDim;col+=plasma*fres*uFront*0.4;
+    float alpha=clamp(veins*0.85+fres*0.75,0.0,1.0);alpha*=mix(0.55,1.0,uFront);
+    if(alpha<0.01)discard;gl_FragColor=vec4(col,alpha);
+  }`;
+  function shell(side,fv){const u=Object.assign({},uniforms,{uFront:{value:fv}});u.uTime=uniforms.uTime;u.uActivity=uniforms.uActivity;u.uBeat=uniforms.uBeat;u.uColorA=uniforms.uColorA;u.uColorB=uniforms.uColorB;u.uHot=uniforms.uHot;return new THREE.ShaderMaterial({uniforms:u,vertexShader:vert,fragmentShader:frag,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false,depthTest:false,side:side});}
+  const geo=new THREE.SphereGeometry(1,160,160);
+  const back=new THREE.Mesh(geo,shell(THREE.BackSide,0.0));
+  const front=new THREE.Mesh(geo,shell(THREE.FrontSide,1.0));
+  scene.add(back);scene.add(front);
+
+  function glowTex(){const s=256,cv=document.createElement('canvas');cv.width=cv.height=s;const g=cv.getContext('2d');const r=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);r.addColorStop(0,'rgba(255,255,255,0.9)');r.addColorStop(0.28,'rgba(255,255,255,0.3)');r.addColorStop(0.6,'rgba(255,255,255,0.06)');r.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=r;g.fillRect(0,0,s,s);const tx=new THREE.Texture(cv);tx.needsUpdate=true;return tx;}
+  const g1=new THREE.Sprite(new THREE.SpriteMaterial({map:glowTex(),color:0xff4fc0,transparent:true,blending:THREE.AdditiveBlending,opacity:0.16,depthWrite:false}));g1.scale.set(3.2,3.2,1);scene.add(g1);
+
+  const acts={idle:0,listening:0.45,speaking:1.0};
+  let target=acts[state]||0,activity=target,rot=0;
+  const clock=new THREE.Clock();
+  size();new ResizeObserver(size).observe(canvas);
+  function loop(){
+    const dt=clock.getDelta(),t=clock.elapsedTime;
+    activity+=(target-activity)*Math.min(dt*3,1);
+    uniforms.uTime.value=t;uniforms.uActivity.value=activity;
+    const bpm=0.9+activity*1.4;
+    const beat=Math.pow(Math.max(0,Math.sin(t*bpm*Math.PI)),8.0)+0.6*Math.pow(Math.max(0,Math.sin((t*bpm+0.16)*Math.PI)),8.0);
+    uniforms.uBeat.value=beat*(0.5+activity*0.5);
+    const s=1.0+beat*0.03*(1.0-activity*0.4)+activity*0.02;back.scale.setScalar(s);front.scale.setScalar(s);
+    const spin=(1.0-activity);rot+=dt*0.1*spin;const ry=rot,rx=Math.sin(t*0.13)*0.1*spin;
+    front.rotation.set(rx,ry,0);back.rotation.set(rx*0.85,ry*0.82+0.35,0);
+    g1.material.opacity=0.12+beat*0.08+activity*0.13;
+    cam.lookAt(0,0,0);renderer.render(scene,cam);requestAnimationFrame(loop);
+  }
+  loop();
+}
+document.querySelectorAll('canvas.orb-c').forEach(c=>initOrb(c,c.dataset.orb));
+</script>
+</body>
+</html>

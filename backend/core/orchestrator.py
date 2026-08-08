@@ -8,8 +8,9 @@ from core.outcomes import log_outcome
 from core.triage import triage
 from tools.registry import fetch_from, format_pool_block
 from core.secret_mode import detect_toggle, is_secret_mode, set_secret_mode
-from core.memory import get_history
+from core.memory import get_history, save_message
 from core.cognition import cognition_pass
+from core.greeting import detect_greeting, greeting_reply
 from core.looper import run_looper
 from core.action_dispatch import detect_action, run_action, action_material, fn_name
 from agents.leadgen import LeadgenTeacher, get_cached_leadgen, is_export_request
@@ -200,6 +201,38 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
             "file_path": None,
         }
 
+    # ── [1.7] GREETING GUARD — a bare greeting never reaches a book. ──
+    # "hey" was answered with an invented status report ("doing some light maintenance
+    # on the systems") — the 8B fast lane confabulating on a prompt that gave it nothing
+    # to answer. There is no answer to "hey" worth a model call, so this returns her
+    # fixed time-of-day line and stops. ONLY fires when the WHOLE message is a greeting /
+    # thanks / ack / sign-off, so "hey can you find me studios" falls straight through to
+    # triage and routes normally. No book call, no tokens, no confabulation surface.
+    greeting_kind = detect_greeting(message)
+    if greeting_kind is not None:
+        text, mood = greeting_reply(greeting_kind)
+        _log(trace_id, "greeting", f"kind={greeting_kind} — short-circuit, no book call")
+        # Persist the exchange exactly as cognition would, so the transcript (and the
+        # UI, which reloads from it) stays complete. No fact extraction: a greeting
+        # carries nothing durable to mine, and that call is a cloud round-trip.
+        await asyncio.to_thread(save_message, session_id, "user", message)
+        await asyncio.to_thread(save_message, session_id, "assistant", text)
+        if voice_flag:
+            try:
+                from voice.speaker import speak
+                speak(text, mood)
+            except Exception as e:
+                _log(trace_id, "voice", f"failed: {e}")
+        return {
+            "response": text,
+            "mood": mood,
+            "provider_used": "none",
+            "domain": "greeting",
+            "sensitivity": "public",
+            "trace_id": trace_id,
+            "file_path": None,
+        }
+
     # ── [2] TRIAGE — sensitivity / complexity / domain / loop_worthy ──
     verdict = triage(message)  # fail-safe → private+complex defaults live in triage
     ctx.update(verdict)
@@ -234,7 +267,12 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     if action is not None:
         res = run_action(action)
         ctx["action"] = action["action"]
-        ctx["action_result"] = res
+        # The result lives ONLY here, on this request's ctx — there is no module-level
+        # or global action_result anywhere, so one can never outlive the request that
+        # produced it. Stamp it with THIS turn's trace_id anyway: cognition re-checks
+        # the stamp and drops anything that doesn't match, so a result from another
+        # turn can never be confirmed as this one's.
+        ctx["action_result"] = {**res, "trace_id": trace_id}
         # An email draft / revision / re-show is a structured block (to/subject/body)
         # she must present in full — give cognition deliverable room, not the 60-token
         # confirmation cap.

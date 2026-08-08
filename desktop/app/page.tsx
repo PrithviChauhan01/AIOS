@@ -1,7 +1,28 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 import { useToken } from "@/lib/token-context";
+import { useSession } from "@/lib/session-context";
 import { API_BASE } from "@/lib/api";
+import Orb, { type OrbState } from "@/components/Orb";
+
+// AIOS-only markdown rendering (deliverables — numbered lead/job lists, bold
+// names, multi-line fields — otherwise collapse to a wall of text). No
+// rehype-raw is used, so react-markdown never parses embedded HTML tags in the
+// model's output as real markup — they render as inert escaped text, same as
+// any other unsafe-looking string. remarkBreaks turns the single line breaks
+// the backend puts between fields into real <br>s (bare CommonMark would
+// otherwise join them back into one line). User messages stay plain text —
+// this component is never used for the user role.
+function AiosMarkdown({ content }: { content: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+      {content}
+    </ReactMarkdown>
+  );
+}
 
 type Mood = "warm" | "neutral" | "sharp" | "soft";
 
@@ -11,22 +32,14 @@ interface Message {
   mood?: Mood;
 }
 
-// Subtle per-mood tint for AIOS messages — thin left border + faint glow.
-// Kept dark and minimal so it reads as a hint, not a highlight. "neutral" uses
-// the fg token (not a fixed zinc shade) so it stays a quiet hint in both themes.
-const MOOD_STYLES: Record<Mood, string> = {
-  warm: "border-amber-500/60 shadow-[-4px_0_12px_-6px_rgba(245,158,11,0.5)]",
-  neutral: "border-fg/30",
-  sharp: "border-red-500/60 shadow-[-4px_0_12px_-6px_rgba(239,68,68,0.5)]",
-  soft: "border-blue-500/60 shadow-[-4px_0_12px_-6px_rgba(59,130,246,0.5)]",
-};
-
-function moodStyle(mood?: Mood): string {
-  return MOOD_STYLES[mood ?? "neutral"];
+function moodClass(mood?: Mood): string {
+  if (mood === "warm" || mood === "soft" || mood === "sharp") return `mood-${mood}`;
+  return "";
 }
 
 export default function Home() {
   const { token } = useToken();
+  const { sessionId } = useSession();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -34,14 +47,59 @@ export default function Home() {
   const [awaitingOnboarding, setAwaitingOnboarding] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Which session is live RIGHT NOW, readable from inside an awaited send() — the
+  // closure's `sessionId` is whatever it was when the send started, which is exactly
+  // the value we must not trust once New Chat has moved on.
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Restore recent turns for the active session on every mount (including
+  // remounting after nav away and back — the page component unmounts on route
+  // change), and again whenever New Chat swaps sessionId to a fresh id (that
+  // fetch just comes back empty, which is exactly the blank slate New Chat
+  // wants — the old session's turns stay in SQLite and surface via the
+  // dashboard's Conversations view instead).
+  //
+  // No "already loaded this session" ref guard here — that pattern breaks
+  // under React Strict Mode's double-invoke-on-mount (on by default for the
+  // App Router): the first invoke's cleanup sets `cancelled`, and a ref guard
+  // would block the second invoke from starting its own fetch, so the only
+  // fetch that ever ran has its response discarded. The `cancelled` flag
+  // below is already the correct/sufficient guard against the stale first
+  // response — let the effect re-run on every mount.
+  useEffect(() => {
+    if (!token) return;
+    setMessages([]);
+    let cancelled = false;
+
+    fetch(`${API_BASE}/conversations?session_id=${encodeURIComponent(sessionId)}&limit=30`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json())
+      .then((turns: { role: string; content: string; mood: Mood | null }[]) => {
+        if (cancelled) return;
+        const prior: Message[] = turns.map((t) => ({
+          role: t.role === "user" ? "user" : "aios",
+          content: t.content,
+          mood: t.mood ?? undefined,
+        }));
+        setMessages((m) => [...prior, ...m]);
+      })
+      .catch(() => {}); // no history yet / offline — chat still works from empty state
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, sessionId]);
+
   const send = async () => {
     if (!input.trim() || !token) return;
     const userMsg = input.trim();
+    const sentSession = sessionId; // the session this turn belongs to
     setInput("");
     setMessages((m) => [...m, { role: "user", content: userMsg }]);
     setLoading(true);
@@ -54,13 +112,25 @@ export default function Home() {
       },
       body: JSON.stringify({
         message: userMsg,
-        session_id: "main",
+        session_id: sessionId,
         onboarding_answer: awaitingOnboarding,
         voice: voiceEnabled,
       }),
     });
 
     const data = await res.json();
+
+    // A turn can take tens of seconds. If New Chat rotated the session while this
+    // request was in flight, the reply belongs to the OUTGOING session — appending it
+    // here would drop the previous chat's answer into the blank new one (that is the
+    // "New Chat replays the previous answer" bug). It is already persisted server-side
+    // under `sentSession`, so dropping it loses nothing: it shows up in the dashboard's
+    // Conversations view, and again in this pane if that session is ever reloaded.
+    if (sessionIdRef.current !== sentSession) {
+      setLoading(false);
+      return;
+    }
+
     setMessages((m) => [...m, { role: "aios", content: data.response, mood: data.mood }]);
 
     if (data.onboarding_question) {
@@ -75,68 +145,68 @@ export default function Home() {
     setLoading(false);
   };
 
+  const orbState: OrbState = loading ? "speaking" : voiceEnabled ? "listening" : "idle";
+
   return (
-    <main className="flex-1 flex flex-col bg-bg text-fg">
-      <div className="border-b border-border px-6 py-4 flex items-center gap-3">
-        <input
-          className="flex-1 bg-panel text-fg text-sm px-4 py-2 rounded outline-none placeholder-fg-dim"
-          placeholder="Speak..."
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          autoFocus
-        />
-        <button
-          onClick={() => setVoiceEnabled((v) => !v)}
-          aria-pressed={voiceEnabled}
-          title={voiceEnabled ? "Voice on" : "Voice off"}
-          className={`transition ${
-            voiceEnabled ? "text-fg" : "text-fg-dim hover:text-fg"
-          }`}
-        >
-          {voiceEnabled ? (
-            // speaker with sound waves
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
-              <path d="M19 5a9 9 0 0 1 0 14" />
-            </svg>
-          ) : (
-            // muted speaker
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M11 5 6 9H2v6h4l5 4V5z" />
-              <line x1="22" y1="9" x2="16" y2="15" />
-              <line x1="16" y1="9" x2="22" y2="15" />
-            </svg>
-          )}
-        </button>
-        <button
-          onClick={send}
-          className="text-xs text-fg-dim hover:text-fg transition px-3"
-        >
-          Send
-        </button>
+    <main className="flex-1 min-h-0 flex overflow-hidden bg-bg text-fg">
+      {/* orb rail */}
+      <div className="relative w-[224px] shrink-0 border-r border-border overflow-hidden flex flex-col">
+        <div className="flex-1 min-h-0">
+          <Orb state={orbState} />
+        </div>
+        <div className="shrink-0 pb-[22px] flex justify-center">
+          <button
+            type="button"
+            onClick={() => setVoiceEnabled((v) => !v)}
+            aria-pressed={voiceEnabled}
+            className={`voice-toggle ${voiceEnabled ? "on" : ""}`}
+          >
+            <span className="voice-dot" />
+            <span className="voice-label">Voice</span>
+          </button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-6 py-6 space-y-4">
-        {messages.map((m, i) => (
-          <div key={i} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-xl px-4 py-2 rounded text-sm ${
-              m.role === "user"
-                ? "bg-fg/10 text-fg"
-                : `text-fg/90 border-l-2 ${moodStyle(m.mood)}`
-            }`}>
+      {/* chat */}
+      <div className="ambient-field relative flex-1 min-h-0 flex flex-col overflow-hidden">
+        <div className="relative z-10 flex-1 min-h-0 overflow-y-auto no-scrollbar px-[22px] py-[22px] flex flex-col gap-3.5">
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              className={`max-w-[80%] flex flex-col gap-1.5 ${
+                m.role === "user" ? "self-end items-end" : "self-start items-start"
+              }`}
+            >
               {m.role === "aios" && (
-                <span className="text-xs text-fg-dim mr-2 uppercase tracking-widest">AIOS</span>
+                <span className="text-[10px] font-semibold tracking-[0.06em] text-fg-2 px-[3px]">AIOS</span>
               )}
-              {m.content}
+              <div className={m.role === "user" ? "bubble bubble-user" : `bubble bubble-aios ${moodClass(m.mood)}`}>
+                {m.role === "user" ? m.content : <AiosMarkdown content={m.content} />}
+              </div>
+              {m.role === "aios" && m.mood && m.mood !== "neutral" && (
+                <span className="text-[9px] font-medium tracking-[0.02em] text-fg-dim px-[3px]">{m.mood}</span>
+              )}
             </div>
-          </div>
-        ))}
-        {loading && (
-          <div className="text-fg-dim text-sm">...</div>
-        )}
-        <div ref={bottomRef} />
+          ))}
+          {loading && <div className="text-fg-dim text-sm px-[3px]">…</div>}
+          <div ref={bottomRef} />
+        </div>
+
+        <div className="composer-pill m-3.5">
+          <input
+            className="flex-1 bg-transparent outline-none text-fg text-[13px] placeholder-fg-dim"
+            placeholder="Speak…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && send()}
+            autoFocus
+          />
+          <button type="button" onClick={send} disabled={!input.trim()} className="raised-btn" aria-label="Send">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14M13 6l6 6-6 6" />
+            </svg>
+          </button>
+        </div>
       </div>
     </main>
   );

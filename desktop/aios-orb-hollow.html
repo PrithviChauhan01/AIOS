@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AIOS — Hollow Plasma Orb</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { height:100%; background:#000; overflow:hidden; }
+body { display:flex; align-items:center; justify-content:center; font-family:'JetBrains Mono',ui-monospace,monospace; }
+#c { display:block; width:100vw; height:100vh; }
+.readout { position:fixed; left:50%; transform:translateX(-50%); bottom:92px; z-index:2; display:flex; flex-direction:column; align-items:center; gap:9px; pointer-events:none; }
+.state { font-size:11px; letter-spacing:0.42em; text-transform:uppercase; color:rgba(255,255,255,0.5); }
+.hint { font-size:10px; letter-spacing:0.2em; color:rgba(255,255,255,0.25); }
+.controls { position:fixed; bottom:30px; left:50%; transform:translateX(-50%); display:flex; gap:8px; z-index:3; }
+.btn { font-family:inherit; font-size:10px; letter-spacing:0.18em; text-transform:uppercase; padding:9px 16px; border-radius:2px; cursor:pointer; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.14); color:rgba(255,255,255,0.55); transition:all .2s ease; }
+.btn:hover { color:#fff; border-color:rgba(255,255,255,0.4); }
+.btn.active { color:#000; background:#fff; border-color:#fff; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="readout"><div class="state" id="state">IDLE</div><div class="hint">good evening, sir</div></div>
+<div class="controls">
+  <div class="btn active" data-s="idle">Idle</div>
+  <div class="btn" data-s="listening">Listening</div>
+  <div class="btn" data-s="speaking">Speaking</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.setClearColor(0x000000,1);
+
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,0.1,100);
+camera.position.z=3.4;
+
+const uniforms={
+  uTime:{value:0}, uActivity:{value:0}, uBeat:{value:0},
+  uColorA:{value:new THREE.Color(0xff2fb0)},
+  uColorB:{value:new THREE.Color(0x28d8ff)},
+  uHot:{value:new THREE.Color(0xffffff)},
+};
+
+const vert=`
+varying vec3 vN; varying vec3 vView; varying vec3 vWorldN;
+void main(){
+  vN=normal;
+  vWorldN=normalize(mat3(modelMatrix)*normal);
+  vec4 mv=modelViewMatrix*vec4(position,1.0);
+  vView=normalize(-mv.xyz);
+  gl_Position=projectionMatrix*mv;
+}`;
+
+const frag=`
+precision highp float;
+varying vec3 vN; varying vec3 vView; varying vec3 vWorldN;
+uniform float uTime,uActivity,uBeat,uFront;
+uniform vec3 uColorA,uColorB,uHot;
+
+vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x,289.0);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0);const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy));vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz);vec3 l=1.0-g;vec3 i1=min(g.xyz,l.zxy);vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+C.xxx;vec3 x2=x0-i2+C.yyy;vec3 x3=x0-D.yyy;
+  i=mod(i,289.0);
+  vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+  float n_=1.0/7.0;vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*floor(p*ns.z*ns.z);
+  vec4 x_=floor(j*ns.z);vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy;vec4 y=y_*ns.x+ns.yyyy;vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy);vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0;vec4 s1=floor(b1)*2.0+1.0;vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 p0=vec3(a0.xy,h.x);vec3 p1=vec3(a0.zw,h.y);vec3 p2=vec3(a1.xy,h.z);vec3 p3=vec3(a1.zw,h.w);
+  vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0);m=m*m;
+  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+float fbm(vec3 p){float s=0.0,a=0.55;for(int i=0;i<5;i++){s+=a*snoise(p);p*=2.02;a*=0.5;}return s;}
+
+void main(){
+  float t=uTime*(0.18+uActivity*0.6);
+  vec3 n=normalize(vN);
+
+  // LOW frequency = fewer, larger, branching veins with big empty gaps
+  vec3 q=n*(1.4+uActivity*0.6);
+  float warp=fbm(q+vec3(t*0.4,t*0.3,-t*0.35));
+  float f=fbm(q*1.2+warp*1.8+vec3(-t*0.5,t*0.4,t*0.25));
+
+  // a few BOLD ridge veins — tighter gate = fewer veins survive
+  float ridge=1.0-abs(f);
+  ridge=pow(ridge, 5.0 + uActivity*2.0);
+  ridge=smoothstep(0.55, 0.92, ridge);       // raised floor → sparser
+
+  float ridge2=1.0-abs(warp);
+  ridge2=pow(ridge2, 4.0);
+  ridge2=smoothstep(0.62, 0.96, ridge2);     // raised floor → sparser
+
+  float veins=clamp(ridge*1.1 + ridge2*0.6, 0.0, 1.5);
+
+  float fres=pow(1.0-max(dot(n,vView),0.0),2.0);
+
+  float mixv=0.5+0.5*sin(f*2.6+t+n.y*2.0);
+  vec3 plasma=mix(uColorA,uColorB,mixv);
+  vec3 col=plasma*veins;
+  col+=uHot*pow(veins,5.0)*(0.05+uActivity*0.15);  // minimal white — only the very hottest points
+  col+=plasma*fres*0.28;                           // dimmer rim shell
+  col*=0.7+uBeat*0.35+uActivity*0.2;               // lower overall gain
+
+  // gamma-ish contrast: push darks down so gaps read black
+  col=pow(col, vec3(1.35));
+
+  // DEPTH: back shell much dimmer → sits clearly behind the front veins.
+  // wider gap = stronger 3D read (this is the depth cue, not white).
+  float depthDim = mix(0.28, 1.0, uFront);        // back ~28% brightness
+  col *= depthDim;
+  col += plasma * fres * uFront * 0.4;            // front-rim pop separates near shell
+
+  float alpha=clamp(veins*0.85 + fres*0.75, 0.0, 1.0);
+  alpha *= mix(0.55, 1.0, uFront);               // back more transparent → see through to it
+  if(alpha<0.01) discard;
+  gl_FragColor=vec4(col,alpha);
+}`;
+
+// hollow shell material — additive, double-pass (back then front)
+// each shell gets its own uFront so back renders dimmer/behind → 3D volume
+function shell(side, frontVal){
+  const u=Object.assign({}, uniforms, { uFront:{value:frontVal} });
+  // share the live uniform objects (not copies) except uFront
+  u.uTime=uniforms.uTime; u.uActivity=uniforms.uActivity; u.uBeat=uniforms.uBeat;
+  u.uColorA=uniforms.uColorA; u.uColorB=uniforms.uColorB; u.uHot=uniforms.uHot;
+  return new THREE.ShaderMaterial({
+    uniforms:u, vertexShader:vert, fragmentShader:frag,
+    transparent:true, blending:THREE.AdditiveBlending,
+    depthWrite:false, depthTest:false, side:side
+  });
+}
+const geo=new THREE.SphereGeometry(1,200,200);
+const back=new THREE.Mesh(geo, shell(THREE.BackSide, 0.0));   // far hemisphere, dim
+const front=new THREE.Mesh(geo, shell(THREE.FrontSide, 1.0)); // near hemisphere, bright
+back.renderOrder=1; front.renderOrder=2;
+scene.add(back); scene.add(front);
+
+// outer bloom
+function glowTex(){const s=256,cv=document.createElement('canvas');cv.width=cv.height=s;const g=cv.getContext('2d');const r=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);r.addColorStop(0,'rgba(255,255,255,0.9)');r.addColorStop(0.28,'rgba(255,255,255,0.3)');r.addColorStop(0.6,'rgba(255,255,255,0.06)');r.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=r;g.fillRect(0,0,s,s);const tx=new THREE.Texture(cv);tx.needsUpdate=true;return tx;}
+const gm1=new THREE.SpriteMaterial({map:glowTex(),color:0xff4fc0,transparent:true,blending:THREE.AdditiveBlending,opacity:0.22,depthWrite:false});
+const g1=new THREE.Sprite(gm1);g1.scale.set(4.2,4.2,1);scene.add(g1);
+const gm2=new THREE.SpriteMaterial({map:glowTex(),color:0x35d0ff,transparent:true,blending:THREE.AdditiveBlending,opacity:0.15,depthWrite:false});
+const g2=new THREE.Sprite(gm2);g2.scale.set(3.3,3.3,1);scene.add(g2);
+
+let target=0,activity=0;
+const S={idle:0,listening:0.45,speaking:1.0};
+document.querySelectorAll('.btn').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.btn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');target=S[b.dataset.s];
+  document.getElementById('state').textContent=b.dataset.s.toUpperCase();
+});
+
+const clock=new THREE.Clock();
+let rot=0;
+function loop(){
+  const dt=clock.getDelta(),t=clock.elapsedTime;
+  activity+=(target-activity)*Math.min(dt*3,1);
+  uniforms.uTime.value=t; uniforms.uActivity.value=activity;
+  const bpm=0.9+activity*1.4;
+  const beat=Math.pow(Math.max(0,Math.sin(t*bpm*Math.PI)),8.0)+0.6*Math.pow(Math.max(0,Math.sin((t*bpm+0.16)*Math.PI)),8.0);
+  uniforms.uBeat.value=beat*(0.5+activity*0.5);
+  const s=1.0+beat*0.03*(1.0-activity*0.4)+activity*0.02;
+  back.scale.setScalar(s); front.scale.setScalar(s);
+  // rotation only when idle — fades to still as she speaks
+  const spin=(1.0-activity);
+  rot += dt*0.1*spin;
+  const ry=rot, rx=Math.sin(t*0.13)*0.1*spin;
+  front.rotation.set(rx,ry,0);
+  // back shell rotates slightly slower + offset → parallax = strong 3D read
+  back.rotation.set(rx*0.85, ry*0.82 + 0.35, 0);
+  g1.material.opacity=0.18+beat*0.12+activity*0.18;
+  g2.material.opacity=0.12+beat*0.08+activity*0.12;
+  const gs=4.2+beat*0.25+activity*0.5; g1.scale.set(gs,gs,1);
+  camera.position.y=Math.sin(t*0.2)*0.04; camera.lookAt(0,0,0);
+  renderer.render(scene,camera);
+  requestAnimationFrame(loop);
+}
+loop();
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+</script>
+</body>
+</html>

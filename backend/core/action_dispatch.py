@@ -60,6 +60,84 @@ _JOBS_FN_NAME = {
     "list": "list_applications",
 }
 
+# Fitness gate: reporting/logging a lift PR or workout result. Requires an
+# explicit PR/max signal, OR a training verb followed by a NUMBER (weight, reps,
+# minutes, distance) — specific enough to keep the extractor off ordinary fitness
+# chat/advice questions ("how do I improve my squat form", "is 225 a good bench",
+# where no number FOLLOWS the verb). A rare false gate just costs one local call
+# and falls through to none → normal routing.
+#
+# Two earlier misses this shape fixes, both of which are why fitness_logs sat at
+# one row: a weight UNIT used to be mandatory, so the way Sir actually reports a
+# lift ("benched 225 for 5") never gated at all and was never written; and timed
+# work ("ran 30 minutes") had no verb in the list. Bare "pr" is also gone from the
+# PR branch — it matched "pr manager" in a leadgen query and fired the fitness
+# tool on a prospecting turn.
+_FITNESS_GATE = re.compile(
+    r"\b(prs|personal record|personal best|new max|1rm|one[- ]rep max)\b"
+    r"|\b(new|hit a|hit another|another|my)\s+pr\b"
+    r"|\b(bench(ed)?|squat(ted)?|deadlift(ed)?|press(ed)?|clean(ed)?|snatch(ed)?|"
+    r"curl(ed)?|row(ed)?|ran|run|jog(ged)?|swam|cycled|lifted|trained)\b[^.]{0,40}"
+    r"\b(\d+|lbs?|kgs?|pounds?|kilo(gram)?s?)\b"
+    r"|\blog(ged)?\b[^.]{0,20}\b(workout|lift|set|rep)s?\b",
+    re.IGNORECASE,
+)
+
+_FITNESS_FN_NAME = {
+    "log": "log_fitness",
+    "list": "list_fitness",
+}
+
+# Leads gate: saving/listing the prospecting rows a research turn produced. A save
+# verb paired with a lead/studio/result noun ("save those leads", "log these
+# studios"), or a plain listing ask. The rows themselves come from the session's
+# leadgen cache, not from this line — see _run_leads.
+_LEADS_GATE = re.compile(
+    r"\b(save|log|store|add|keep|record)\b[^.]{0,40}"
+    r"\b(leads?|studios?|prospects?|compan(y|ies)|results?|those|these)\b"
+    r"|\b(list|show|what)\b[^.]{0,25}\b(leads?|prospects?)\b",
+    re.IGNORECASE,
+)
+
+_LEADS_FN_NAME = {
+    "save": "save_leads",
+    "list": "list_leads",
+}
+
+# Study gate: reporting/listing a study session. A study verb paired with a
+# duration/session/day word ("studied DP for two hours today"), an explicit log
+# verb on a study noun, or a listing ask. Specific enough to keep the extractor off
+# ordinary study QUESTIONS ("explain dynamic programming"), which must still route
+# to the StudyTeacher.
+_STUDY_GATE = re.compile(
+    r"\b(stud(y|ied|ying)|revis(e|ed|ing|ion)|practic(e|ed|ing))\b[^.]{0,60}"
+    r"\b(hours?|hrs?|minutes?|mins?|session|today|yesterday|morning|evening|tonight)\b"
+    r"|\b(log|track|record|save)\b[^.]{0,25}\b(stud(y|ies|ying)|revision|session)\b"
+    r"|\b(what|how much|show|list)\b[^.]{0,30}\b(stud(y|ied|ies|ying)|revision)\b",
+    re.IGNORECASE,
+)
+
+_STUDY_FN_NAME = {
+    "log": "log_study",
+    "list": "list_study",
+}
+
+# Habits gate: marking a habit done, or asking whether one was done. Covers "mark
+# meditation done", "did I meditate today", "log my habits", "habit streak". A rare
+# false gate just costs one local call and falls through to none → normal routing.
+_HABITS_GATE = re.compile(
+    r"\bhabits?\b|\bstreak\b"
+    r"|\b(mark|tick|check)\b[^.]{0,40}\b(done|off|complete[d]?)\b"
+    r"|\bdid i\b[^.]{0,40}\b(today|yesterday|yet)\b",
+    re.IGNORECASE,
+)
+
+_HABITS_FN_NAME = {
+    "mark": "mark_habit",
+    "check": "check_habit",
+    "list": "list_habits",
+}
+
 # Documents gate: saving/listing/retrieving/deleting a stored document. Catches
 # "save this document/file/pdf", "what documents do I have", "pull up my resume",
 # "delete the X document". Broad-ish; the extractor returns none for non-commands.
@@ -119,6 +197,31 @@ _EDIT = re.compile(
     r"longer|subject|tone|fix|adjust|tweak|rephrase)\b",
     re.IGNORECASE,
 )
+
+
+# The local 3B routinely emits the literal STRING "null" (and "none"/"N/A") where the
+# schema asks for JSON null — which passes an `or ""` check and lands in the DB as the
+# word "null". These two normalise a raw extracted field into a real value or None.
+_NULL_WORDS = {"", "null", "none", "n/a", "na", "nil", "undefined", "-"}
+
+
+def _clean(value) -> str | None:
+    """Extracted text field → stripped string, or None if it's empty/a null word."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in _NULL_WORDS else text
+
+
+def _num(value) -> int | None:
+    """Extracted count → int, or None. Tolerates the model returning "5" or "null"."""
+    text = _clean(value)
+    if text is None:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
 
 
 def _classify_confirm(message: str) -> str:
@@ -234,6 +337,239 @@ def _extract_jobs(message: str) -> dict | None:
         "status": (parsed.get("status") or "").strip() or None,
         "url": (parsed.get("url") or "").strip() or None,
         "follow_up_at": (parsed.get("follow_up_at") or "").strip() or None,
+    }
+
+
+_FITNESS_EXTRACT_PROMPT = """You convert a short spoken report of a LIFT / WORKOUT into strict JSON. Output ONLY a JSON object, nothing else.
+
+Schema:
+{"action": "log|list|none", "exercises": [{"lift": "<the exercise name, e.g. 'bench press', 'back squat', 'run'>", "weight": "<the weight exactly as said, e.g. '225 lbs', '100kg', or empty>", "reps": <integer rep count if given, else null>, "sets": <integer set count if given, else null>, "duration": "<how long, exactly as said, e.g. '30 minutes', or empty>"}], "date": "<when this happened, exactly as said e.g. 'today','yesterday', or empty — empty means just now>"}
+
+Rules:
+- log  = Sir reporting a lift/workout result to be recorded ("I hit a new PR on bench, 225 for 5", "squatted 315 for 3 yesterday").
+- list = show past PRs/workouts ("what are my PRs", "show my lift log"). Use "exercises": [].
+- none = anything that is NOT actually reporting/logging a workout — including a training QUESTION ("how do I bench more", "is 225 a good bench"). Use "exercises": [].
+- exercises: ONE ENTRY PER EXERCISE. "benched 225 for 5 and squatted 315 for 3" is TWO entries. Never merge two exercises into one entry, never split one exercise into two.
+- lift: the exercise name only, keep Sir's wording, strip filler like "a new PR on".
+- weight: copy the number + unit exactly as said. Do NOT convert units.
+- reps/sets: integers only if explicitly stated; else null.
+- duration: only for timed work ("ran 30 minutes", "45 min on the bike"); empty for a loaded lift.
+- date: copy the time phrasing verbatim if given (e.g. 'yesterday', 'last Monday'); empty if not said. It applies to the whole message.
+- If unsure whether it's a workout log at all, use "none".
+JSON only."""
+
+
+def _extract_fitness(message: str) -> dict | None:
+    """Local strict-JSON extraction for a PR/workout-log command. Returns the
+    parsed dict, or None for anything that isn't a usable log/list command.
+    Same hard fail-safe contract as _extract."""
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": _FITNESS_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            options={"temperature": 0},
+        )
+        text = resp["message"]["content"].strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[orch] fitness extract failed ({e}) — treating as none")
+        return None
+
+    action = (parsed.get("action") or "none").strip().lower()
+    if action not in _FITNESS_FN_NAME:  # 'none' or anything unexpected → not an action
+        return None
+
+    # One entry per exercise. A model that ignores the list schema and returns the
+    # old flat single-lift shape is normalised into a one-entry list here, so the
+    # execute path below only ever deals with one shape.
+    raw = parsed.get("exercises")
+    if not isinstance(raw, list):
+        raw = [parsed] if parsed.get("lift") else []
+    exercises = []
+    for ex in raw:
+        if not isinstance(ex, dict):
+            continue
+        lift = _clean(ex.get("lift"))
+        if not lift:
+            continue
+        exercises.append({
+            "lift": lift,
+            "weight": _clean(ex.get("weight")),
+            "reps": _num(ex.get("reps")),
+            "sets": _num(ex.get("sets")),
+            "duration": _clean(ex.get("duration")),
+        })
+    if action == "log" and not exercises:  # nothing to write → not an action
+        return None
+    return {
+        "tool": "fitness",
+        "action": action,
+        "exercises": exercises,
+        "date": _clean(parsed.get("date")),
+    }
+
+
+_LEADS_EXTRACT_PROMPT = """You convert a short command about SAVING PROSPECTING LEADS into strict JSON. Output ONLY a JSON object, nothing else.
+
+Schema:
+{"action": "save|list|none", "name": "<a single studio/company name IF Sir named one, else empty>", "location": "<city/area if said, else empty>", "contact": "<phone or website if said, else empty>", "research": "<any note about the lead if said, else empty>"}
+
+Rules:
+- save = Sir wants the leads kept ("save those leads", "log these studios", "add Studio Nine to my leads").
+- list = show saved leads ("what leads do I have", "list my leads").
+- none = anything that is NOT saving or listing leads — including a SEARCH request ("find 10 studios in Mumbai"), which is research, not a save.
+- name: fill this ONLY when Sir named one specific studio/company. For "save those/these/the results" leave it EMPTY — those refer to the search results already on screen.
+- Do NOT invent a name, location or contact. Empty is correct when it wasn't said.
+- If unsure whether it's a save/list command at all, use "none".
+JSON only."""
+
+
+def _extract_leads(message: str) -> dict | None:
+    """Local strict-JSON extraction for a leads save/list command. Returns the
+    parsed dict, or None for anything that isn't one. Same hard fail-safe contract
+    as _extract."""
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": _LEADS_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            options={"temperature": 0},
+        )
+        text = resp["message"]["content"].strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[orch] leads extract failed ({e}) — treating as none")
+        return None
+
+    action = (parsed.get("action") or "none").strip().lower()
+    if action not in _LEADS_FN_NAME:  # 'none' or anything unexpected → not an action
+        return None
+    return {
+        "tool": "leads",
+        "action": action,
+        "name": _clean(parsed.get("name")) or "",
+        "location": _clean(parsed.get("location")),
+        "contact": _clean(parsed.get("contact")),
+        "research": _clean(parsed.get("research")),
+    }
+
+
+_STUDY_EXTRACT_PROMPT = """You convert a short spoken report of a STUDY SESSION into strict JSON. Output ONLY a JSON object, nothing else.
+
+Schema:
+{"action": "log|list|none", "subject": "<the subject studied, e.g. 'DSA', 'organic chemistry', or empty>", "duration": "<how long, exactly as said, e.g. '2 hours', '90 minutes', or empty>", "topics": "<the specific topics covered if said, else empty>", "notes": "<any other detail Sir added, else empty>", "date": "<when, exactly as said e.g. 'today','yesterday', or empty>"}
+
+Rules:
+- log  = Sir reporting study he ALREADY did ("studied DP for two hours today", "did an hour of chemistry").
+- list = show logged sessions ("what have I studied this week", "show my study log").
+- none = anything that is NOT logging or listing a session — especially a LEARNING REQUEST ("teach me dynamic programming", "explain the limbic system"), which is not a log.
+- subject: the subject only. topics: the specific things covered within it.
+- duration: copy the phrasing exactly. Do NOT convert or invent a number.
+- date: copy the time phrasing verbatim if given; empty if not said.
+- If unsure whether it's a study log at all, use "none".
+JSON only."""
+
+
+def _extract_study(message: str) -> dict | None:
+    """Local strict-JSON extraction for a study log/list command. Returns the parsed
+    dict, or None for anything that isn't one. Same hard fail-safe contract as
+    _extract."""
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": _STUDY_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            options={"temperature": 0},
+        )
+        text = resp["message"]["content"].strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[orch] study extract failed ({e}) — treating as none")
+        return None
+
+    action = (parsed.get("action") or "none").strip().lower()
+    if action not in _STUDY_FN_NAME:  # 'none' or anything unexpected → not an action
+        return None
+    return {
+        "tool": "study",
+        "action": action,
+        "subject": _clean(parsed.get("subject")) or "",
+        "duration": _clean(parsed.get("duration")),
+        "topics": _clean(parsed.get("topics")),
+        "notes": _clean(parsed.get("notes")),
+        "date": _clean(parsed.get("date")),
+    }
+
+
+_HABITS_EXTRACT_PROMPT = """You convert a short command about a DAILY HABIT into strict JSON. Output ONLY a JSON object, nothing else.
+
+Schema:
+{"action": "mark|check|list|none", "name": "<the habit's name, e.g. 'meditation', 'gym', or empty>", "done": true|false, "date": "<when, exactly as said e.g. 'today','yesterday', or empty — empty means today>"}
+
+Rules:
+- mark  = record that a habit WAS done (or explicitly was not) ("mark meditation done", "I did my run today", "didn't meditate today" -> done false).
+- check = ASK whether a habit was done ("did I meditate today", "have I done my run yet").
+- list  = show today's habits ("what habits do I have today", "show my habits").
+- none  = anything that is NOT about a habit — including marking a REMINDER or a TASK done.
+- name: the habit only, stripped of "mark", "my", "done" and the date.
+- done: true unless Sir clearly says he did NOT do it. For check/list, use true.
+- date: copy the phrasing verbatim if given; empty means today.
+- If unsure whether it's a habit command at all, use "none".
+JSON only."""
+
+
+def _extract_habits(message: str) -> dict | None:
+    """Local strict-JSON extraction for a habit mark/check/list command. Returns the
+    parsed dict, or None for anything that isn't one. Same hard fail-safe contract
+    as _extract."""
+    try:
+        resp = ollama.chat(
+            model="llama3.2",
+            messages=[
+                {"role": "system", "content": _HABITS_EXTRACT_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            options={"temperature": 0},
+        )
+        text = resp["message"]["content"].strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+    except Exception as e:
+        print(f"[orch] habits extract failed ({e}) — treating as none")
+        return None
+
+    action = (parsed.get("action") or "none").strip().lower()
+    if action not in _HABITS_FN_NAME:  # 'none' or anything unexpected → not an action
+        return None
+    name = _clean(parsed.get("name"))
+    if action in ("mark", "check") and not name:  # nothing to act on → not an action
+        return None
+    done = parsed.get("done", True)
+    return {
+        "tool": "habits",
+        "action": action,
+        "name": name or "",
+        # A model that answers "false"/"no" as a STRING must not read as truthy.
+        "done": str(done).strip().lower() not in ("false", "0", "no", "none"),
+        "date": _clean(parsed.get("date")),
     }
 
 
@@ -365,7 +701,7 @@ def detect_action(message: str, session_id: str = "default") -> dict | None:
         return {"tool": "email", "action": "need_address",
                 "session_id": session_id, "raw_message": msg}
 
-    # 1–4. Tool gates in order; a line that gates but fails extraction can fall
+    # 1–7. Tool gates in order; a line that gates but fails extraction can fall
     # through to the next tool's gate.
     if _GATE.search(msg):
         action = _extract(msg)
@@ -375,6 +711,28 @@ def detect_action(message: str, session_id: str = "default") -> dict | None:
             return action
     if _JOBS_GATE.search(msg):
         action = _extract_jobs(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
+    # Leads before fitness: "save those PR firm results" would otherwise hit the
+    # fitness gate's bare "pr" alternative first.
+    if _LEADS_GATE.search(msg):
+        action = _extract_leads(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
+    if _FITNESS_GATE.search(msg):
+        action = _extract_fitness(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
+    if _STUDY_GATE.search(msg):
+        action = _extract_study(msg)
+        if action is not None:
+            action["session_id"] = session_id
+            return action
+    if _HABITS_GATE.search(msg):
+        action = _extract_habits(msg)
         if action is not None:
             action["session_id"] = session_id
             return action
@@ -416,6 +774,14 @@ def run_action(action: dict) -> dict:
     raises."""
     if action.get("tool") == "jobs":
         return _run_jobs(action)
+    if action.get("tool") == "fitness":
+        return _run_fitness(action)
+    if action.get("tool") == "leads":
+        return _run_leads(action)
+    if action.get("tool") == "study":
+        return _run_study(action)
+    if action.get("tool") == "habits":
+        return _run_habits(action)
     if action.get("tool") == "documents":
         return _run_documents(action)
     if action.get("tool") == "email":
@@ -527,6 +893,105 @@ def _run_jobs(action: dict) -> dict:
     return {"ok": False, "error": f"unknown jobs verb {verb}"}
 
 
+def _run_fitness(action: dict) -> dict:
+    """Execute a fitness-log action against the REAL FitnessTool via the registry.
+    A log writes ONE ROW PER EXERCISE reported in the message."""
+    name = "fitness"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    verb = action["action"]
+    try:
+        if verb == "log":
+            return tool.log_many(action.get("exercises") or [], action.get("date"))
+        if verb == "list":
+            return {"ok": True, "items": tool.list()}
+    except Exception as e:
+        print(f"[orch] fitness action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown fitness verb {verb}"}
+
+
+def _run_leads(action: dict) -> dict:
+    """Execute a leads action against the REAL LeadsTool via the registry.
+
+    The rows for a bulk save come from THIS SESSION'S last prospecting run (the
+    leadgen result cache) — "save those" refers to what's on screen, not to
+    anything in the message. Only when Sir named one specific studio does the
+    single-lead path run instead. The cache is the same one the export follow-up
+    uses, so a save and a call-sheet export always agree on what "those" means."""
+    name = "leads"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    verb = action["action"]
+    try:
+        if verb == "list":
+            return {"ok": True, "items": tool.list()}
+        if verb == "save":
+            # Local import: agents.leadgen pulls the teacher stack, and core is
+            # imported by it — keeping this inside the call avoids the cycle.
+            from agents.leadgen import get_cached_leadgen
+            cached = get_cached_leadgen(action.get("session_id", "default"))
+            rows = (cached or {}).get("rows") or []
+            if rows:
+                res = tool.save_many(rows)
+                print(f"[leads] bulk save from cached set "
+                      f"(query={(cached or {}).get('query')!r}): {len(rows)} row(s) offered")
+                return res
+            if action.get("name"):
+                return tool.save(action["name"], action.get("location"),
+                                 action.get("contact"), action.get("research"))
+            return {"ok": False, "needs": "rows",
+                    "ask": "I have no search results in hand to save, Sir — "
+                           "run the search first, then tell me to save them."}
+    except Exception as e:
+        print(f"[orch] leads action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown leads verb {verb}"}
+
+
+def _run_study(action: dict) -> dict:
+    """Execute a study-log action against the REAL StudyTool via the registry."""
+    name = "study"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    verb = action["action"]
+    try:
+        if verb == "log":
+            return tool.log(action.get("subject"), action.get("duration"),
+                            action.get("topics"), action.get("notes"), action.get("date"))
+        if verb == "list":
+            return {"ok": True, "items": tool.list()}
+    except Exception as e:
+        print(f"[orch] study action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown study verb {verb}"}
+
+
+def _run_habits(action: dict) -> dict:
+    """Execute a habit action against the REAL HabitsTool via the registry. `check`
+    is a READ — it answers "did I do X today" without writing a row."""
+    name = "habits"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    verb = action["action"]
+    try:
+        if verb == "mark":
+            return tool.mark(action.get("name"), action.get("done", True),
+                             action.get("date"))
+        if verb == "check":
+            return tool.check(action.get("name"), action.get("date"))
+        if verb == "list":
+            return {"ok": True, "items": tool.list(action.get("date"))}
+    except Exception as e:
+        print(f"[orch] habits action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown habits verb {verb}"}
+
+
 def _run_reminders(action: dict) -> dict:
     """Execute the detected action against the REAL RemindersTool via the registry,
     respecting is_action. Returns the actual tool result dict (success, the
@@ -564,6 +1029,14 @@ def fn_name(action: dict) -> str:
     verb = action.get("action")
     if action.get("tool") == "jobs":
         return _JOBS_FN_NAME.get(verb, verb)
+    if action.get("tool") == "fitness":
+        return _FITNESS_FN_NAME.get(verb, verb)
+    if action.get("tool") == "leads":
+        return _LEADS_FN_NAME.get(verb, verb)
+    if action.get("tool") == "study":
+        return _STUDY_FN_NAME.get(verb, verb)
+    if action.get("tool") == "habits":
+        return _HABITS_FN_NAME.get(verb, verb)
     if action.get("tool") == "documents":
         return _DOCS_FN_NAME.get(verb, verb)
     if action.get("tool") == "email":
@@ -577,6 +1050,14 @@ def action_material(action: dict, res: dict) -> str:
     Dispatches by the action's "tool" tag."""
     if action.get("tool") == "jobs":
         return _jobs_material(action.get("action"), res)
+    if action.get("tool") == "fitness":
+        return _fitness_material(action.get("action"), res)
+    if action.get("tool") == "leads":
+        return _leads_material(action.get("action"), res)
+    if action.get("tool") == "study":
+        return _study_material(action.get("action"), res)
+    if action.get("tool") == "habits":
+        return _habits_material(action.get("action"), res)
     if action.get("tool") == "documents":
         return _documents_material(action.get("action"), res)
     if action.get("tool") == "email":
@@ -721,6 +1202,175 @@ def _jobs_material(verb: str, res: dict) -> str:
         for r in items
     )
     return ("ACTION EXECUTED — these are Sir's logged applications. Present them "
+            "cleanly:\n" + lines)
+
+
+def _fitness_material(verb: str, res: dict) -> str:
+    """Render a fitness-log action result for cognition. This is the truth she
+    confirms from — she must not embellish past what it states. A log may have
+    written SEVERAL rows (one per exercise reported), so every stored row is
+    listed and the count is stated exactly."""
+    if verb == "log":
+        if res.get("ok"):
+            items = res.get("items") or [res]  # single-row result reads the same way
+            lines = "\n".join(
+                f"- {r['activity']}: {r.get('notes') or 'no detail'}"
+                + (f", {r['duration_min']} min" if r.get("duration_min") else "")
+                + f" (logged {r['logged_at']})"
+                for r in items
+            )
+            partial = ""
+            if res.get("failed"):
+                partial = (" NOT everything landed: " + " ".join(str(f) for f in res["failed"])
+                           + " Tell him that part is still missing — do not gloss over it.")
+            return (
+                f"ACTION EXECUTED — you just SAVED {len(items)} PR/workout row(s) to the "
+                "database. This actually happened, the write is done. Exactly what was "
+                f"stored:\n{lines}\nConfirm to Sir, naming the lift(s) and the number(s) — "
+                "a short, genuinely-pleased-for-him beat, not a lecture. Never claim a "
+                "lift that is not listed above." + partial
+            )
+        # clarify path — nothing was written
+        return (
+            "ACTION NOT DONE — no PR/workout was saved because a detail is missing "
+            f"({res.get('needs')}). Do NOT claim it's logged. Put this to Sir: "
+            f"{res.get('ask')}"
+        )
+
+    # list
+    items = res.get("items", [])
+    if not items:
+        return ("ACTION EXECUTED — you checked the fitness log and it is EMPTY. "
+                "Tell Sir he hasn't logged any PRs/workouts yet.")
+    lines = "\n".join(
+        f"#{r['id']} {r['activity']} — {r['notes'] or 'no detail'} ({r['logged_at']})"
+        for r in items
+    )
+    return ("ACTION EXECUTED — these are Sir's logged PRs/workouts. Present them "
+            "cleanly:\n" + lines)
+
+
+def _leads_material(verb: str, res: dict) -> str:
+    """Render a leads action result for cognition. The saved/skipped split is stated
+    exactly — a re-save of an existing set writes nothing new and she must say so
+    rather than claim N fresh rows."""
+    if verb == "save":
+        if res.get("ok"):
+            saved = res.get("items") or []
+            skipped = res.get("skipped") or []
+            if not saved and skipped:
+                return (
+                    f"ACTION EXECUTED — nothing new was written: all {len(skipped)} of those "
+                    "leads were ALREADY saved. Tell Sir they're already on file; do NOT claim "
+                    "a fresh save."
+                )
+            lines = "\n".join(
+                f"- {r['studio_name']}" + (f" ({r['location']})" if r.get("location") else "")
+                for r in saved
+            )
+            dupe = (f" {len(skipped)} were already on file and were skipped — mention that "
+                    "count, briefly." if skipped else "")
+            return (
+                f"ACTION EXECUTED — you just SAVED {len(saved)} lead(s) to the database. This "
+                f"actually happened, the write is done. Exactly what was stored:\n{lines}\n"
+                "Confirm to Sir minimally with the COUNT — do not re-list every lead unless he "
+                "asks, and never name one that isn't above." + dupe
+            )
+        # clarify path — nothing was written
+        return (
+            "ACTION NOT DONE — no leads were saved "
+            f"({res.get('needs') or res.get('error')}). Do NOT claim anything is saved. "
+            f"Put this to Sir: {res.get('ask')}"
+        )
+
+    # list
+    items = res.get("items", [])
+    if not items:
+        return ("ACTION EXECUTED — you checked the leads table and it is EMPTY. "
+                "Tell Sir he hasn't saved any leads yet.")
+    lines = "\n".join(
+        f"#{r['id']} {r['studio_name']} — {r['location'] or 'no location'}"
+        + (f" | {r['contact']}" if r.get("contact") else "")
+        + (f" | {r['research']}" if r.get("research") else "")
+        for r in items
+    )
+    return ("ACTION EXECUTED — these are Sir's saved leads. Present them "
+            "cleanly:\n" + lines)
+
+
+def _study_material(verb: str, res: dict) -> str:
+    """Render a study-log action result for cognition."""
+    if verb == "log":
+        if res.get("ok"):
+            length = (f"{res['duration_min']} min" if res.get("duration_min")
+                      else "no duration given")
+            return (
+                "ACTION EXECUTED — you just SAVED a study session to the database. This "
+                "actually happened, the write is done. Details: "
+                f"subject={res['topic']!r}, duration={length}, "
+                f"notes={res.get('notes') or 'none'}, logged_at={res['logged_at']!r}. "
+                "Confirm to Sir minimally, naming the subject and the time."
+            )
+        # clarify path — nothing was written
+        return (
+            "ACTION NOT DONE — no study session was saved because a detail is missing "
+            f"({res.get('needs')}). Do NOT claim it's logged. Put this to Sir: "
+            f"{res.get('ask')}"
+        )
+
+    # list
+    items = res.get("items", [])
+    if not items:
+        return ("ACTION EXECUTED — you checked the study log and it is EMPTY. "
+                "Tell Sir he hasn't logged any sessions yet.")
+    lines = "\n".join(
+        f"#{r['id']} {r['topic']}"
+        + (f" — {r['duration_min']} min" if r.get("duration_min") else "")
+        + (f" — {r['notes']}" if r.get("notes") else "")
+        + f" ({r['logged_at']})"
+        for r in items
+    )
+    return ("ACTION EXECUTED — these are Sir's logged study sessions. Present them "
+            "cleanly:\n" + lines)
+
+
+def _habits_material(verb: str, res: dict) -> str:
+    """Render a habit action result for cognition. `check` is a READ — she reports
+    what the table says and nothing more; a habit never logged is NOT the same as
+    one logged as not-done, and she must not blur the two."""
+    if verb == "mark":
+        if not res.get("ok"):
+            return (f"ACTION NOT DONE — {res.get('ask')} Do not claim anything was marked.")
+        state = "DONE" if res.get("done") else "NOT done"
+        if res.get("already"):
+            return (f"ACTION EXECUTED — {res['name']!r} was ALREADY marked {state} for "
+                    f"{res['logged_at']}; nothing changed. Tell Sir it was already logged — "
+                    "do NOT imply you just did it.")
+        return (f"ACTION EXECUTED — you just marked {res['name']!r} {state} for "
+                f"{res['logged_at']}. This really happened, the write is done. Confirm to "
+                "Sir, minimally.")
+
+    if verb == "check":
+        if not res.get("ok"):
+            return (f"ACTION NOT DONE — {res.get('ask')} Do not guess an answer.")
+        if not res.get("found"):
+            return (f"ACTION EXECUTED — you checked the habit log: there is NO entry for "
+                    f"{res['name']!r} on {res['logged_at']}. Tell Sir plainly it isn't "
+                    "logged — do NOT say he didn't do it, only that nothing is recorded.")
+        verdict = "DONE" if res.get("done") else "logged as NOT done"
+        return (f"ACTION EXECUTED — you checked the habit log: {res['name']!r} is {verdict} "
+                f"for {res['logged_at']}. Answer Sir from exactly that, in one line.")
+
+    # list
+    items = res.get("items", [])
+    if not items:
+        return ("ACTION EXECUTED — you checked today's habits and there are NONE logged. "
+                "Tell Sir nothing is marked for today yet.")
+    lines = "\n".join(
+        f"#{r['id']} {r['name']} — {'done' if r['done'] else 'not done'} ({r['logged_at']})"
+        for r in items
+    )
+    return ("ACTION EXECUTED — these are Sir's habits for that day. Present them "
             "cleanly:\n" + lines)
 
 

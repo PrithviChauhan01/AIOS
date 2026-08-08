@@ -8,6 +8,10 @@ from tools.reminders import RemindersTool
 from tools.jobs import JobsTool
 from tools.documents import DocumentsTool
 from tools.mailer import EmailTool
+from tools.fitness import FitnessTool
+from tools.leads import LeadsTool
+from tools.study import StudyTool
+from tools.habits import HabitsTool
 
 # ── THE SHARED POOL — instantiated tools by name. Any teacher draws any tool. ──
 _REGISTRY = {
@@ -18,6 +22,10 @@ _REGISTRY = {
     "jobs": JobsTool(),             # ACTION — logs job applications
     "documents": DocumentsTool(),   # ACTION — general document store (tiered)
     "email": EmailTool(),           # ACTION — first EXTERNAL action, confirm-gated
+    "fitness": FitnessTool(),       # ACTION — logs PRs/workouts to fitness_logs
+    "leads": LeadsTool(),           # ACTION — persists prospecting rows (bulk)
+    "study": StudyTool(),           # ACTION — logs study sessions
+    "habits": HabitsTool(),         # ACTION — daily habit marks/checks
 }
 
 

@@ -30,6 +30,26 @@ def _strip_analysis(text: str) -> str:
     return _ANALYSIS_RE.sub("", text or "").strip()
 
 
+# Quote-wrapping backstop — the action path especially comes back with the WHOLE reply
+# sitting inside double quotes ("Reminder saved to drink water..."), as if she were
+# quoting herself. Openers/closers checked as pairs so smart quotes are covered too.
+_QUOTE_PAIRS = (('"', '"'), ("“", "”"))
+
+
+def _strip_quote_wrap(text: str) -> str:
+    """Unwrap a reply that is entirely one quoted span. Only strips when the SAME quote
+    opens and closes the whole string AND neither quote char appears inside it — so a
+    reply that legitimately quotes something ('He said "no", Sir.') or that stitches two
+    quoted fragments together is left exactly as it is."""
+    t = (text or "").strip()
+    for open_q, close_q in _QUOTE_PAIRS:
+        if len(t) >= 2 and t.startswith(open_q) and t.endswith(close_q):
+            inner = t[1:-1]
+            if open_q not in inner and close_q not in inner:
+                return inner.strip()
+    return t
+
+
 # ── Empty-section guard (deliverables) ──
 # The ensemble combine is done by cognition's model, not code: it's handed two source
 # blocks and told to keep the section structure. Under that load it sometimes prints the
@@ -178,6 +198,21 @@ def _output_cap(ctx: dict, material, req_cap: int | None) -> int:
     return max(base, req_cap or 0)
 
 
+# ── List-type deliverable detection (leads, jobs, any row-per-item material) ──
+# The generic deliverable task_block below was written for HEADER-style dossiers
+# (SERVICES:/CONTACT:/SOCIAL:/...) and only asks the model to "keep the section
+# structure" — nothing tells it to preserve line breaks between discrete items, so
+# a 10-row Places list (leadgen._format_row: "1. Name\n   Phone: ...\n   ...") was
+# free to melt into one prose paragraph. Two-or-more "N. " line starts is the
+# signal a teacher already emitted a row-per-item list (as opposed to prose or
+# ALL-CAPS section headers), regardless of which domain produced it.
+_LIST_ROW_RE = re.compile(r"^\s*\d{1,3}\.\s+\S", re.MULTILINE)
+
+
+def _is_list_material(material: str) -> bool:
+    return len(_LIST_ROW_RE.findall(material or "")) >= 2
+
+
 def _format_history(history: list) -> str:
     if not history:
         return "(nothing yet)"
@@ -261,6 +296,16 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
         history = history[len(history) - _LOCAL_HISTORY_MSGS:] if _LOCAL_HISTORY_MSGS > 0 else []
     history_block = _format_history(history)
 
+    # ── Action path: no prior conversation. ──
+    # An action confirmation's only truth is the RAW MATERIAL below — the REAL tool
+    # result for THIS turn. Prior turns add nothing to it, and they are exactly how the
+    # previous confirmation ("Reminder to drink water in 10 minutes, Sir done.") got
+    # replayed as the answer to a NEW reminder: the model copies the nearest matching
+    # line it can see. Every other path keeps its history window untouched.
+    if ctx.get("action_result") is not None:
+        history_block = ("(withheld — this turn confirms an action; the raw material "
+                         "below is the only truth for it)")
+
     if material is None:
         material_block = "(none — you're working from yourself here)"
     elif is_ensemble:
@@ -281,7 +326,9 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
             task_block = (
                 "You just performed a real action for Sir and it SUCCEEDED. The RAW "
                 "MATERIAL above is the ACTUAL result — confirm it in your voice, minimally "
-                "and truthfully, inventing nothing beyond it. IMPORTANT: if the material "
+                "and truthfully, inventing nothing beyond it. Confirm ONLY what THIS "
+                "material states: never an earlier action's task, time or details. "
+                "IMPORTANT: if the material "
                 "says the action is STAGED / NOT yet sent (e.g. an email draft awaiting "
                 "confirmation), present it and ASK for confirmation — do NOT say it was "
                 "sent or done."
@@ -294,6 +341,20 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
                 "plainly what actually happened and relay the exact ask / next step from the "
                 "material, in your voice."
             )
+    elif ctx.get("deliverable") and _is_list_material(material):
+        task_block = (
+            "This is a deliverable LIST for Sir — discrete items (leads, jobs, whatever the "
+            "material is), not a narrative. Open with ONE line in your voice framing it. Then "
+            "render the items as a MARKDOWN NUMBERED LIST, exactly one item per number: the "
+            "item's name in **bold** on its own line, then its remaining fields (phone, "
+            "address, rating, website, salary, whatever the material actually gives) each on "
+            "their OWN line directly beneath it, with a blank line between items. Use real "
+            "line breaks — NEVER run two items together, and NEVER run two fields of the same "
+            "item together, in one sentence or paragraph. Carry every real field from the "
+            "material verbatim (never invent or drop one); only omit a field if the material "
+            "has none for it. Do not pad, do not add commentary per item. End with one line "
+            "only if a real next step exists."
+        )
     elif ctx.get("deliverable"):
         task_block = (
             "This is a deliverable for Sir. Open with ONE line in your voice framing it "
@@ -357,6 +418,20 @@ Reply with ONLY the words you say to Sir, then the single mood tag the system as
 async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     """THE mind. Reasons over the teacher's raw material and speaks HER response
     in HER voice. The raw material is input to her thinking, never her answer."""
+    # ── STALE ACTION GUARD ──
+    # action_result is stamped by the orchestrator with the trace_id of the request that
+    # produced it. If the stamp isn't THIS turn's trace, the result belongs to another
+    # turn — drop it AND the material rendered from it, so she falls through to a plain
+    # reply and can never confirm an action that didn't happen on this turn. ctx is
+    # copied rather than mutated: the caller's dict is its own request's record.
+    action_result = ctx.get("action_result")
+    if action_result is not None and action_result.get("trace_id") != ctx.get("trace_id"):
+        print(f"[cognition] WARNING: stale action_result — stamped "
+              f"{action_result.get('trace_id')}, this turn is {ctx.get('trace_id')}. "
+              f"Dropped; no action is referenced in this reply.")
+        ctx = {k: v for k, v in ctx.items() if k not in ("action_result", "action")}
+        raw_material = None
+
     material, is_ensemble = _format_material(raw_material)
 
     # ── CLOUD GUARD (covers ALL retrieval: documents, memory, future tools) ──
@@ -441,6 +516,8 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     # scaffolding so only her spoken reply remains.
     response, mood = _extract_mood(result["raw_text"])
     response = _strip_analysis(response)
+    # …then unwrap a reply the model handed back entirely inside quotes.
+    response = _strip_quote_wrap(response)
     # Deliverables only: drop any section header the combine left empty (bare 'CONTEXT:'
     # with no body) so a hollow skeleton can never render. Full sections pass untouched.
     if ctx.get("deliverable"):

@@ -218,6 +218,55 @@ def parse_due(text, now: datetime = None) -> datetime:
     return dt.replace(microsecond=0)
 
 
+# A spoken DURATION ("2 hours", "90 mins", "an hour and a half"). Lives here because
+# this module is already the shared time-parsing home (jobs and fitness both import
+# parse_due/_DT_FMT from it) — study/fitness logs need minutes, not a due date.
+_DURATION_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:of\s+)?(hours?|hrs?|h|minutes?|mins?|m)\b", re.IGNORECASE)
+# "forty five" is one number, not 40 then 5 — collapsed BEFORE the word map runs,
+# or the map would leave "40 5 minutes" and the regex would read just the 5.
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+         "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+_UNITS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+          "six": 6, "seven": 7, "eight": 8, "nine": 9}
+_COMPOUND_RE = re.compile(
+    r"\b(" + "|".join(_TENS) + r")[\s-](" + "|".join(_UNITS) + r")\b", re.IGNORECASE)
+# Spelled-out counts, so "two hours" measures the same as "2 hours" — Sir dictates,
+# and the local extractor copies his phrasing verbatim by design. 'a'/'an' are
+# deliberately NOT here: "an hour" is handled below, and mapping it to 1 would make
+# the two paths double count.
+_WORD_NUM = {**_TENS, **_UNITS,
+             "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "couple": 2}
+_WORD_NUM_RE = re.compile(r"\b(" + "|".join(_WORD_NUM) + r")\b", re.IGNORECASE)
+
+
+def parse_minutes(text) -> int | None:
+    """Spoken duration → whole minutes, or None if none is stated. Sums every part it
+    finds so 'an hour and 30 minutes' is 90. Bare 'an hour' / 'half an hour' are handled
+    without a digit. Never raises."""
+    if isinstance(text, (int, float)):
+        return int(text) or None
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    t = _COMPOUND_RE.sub(
+        lambda m: str(_TENS[m.group(1).lower()] + _UNITS[m.group(2).lower()]), t)
+    t = _WORD_NUM_RE.sub(lambda m: str(_WORD_NUM[m.group(0).lower()]), t)
+    total = 0.0
+    for amount, unit in _DURATION_RE.findall(t):
+        n = float(amount)
+        total += n * 60 if unit.startswith("h") else n
+    # Digitless parts, ADDED to whatever the digits gave — "an hour and 30 minutes"
+    # is 90, not 30. Checked longest-phrase-first so they can't double count.
+    if re.search(r"\ban hour and a half\b", t):
+        total += 90
+    elif re.search(r"\bhalf (an )?hour\b", t):
+        total += 30
+    elif re.search(r"\ban hour\b", t):
+        total += 60
+    return int(round(total)) or None
+
+
 # ── Action API (writes state) ──
 def set_reminder(title: str, due_at, repeat: str = None) -> dict:
     """Create a reminder. `due_at` may be a datetime or a natural-language string

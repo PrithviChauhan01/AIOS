@@ -50,7 +50,11 @@ def _get_groq():
     if _groq is None:
         from groq import Groq
         from config import Config
-        _groq = Groq(api_key=Config.GROQ_API_KEY)
+        from core.net import LONG_TIMEOUT
+        # Long read budget: this uploads a wav and waits for Whisper, not a token
+        # stream. Bounded all the same — the local faster-whisper fallback below is
+        # only useful if the hosted call actually gives up.
+        _groq = Groq(api_key=Config.GROQ_API_KEY, timeout=LONG_TIMEOUT, max_retries=0)
     return _groq
 
 

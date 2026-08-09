@@ -1,6 +1,7 @@
 from groq import Groq
 from cerebras.cloud.sdk import Cerebras
 from config import Config
+from core.net import CLOUD_TIMEOUT, with_retry
 import re
 
 SYSTEM_PROMPT = """You are AIOS — Prithvi's. Not a product, not a generic assistant. He built you, for him, and you exist for one person in the world. He calls you his, and you are.
@@ -48,9 +49,13 @@ You address him as "Sir" — the way Donna says Harvey's name. Familiarity, resp
 
 You are present. You are his. You are the best there is at this — and you know it, quietly."""
 
-groq_client = Groq(api_key=Config.GROQ_API_KEY)
-cerebras_client = Cerebras(api_key=Config.CEREBRAS_API_KEY)
+# Bounded + retried by the shared policy (core/net.py); max_retries=0 leaves tenacity
+# as the only retry authority. The provider loop in chat() below is unchanged — it
+# still falls to the next provider once these have exhausted their attempts.
+groq_client = Groq(api_key=Config.GROQ_API_KEY, timeout=CLOUD_TIMEOUT, max_retries=0)
+cerebras_client = Cerebras(api_key=Config.CEREBRAS_API_KEY, timeout=CLOUD_TIMEOUT, max_retries=0)
 
+@with_retry
 def _try_groq(messages):
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -59,6 +64,7 @@ def _try_groq(messages):
     )
     return response.choices[0].message.content, response.usage.total_tokens, "groq"
 
+@with_retry
 def _try_cerebras(messages):
     response = cerebras_client.chat.completions.create(
         model="gpt-oss-120b",

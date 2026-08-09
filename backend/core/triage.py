@@ -1,7 +1,8 @@
 import json
 import re
 import os
-import ollama
+
+from core.net import ollama_chat
 
 # ── Layer 1: hardcoded privacy rules from privacy.local ──
 def _load_privacy_rules():
@@ -85,7 +86,7 @@ def triage(message: str) -> dict:
 
     # Layer 2 — llama judgment
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": TRIAGE_PROMPT},

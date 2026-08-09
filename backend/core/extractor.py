@@ -1,9 +1,13 @@
 from groq import Groq
 from config import Config
+from core.net import CLOUD_TIMEOUT, with_retry
 from core.profile import store_fact
 from core.vault import vault_store
 
-client = Groq(api_key=Config.GROQ_API_KEY)
+# Bounded + retried by the shared policy (core/net.py). The extractor runs AFTER the
+# reply is already on its way back, so a slow one used to hold the request open for
+# nothing; it stays fail-silent either way.
+client = Groq(api_key=Config.GROQ_API_KEY, timeout=CLOUD_TIMEOUT, max_retries=0)
 
 # Tiers for which we are allowed to call the cloud extractor. Anything else
 # (secret, or an unexpected value) is fail-safe routed to the local vault.
@@ -20,6 +24,19 @@ Rules:
 - Never invent facts. Only extract what is explicitly stated.
 - Keep each fact concise — one sentence max."""
 
+@with_retry
+def _extract_call(user_message: str, assistant_response: str):
+    """The one outbound call — wrapped so a hung/rate-limited extractor is bounded."""
+    return client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": f"User said: {user_message}\nAssistant replied: {assistant_response}"}
+        ],
+        max_tokens=256
+    )
+
+
 def extract_and_store(user_message: str, assistant_response: str, tier: str = "public"):
     # ── SECRET (or any non-cloud tier) → NEVER touch Groq. ──
     # The raw user message goes straight to the encrypted local vault: no cloud
@@ -35,14 +52,7 @@ def extract_and_store(user_message: str, assistant_response: str, tier: str = "p
 
     # ── PUBLIC / PRIVATE → extract via Groq, tagging each fact with the tier. ──
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": EXTRACT_PROMPT},
-                {"role": "user", "content": f"User said: {user_message}\nAssistant replied: {assistant_response}"}
-            ],
-            max_tokens=256
-        )
+        response = _extract_call(user_message, assistant_response)
         import json
         text = response.choices[0].message.content.strip()
         facts = json.loads(text)

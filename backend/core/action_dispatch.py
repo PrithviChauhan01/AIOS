@@ -22,11 +22,13 @@ action carries a "tool" key so run_action / action_material / fn_name dispatch t
 the right one. email/calendar will plug in the same way.
 """
 
+import hashlib
 import json
 import re
+import threading
+import time
 
-import ollama
-
+from core.net import ollama_chat
 from tools.registry import get_tool, is_action_tool
 
 # Cheap gate: spoken reminder commands essentially always contain "remind"
@@ -48,12 +50,52 @@ _JOBS_GATE = re.compile(
     re.IGNORECASE,
 )
 
+# Bulk-clear gate for reminders — checked BEFORE the LLM extractor even runs
+# (deterministic, no ollama round trip, so it can never misfire the way a model
+# occasionally does). "empty all the reminders" / "remove all the reminders" /
+# "clear my reminders" all match. Plural "reminders" (or an explicit "all") is
+# required so a SINGLE-item command ("delete the reminder about calling mom",
+# "cancel the reminder for the dentist") never gets read as a wipe.
+_CLEAR_RE = re.compile(
+    r"\b(clear|empty|wipe)\b[^.]{0,25}\breminders\b"
+    r"|\b(delete|remove|cancel|clear)\b[^.]{0,10}\ball\b[^.]{0,15}\breminders?\b"
+    r"|\ball\b[^.]{0,10}\b(my\s+)?reminders\b[^.]{0,20}"
+    r"\b(clear(ed)?|empty|delet(e|ed)|remov(e|ed)|wipe(d)?|gone)\b",
+    re.IGNORECASE,
+)
+# "clear my reminders" alone means PENDING only (the default everywhere else in this
+# module — set/list/complete/delete all operate on pending rows). Only an explicit
+# "including completed" (or a close variant) widens it to everything.
+_CLEAR_ALL_SCOPE_RE = re.compile(
+    r"\bincluding\b[^.]{0,15}\bcompleted\b|\binclude\b[^.]{0,15}\bcompleted\b"
+    r"|\bcompleted\b[^.]{0,10}\b(too|as well)\b",
+    re.IGNORECASE,
+)
+
+# Fallback safety net — a message that READS like a bulk-clear/delete-all command
+# for something we have NO tool for (leads, habits, jobs, documents, or a reminders
+# phrasing odd enough to slip past _CLEAR_RE above). Checked LAST, only when every
+# other gate found nothing: it turns "empty my study log" from silent nothing (which
+# fell through to general chat and got narrated back) into an honest decline routed
+# through the SAME ACTION NOT DONE path real actions use. See _run_unsupported.
+_BULK_CLEAR_INTENT_RE = re.compile(
+    r"\b(clear|empty|wipe|erase)\b[^.]{0,25}\b(my\s+)?"
+    r"(reminders?|leads?|habits?|jobs?|applications?|documents?|files?|"
+    r"study(\s+(log|sessions?))?|logs?|history|everything|all of (it|them))\b"
+    r"|\b(delete|remove)\b[^.]{0,10}\ball\b[^.]{0,20}\b(my\s+)?"
+    r"(reminders?|leads?|habits?|jobs?|applications?|documents?|files?|"
+    r"study(\s+(log|sessions?))?|logs?)\b",
+    re.IGNORECASE,
+)
+
+
 # Action verb → the module function name, for an honest, greppable orch log line.
 _FN_NAME = {
     "set": "set_reminder",
     "list": "list_reminders",
     "complete": "complete_reminder",
     "delete": "delete_reminder",
+    "clear": "clear_reminders",
 }
 _JOBS_FN_NAME = {
     "log": "log_application",
@@ -258,7 +300,7 @@ def _extract(message: str) -> dict | None:
     anything that isn't a usable reminder command (bad JSON, action 'none', or an
     unknown action). Hard fail-safe: never raises, never guesses."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _EXTRACT_PROMPT},
@@ -308,7 +350,7 @@ def _extract_jobs(message: str) -> dict | None:
     parsed dict, or None for anything that isn't a usable log/list command. Same
     hard fail-safe contract as _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _JOBS_EXTRACT_PROMPT},
@@ -364,7 +406,7 @@ def _extract_fitness(message: str) -> dict | None:
     parsed dict, or None for anything that isn't a usable log/list command.
     Same hard fail-safe contract as _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _FITNESS_EXTRACT_PROMPT},
@@ -435,7 +477,7 @@ def _extract_leads(message: str) -> dict | None:
     parsed dict, or None for anything that isn't one. Same hard fail-safe contract
     as _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _LEADS_EXTRACT_PROMPT},
@@ -486,7 +528,7 @@ def _extract_study(message: str) -> dict | None:
     dict, or None for anything that isn't one. Same hard fail-safe contract as
     _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _STUDY_EXTRACT_PROMPT},
@@ -539,7 +581,7 @@ def _extract_habits(message: str) -> dict | None:
     parsed dict, or None for anything that isn't one. Same hard fail-safe contract
     as _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _HABITS_EXTRACT_PROMPT},
@@ -595,7 +637,7 @@ def _extract_docs(message: str) -> dict | None:
     parsed dict, or None for anything that isn't a usable command. Same hard
     fail-safe contract as _extract."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _DOCS_EXTRACT_PROMPT},
@@ -643,7 +685,7 @@ JSON only."""
 def _extract_email(message: str) -> dict | None:
     """Local strict-JSON extraction for an email-draft command. None if it isn't one."""
     try:
-        resp = ollama.chat(
+        resp = ollama_chat(
             model="llama3.2",
             messages=[
                 {"role": "system", "content": _EMAIL_EXTRACT_PROMPT},
@@ -674,6 +716,17 @@ def _extract_email(message: str) -> dict | None:
 
 
 def detect_action(message: str, session_id: str = "default") -> dict | None:
+    """Cheap per-tool gate, then local extraction (see _detect), plus the idempotency
+    key the execute stage checks. Returns the intent dict for a real action command,
+    or None for ordinary chat."""
+    action = _detect(message, session_id)
+    if action is not None:
+        action.setdefault("raw_message", message or "")
+        action["idem_key"] = _idempotency_key(action, message or "")
+    return action
+
+
+def _detect(message: str, session_id: str = "default") -> dict | None:
     """Cheap per-tool gate, then local extraction. Returns the intent dict (tagged
     with its "tool" and the session) for a real action command, or None for ordinary
     chat. A PENDING email confirmation takes priority over every gate so a bare
@@ -704,6 +757,12 @@ def detect_action(message: str, session_id: str = "default") -> dict | None:
     # 1–7. Tool gates in order; a line that gates but fails extraction can fall
     # through to the next tool's gate.
     if _GATE.search(msg):
+        # Bulk clear is DETERMINISTIC — checked before the LLM extractor, which has
+        # no "clear" concept in its schema at all. No ollama round trip, never flaky.
+        if _CLEAR_RE.search(msg):
+            scope = "all" if _CLEAR_ALL_SCOPE_RE.search(msg) else "pending"
+            return {"tool": "reminders", "action": "clear", "scope": scope,
+                    "session_id": session_id, "raw_message": msg}
         action = _extract(msg)
         if action is not None:
             action["tool"] = "reminders"
@@ -746,7 +805,146 @@ def detect_action(message: str, session_id: str = "default") -> dict | None:
         if action is not None:
             action["session_id"] = session_id
             return action
+
+    # 8. FALLBACK — nothing matched, but this reads like a bulk-clear/delete-all
+    # command we have no tool for. Return an honest decline instead of None, so it
+    # routes through the ACTION NOT DONE path (real material, a real task_block)
+    # rather than falling to general chat with nothing to say — which is what
+    # produced the "You asked me to empty all of them" narration.
+    if _BULK_CLEAR_INTENT_RE.search(msg):
+        return {"tool": "unsupported", "action": "decline",
+                "session_id": session_id, "raw_message": msg}
     return None
+
+
+# ── Idempotency ──
+# A double-submit (impatient second Enter, a client retry, the same command spoken
+# twice) used to execute twice: two reminders, two logged applications, two SENT
+# emails. Nothing downstream could tell the difference, because each turn arrives as
+# a fresh request with a fresh ctx.
+#
+# So every detected action carries a key derived from (session_id, normalized
+# message, tool:verb) — stable for the same logical request, different for a
+# different one. Before executing, run_action checks the key: if that exact request
+# already EXECUTED within the TTL, the ORIGINAL result is returned and the tool is
+# never called again.
+#
+# In-memory with a TTL, matching the other per-session state in this codebase
+# (_AWAITING_EMAIL here, _PENDING in mailer, _SECRET_MODE, the leadgen cache). A
+# restart clears it, which is correct: 60s of protection has no meaning across one.
+_IDEM_TTL_S = 60.0
+_idem_store: dict[str, tuple[float, dict]] = {}
+_idem_lock = threading.Lock()
+
+# Only WRITE verbs are guarded. Reads (list/check/get/reconfirm) are safe to repeat
+# and must stay live — replaying a cached "your reminders" for 60s would show Sir a
+# list that no longer matches the table he just changed.
+_WRITE_VERBS = {
+    "reminders": {"set", "complete", "delete", "clear"},
+    "jobs": {"log"},
+    "documents": {"save", "delete"},
+    "leads": {"save"},
+    "fitness": {"log"},
+    "study": {"log"},
+    "habits": {"mark"},
+    "email": {"draft", "send", "revise", "cancel", "cancel_awaiting"},
+}
+
+_WS_RE = re.compile(r"\s+")
+_PUNCT_RE = re.compile(r"[^\w\s]+")
+
+
+def _normalize_message(message: str) -> str:
+    """Message → comparison form: lowercase, punctuation dropped, whitespace
+    collapsed. So "Remind me to stretch!" and "remind me to stretch" are ONE logical
+    request, while a genuinely different command is a different key."""
+    return _WS_RE.sub(" ", _PUNCT_RE.sub(" ", (message or "").lower())).strip()
+
+
+def _idempotency_key(action: dict, message: str) -> str:
+    """(session_id, normalized message, action type) — the spec's triple.
+
+    Email confirmations get ONE extra ingredient: the staged draft's identity. On the
+    confirm gate the message is just "yes", which says nothing about WHICH email —
+    two different drafts confirmed with the same word inside a minute would otherwise
+    collide on one key and the second send would be swallowed as a replay. The draft
+    is read, never modified, so this stays a pure key computation."""
+    tool = action.get("tool") or "reminders"
+    verb = action.get("action") or ""
+    parts = [action.get("session_id") or "default", tool, verb, _normalize_message(message)]
+
+    if tool == "email":
+        try:
+            etool = get_tool("email")
+            pending = etool.get_pending(action.get("session_id", "default")) if etool else None
+            if pending:
+                parts.append(f"{pending.get('to')}|{pending.get('subject')}")
+        except Exception as e:
+            # Key computation must never break a turn. Without the draft identity the
+            # key is merely coarser (the base triple), never wrong.
+            print(f"[idem] draft fingerprint unavailable ({e}) — using the base key")
+
+    return hashlib.sha256("\x1f".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+
+
+def _is_write(action: dict) -> bool:
+    return action.get("action") in _WRITE_VERBS.get(action.get("tool") or "reminders", set())
+
+
+def _idem_get(key: str) -> dict | None:
+    """The stored result for an identical request still inside the TTL, else None.
+    Sweeps expired entries on the way through so the store can't grow unbounded."""
+    now = time.monotonic()
+    with _idem_lock:
+        for k, (ts, _) in list(_idem_store.items()):
+            if now - ts > _IDEM_TTL_S:
+                del _idem_store[k]
+        entry = _idem_store.get(key)
+    return entry[1] if entry else None
+
+
+def _idem_put(key: str, result: dict) -> None:
+    with _idem_lock:
+        _idem_store[key] = (time.monotonic(), result)
+
+
+# ── Reply cache (closes the "two different replies" half of a replay) ──
+# Deduping the TOOL WRITE (above) stops a duplicate reminder/email/etc. from ever
+# landing twice, but cognition still turns the (correctly reused) tool result into
+# spoken text with a fresh LLM call every time — so a genuine duplicate could still
+# come back worded two different ways for the exact same fact. This is a second,
+# separate cache, keyed by the SAME idem_key, holding the FULL reply cognition
+# produced (response/mood/provider_used/tokens) so a replay returns it verbatim —
+# see core/cognition.py's use of get_cached_reply/record_reply. Same TTL, same
+# sweep-on-read pattern, deliberately a SEPARATE dict from _idem_store: the tool
+# result is written the moment execution finishes, the reply only once cognition is
+# done — two different write times, so keeping them apart avoids any partial-update
+# bookkeeping on a single shared entry.
+_idem_reply_store: dict[str, tuple[float, dict]] = {}
+
+
+def get_cached_reply(idem_key: str) -> dict | None:
+    """The FULL cognition reply already produced for this idem_key, if one exists
+    and is still inside the TTL; else None (caller then generates fresh, exactly as
+    if this cache didn't exist)."""
+    if not idem_key:
+        return None
+    now = time.monotonic()
+    with _idem_lock:
+        for k, (ts, _) in list(_idem_reply_store.items()):
+            if now - ts > _IDEM_TTL_S:
+                del _idem_reply_store[k]
+        entry = _idem_reply_store.get(idem_key)
+    return dict(entry[1]) if entry else None
+
+
+def record_reply(idem_key: str, reply: dict) -> None:
+    """Remember the reply cognition produced for this idem_key, so a later duplicate
+    of the SAME logical request (still inside the TTL) gets this exact text back."""
+    if not idem_key:
+        return
+    with _idem_lock:
+        _idem_reply_store[idem_key] = (time.monotonic(), dict(reply))
 
 
 # ── Execution ──
@@ -768,10 +966,44 @@ def _resolve_id(action: dict, items: list) -> int | None:
 
 
 def run_action(action: dict) -> dict:
-    """Execute the detected action against the REAL tool via the registry,
-    respecting is_action. Dispatches by the action's "tool" tag. Returns the actual
-    tool result dict (success, the needs/ask clarify path, or a not-found). Never
-    raises."""
+    """Execute the detected action against the REAL tool, ONCE per logical request.
+
+    A write that already executed within the idempotency TTL returns its ORIGINAL
+    stored result instead of running again — that is what stops a double-submit
+    becoming two reminders or two sent emails. Reads and clarify/failure results are
+    not cached: nothing was written, so repeating them is free and a transient
+    failure stays retryable.
+
+    A guarded result carries "_idem_key" (so cognition can key its OWN reply cache
+    off the same identity) and, on a replay, "_idem_replay": True — see
+    core/cognition.py's idempotent-replay short-circuit."""
+    key = action.get("idem_key")
+    guarded = bool(key) and _is_write(action)
+
+    if guarded:
+        cached = _idem_get(key)
+        if cached is not None:
+            print(f"[idem] replay {key[:12]} ({action.get('tool')}:{action.get('action')}) "
+                  f"— already executed within {int(_IDEM_TTL_S)}s, returning the ORIGINAL "
+                  "result, tool NOT called again")
+            return {**cached, "_idem_key": key, "_idem_replay": True}
+
+    res = _execute(action)
+
+    # Only a real execution is recorded. An ok=False result (missing detail, nothing
+    # staged, send failed) wrote nothing, so it must stay repeatable.
+    if guarded and res.get("ok"):
+        _idem_put(key, res)
+        res = {**res, "_idem_key": key, "_idem_replay": False}
+    return res
+
+
+def _execute(action: dict) -> dict:
+    """Dispatch to the REAL tool via the registry, respecting is_action. Returns the
+    actual tool result dict (success, the needs/ask clarify path, or a not-found).
+    Never raises."""
+    if action.get("tool") == "unsupported":
+        return _run_unsupported(action)
     if action.get("tool") == "jobs":
         return _run_jobs(action)
     if action.get("tool") == "fitness":
@@ -787,6 +1019,16 @@ def run_action(action: dict) -> dict:
     if action.get("tool") == "email":
         return _run_email(action)
     return _run_reminders(action)
+
+
+def _run_unsupported(action: dict) -> dict:
+    """Nothing to execute — the message read like a bulk-clear/delete-all command
+    but there is no tool for it (see _BULK_CLEAR_INTENT_RE). Returns a real, honest
+    ok=False so cognition routes through the ACTION NOT DONE path and declines
+    plainly, instead of falling to general chat with no material and narrating the
+    request back."""
+    return {"ok": False, "error": "unsupported",
+            "ask": "I don't have a way to do that yet, Sir."}
 
 
 def _run_email(action: dict) -> dict:
@@ -1009,6 +1251,9 @@ def _run_reminders(action: dict) -> dict:
         if verb == "list":
             return {"ok": True, "items": tool.list(pending_only=True)}
 
+        if verb == "clear":
+            return tool.clear(action.get("scope") or "pending")
+
         # complete / delete need a concrete row — resolve from id or unique title.
         items = tool.list(pending_only=True)
         rid = _resolve_id(action, items)
@@ -1027,6 +1272,8 @@ def fn_name(action: dict) -> str:
     """Module-function name for an action, for logging ('set' → 'set_reminder',
     'log' → 'log_application'). Dispatches by the action's "tool" tag."""
     verb = action.get("action")
+    if action.get("tool") == "unsupported":
+        return "decline"
     if action.get("tool") == "jobs":
         return _JOBS_FN_NAME.get(verb, verb)
     if action.get("tool") == "fitness":
@@ -1048,6 +1295,8 @@ def action_material(action: dict, res: dict) -> str:
     """Render the REAL tool result into a text block for cognition. This is the
     truth she confirms from — she must not embellish past what it states.
     Dispatches by the action's "tool" tag."""
+    if action.get("tool") == "unsupported":
+        return _unsupported_material(action.get("action"), res)
     if action.get("tool") == "jobs":
         return _jobs_material(action.get("action"), res)
     if action.get("tool") == "fitness":
@@ -1063,6 +1312,18 @@ def action_material(action: dict, res: dict) -> str:
     if action.get("tool") == "email":
         return _email_material(action.get("action"), res)
     return _reminder_material(action.get("action"), res)
+
+
+def _unsupported_material(verb: str, res: dict) -> str:
+    """Render a declined/unsupported action for cognition. She must say plainly she
+    can't do it — never restate or paraphrase Sir's request back to him as if
+    acknowledging or handling it (that's how a decline reads as a stalled "yes")."""
+    return (
+        "ACTION NOT DONE — Sir asked for something you have NO tool to do. Do NOT "
+        "claim it's done, do NOT restate or paraphrase his request back to him as if "
+        "you're acknowledging or handling it. Tell him PLAINLY, in one short line, "
+        f"that you can't do that (yet). {res.get('ask') or ''}"
+    ).strip()
 
 
 def _email_material(verb: str, res: dict) -> str:
@@ -1405,6 +1666,29 @@ def _reminder_material(verb: str, res: dict) -> str:
         )
         return ("ACTION EXECUTED — these are Sir's current pending reminders. Present "
                 "them cleanly:\n" + lines)
+
+    if verb == "clear":
+        if res.get("ok"):
+            n = res.get("deleted", 0)
+            scope = res.get("scope", "pending")
+            if n == 0:
+                # Mirrors the (reliable) empty-list phrasing above: "you checked, it's
+                # EMPTY" — no verb near "clear/delete/remove" for a small model to
+                # latch onto and falsely confirm. NOTHING was deleted; say that.
+                which = "reminders at all (including completed ones)" if scope == "all" else "PENDING reminders"
+                return (f"ACTION EXECUTED — you checked the reminders table: there were "
+                        f"ZERO {which} to begin with. NOTHING was deleted — there was "
+                        "nothing there. Do NOT say 'cleared', 'deleted', or 'removed', and "
+                        "do NOT give a count. Tell Sir plainly there was nothing to clear.")
+            scope_note = " (including completed ones)" if scope == "all" else ""
+            return (
+                f"ACTION EXECUTED — you just DELETED {n} reminder(s){scope_note}. This "
+                "actually happened, the write is done. Confirm to Sir with the EXACT "
+                f"count — {n}. Never say 'all' unless {n} genuinely is the whole list; "
+                "never invent a different number."
+            )
+        return (f"ACTION NOT DONE — the reminders were NOT cleared "
+                f"({res.get('error')}). Do NOT claim anything was deleted.")
 
     # complete / delete
     done_word = "marked done" if verb == "complete" else "deleted"

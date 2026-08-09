@@ -3,6 +3,12 @@ import re
 import time
 import asyncio
 from config import Config
+# Every call below is bounded and retried by the shared policy — see core/net.py.
+# max_retries=0 on each client makes tenacity the ONLY retry authority: the SDKs
+# retry twice by default, which would silently multiply attempts (and hide the 429s
+# the cooldown logic below depends on seeing).
+from core.net import (CLOUD_TIMEOUT, LONG_TIMEOUT, timeout_for, with_retry,
+                      ollama_client)
 
 # ── Capability map — exact values from LLD §4 ──
 CAPABILITY_MAP = {
@@ -250,25 +256,29 @@ def groq_client():
     # there is exactly one Groq connection pool in the process.
     if "groq" not in _clients:
         from groq import Groq
-        _clients["groq"] = Groq(api_key=Config.GROQ_API_KEY)
+        _clients["groq"] = Groq(api_key=Config.GROQ_API_KEY,
+                                timeout=CLOUD_TIMEOUT, max_retries=0)
     return _clients["groq"]
 
 def _cerebras_client():
     if "cerebras" not in _clients:
         from cerebras.cloud.sdk import Cerebras
-        _clients["cerebras"] = Cerebras(api_key=Config.CEREBRAS_API_KEY)
+        _clients["cerebras"] = Cerebras(api_key=Config.CEREBRAS_API_KEY,
+                                        timeout=CLOUD_TIMEOUT, max_retries=0)
     return _clients["cerebras"]
 
 def _mistral_client():
     if "mistral" not in _clients:
         from mistralai import Mistral
-        _clients["mistral"] = Mistral(api_key=os.getenv("MISTRAL_API_KEY", ""))
+        _clients["mistral"] = Mistral(api_key=os.getenv("MISTRAL_API_KEY", ""),
+                                      timeout_ms=int(LONG_TIMEOUT.read * 1000))
     return _clients["mistral"]
 
 def _openai_client():
     if "openai" not in _clients:
         from openai import OpenAI
-        _clients["openai"] = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        _clients["openai"] = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""),
+                                    timeout=CLOUD_TIMEOUT, max_retries=0)
     return _clients["openai"]
 
 # NVIDIA NIM is OpenAI-compatible — same SDK, just a different base_url + key.
@@ -279,42 +289,61 @@ _NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 def nvidia_client():
     if "nvidia" not in _clients:
         from openai import OpenAI
-        _clients["nvidia"] = OpenAI(api_key=Config.NVIDIA_API_KEY, base_url=_NVIDIA_BASE_URL)
+        # Nemotron is the slow, long-answer endpoint — it gets the long read budget as
+        # its client default; per-call overrides still apply below.
+        _clients["nvidia"] = OpenAI(api_key=Config.NVIDIA_API_KEY, base_url=_NVIDIA_BASE_URL,
+                                    timeout=LONG_TIMEOUT, max_retries=0)
     return _clients["nvidia"]
 
 # ── Per-book synchronous calls (run off-thread by call_book) ──
 # max_tokens is per-call: cognition hard-caps length (trivial ~60, deliverable
 # ~900). Defaults to _MAX_TOKENS for callers that don't care (e.g. teachers).
+#
+# Each is wrapped by @with_retry (2 attempts, backoff+jitter, retryable failures
+# only) and passes an explicit per-call timeout sized to its output — a deliverable
+# asking for 4096 tokens legitimately needs longer than a 150-token confirmation.
+# A retry re-runs THIS function against THIS book, so it can never cross a tier.
+@with_retry
 def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
-        model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+        model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return r.choices[0].message.content, r.usage.total_tokens
 
+@with_retry
 def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
-        model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+        model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return r.choices[0].message.content, r.usage.total_tokens
 
+@with_retry
 def _call_cerebras(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _cerebras_client().chat.completions.create(
-        model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+        model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return r.choices[0].message.content, r.usage.total_tokens
 
+@with_retry
 def _call_mistral(prompt: str, max_tokens: int = _MAX_TOKENS):
+    # The Mistral SDK takes its timeout on the client (timeout_ms), not per call.
     r = _mistral_client().chat.complete(
         model=_MODELS["mistral"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return r.choices[0].message.content, r.usage.total_tokens
 
+@with_retry
 def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _openai_client().chat.completions.create(
-        model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
+        model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return r.choices[0].message.content, r.usage.total_tokens
 
 # Nemotron Super — standard chat completion, no reasoning-budget params.
+@with_retry
 def _call_nemotron_super(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_super"], messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens)
+        max_tokens=max_tokens, timeout=LONG_TIMEOUT)
     return r.choices[0].message.content, r.usage.total_tokens
 
 # Nemotron Ultra — a REASONING model. It thinks in message.reasoning_content and
@@ -330,6 +359,7 @@ _ULTRA_REASONING_BUDGET = 16384
 _ULTRA_MIN_ANSWER_TOKENS = 512   # floor so a tiny caller cap can't starve the visible answer
 _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>\s*")
 
+@with_retry
 def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     # max_tokens is the FINAL-ANSWER budget; reasoning gets its own budget on top.
     answer_cap = max(max_tokens, _ULTRA_MIN_ANSWER_TOKENS)
@@ -337,6 +367,8 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_ultra"], messages=[{"role": "user", "content": prompt}],
         max_tokens=api_max,
+        # Always the long budget: even a small answer cap sits behind a 16k reasoning pass.
+        timeout=LONG_TIMEOUT,
         extra_body={"chat_template_kwargs": {"enable_thinking": True},
                     "reasoning_budget": _ULTRA_REASONING_BUDGET})
     msg = r.choices[0].message
@@ -350,13 +382,15 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     answer = _THINK_BLOCK_RE.sub("", answer).strip()
     return answer, r.usage.total_tokens
 
+@with_retry
 def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
-    import ollama
     # num_predict caps the OUTPUT; num_ctx is the whole window (prompt + output).
     # The default num_ctx (2048) is smaller than a deliverable's prompt+material,
     # so the model silently drops the tail and the reply ends mid-sentence. Give it
     # a window big enough to hold the full prompt AND max_tokens of new output.
-    r = ollama.chat(
+    # The shared client carries the LOCAL (120s) read budget — a local 3B is slow,
+    # not hung, and this is the ONLY book a secret turn is allowed to use.
+    r = ollama_client().chat(
         model=_MODELS["ollama"], messages=[{"role": "user", "content": prompt}],
         options={"num_predict": max_tokens, "num_ctx": 8192})
     tokens = r.get("prompt_eval_count", 0) + r.get("eval_count", 0)

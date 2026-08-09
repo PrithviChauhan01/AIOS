@@ -6,6 +6,7 @@ from core.books import select_book, select_book_for_tier, select_fast_book, call
 from core.profile import get_relevant_facts
 from core.memory import save_message
 from core.extractor import extract_and_store
+from core.action_dispatch import get_cached_reply, record_reply
 
 # Her generation never needs raw horsepower the way research does — it needs to
 # reason and sound like herself. "good" keeps the free cloud books in play.
@@ -328,6 +329,11 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
                 "MATERIAL above is the ACTUAL result — confirm it in your voice, minimally "
                 "and truthfully, inventing nothing beyond it. Confirm ONLY what THIS "
                 "material states: never an earlier action's task, time or details. "
+                "ACTOR CHECK (get this right — it inverts easily): HE asked, YOU acted. "
+                "He did not remind/set/log/save/mark/clear anything — YOU did, for HIM. "
+                "Say it as 'I've set/logged/saved/cleared ... for you' — NEVER as 'you "
+                "reminded/asked/told me to ...' or any phrasing where Sir is the one who "
+                "performed the action on you. "
                 "IMPORTANT: if the material "
                 "says the action is STAGED / NOT yet sent (e.g. an email draft awaiting "
                 "confirmation), present it and ASK for confirmation — do NOT say it was "
@@ -337,9 +343,12 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
             task_block = (
                 "The action you attempted for Sir did NOT succeed — the RAW MATERIAL above "
                 "says ACTION NOT DONE. You MUST NOT claim it worked, sent, saved, or "
-                "completed. Do not use words like 'sent', 'done', or 'successfully'. State "
-                "plainly what actually happened and relay the exact ask / next step from the "
-                "material, in your voice."
+                "completed. Do not use words like 'sent', 'done', or 'successfully'. Do NOT "
+                "restate, paraphrase, or summarize his request back to him as if you're "
+                "acknowledging or handling it — that reads as agreement when nothing "
+                "happened. State plainly, in your voice, what actually happened (usually: "
+                "you can't do that) and relay the exact ask / next step from the material — "
+                "nothing more."
             )
     elif ctx.get("deliverable") and _is_list_material(material):
         task_block = (
@@ -431,6 +440,24 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
               f"Dropped; no action is referenced in this reply.")
         ctx = {k: v for k, v in ctx.items() if k not in ("action_result", "action")}
         raw_material = None
+        action_result = None  # keep this var in sync — the replay check below must
+                               # not act on a result that was just dropped as stale
+
+    # ── IDEMPOTENT REPLAY ──
+    # action_dispatch already stopped the TOOL from writing twice (run_action's own
+    # cache — see core/action_dispatch.py). That alone still let a duplicate come back
+    # worded two different ways: cognition phrases a fresh confirmation from an LLM on
+    # every call, even when the underlying fact (the reused tool result) is identical.
+    # A guarded action_result carries "_idem_key" and, on a replay, "_idem_replay":
+    # True (both set by run_action). If a full reply was already recorded for that
+    # exact key, hand it back byte-for-byte — no material, no prompt, no book call,
+    # nothing persisted a second time for a request that never really happened twice.
+    if action_result is not None and action_result.get("_idem_replay") and action_result.get("_idem_key"):
+        cached_reply = get_cached_reply(action_result["_idem_key"])
+        if cached_reply is not None:
+            print(f"[cognition] idempotent replay {action_result['_idem_key'][:12]} — "
+                  "reusing the stored reply verbatim, no new book call")
+            return cached_reply
 
     material, is_ensemble = _format_material(raw_material)
 
@@ -532,9 +559,20 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
     await asyncio.to_thread(save_message, session_id, "assistant", response)
     await asyncio.to_thread(extract_and_store, message, response, route_tier)
 
-    return {
+    reply = {
         "response": response,
         "mood": mood,
         "provider_used": result["book_used"],
         "tokens": result["tokens"],
     }
+
+    # Record the FULL reply for a guarded (write) action, so a LATER duplicate of the
+    # exact same request — still inside the idempotency TTL — gets this exact text
+    # back instead of a fresh, possibly differently-worded paraphrase of the same
+    # fact. Only ever set on a genuinely FRESH execution (_idem_replay is False),
+    # never on a replay itself — replaying a replay would just re-store what's
+    # already there.
+    if action_result is not None and action_result.get("_idem_key") and not action_result.get("_idem_replay"):
+        record_reply(action_result["_idem_key"], reply)
+
+    return reply

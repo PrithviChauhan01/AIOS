@@ -52,6 +52,7 @@ import json
 import re
 
 from config import Config
+from core.net import CLOUD_TIMEOUT, with_retry
 
 # ── The dedicated brain model — Groq llama-3.3-70b-versatile. ──
 # On api.groq.com, keyed by GROQ_API_KEY. It reuses core.books' shared Groq client (the
@@ -66,14 +67,21 @@ _BRAIN_TIMEOUT_S = 8    # a slow brain must never hang a turn — timeout → st
 _BRAIN_MAX_TOKENS = 1200  # room for the composed prompt (~250 words) + the routing JSON
 
 
+@with_retry
 def _call_brain_sync(prompt: str) -> str:
     """Blocking Groq chat completion — run off-thread by _call_brain_model. Returns the
-    model's text content (the routing JSON)."""
+    model's text content (the routing JSON).
+
+    Retries only fit inside the _BRAIN_TIMEOUT_S budget when the first attempt fails
+    FAST (connection refused, an immediate 429/5xx) — which is exactly when a second
+    attempt is worth having. A slow attempt is cut off by the wait_for below and
+    plan() degrades to the keyword fallback, unchanged."""
     from core.books import groq_client
     r = groq_client().chat.completions.create(
         model=BRAIN_MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=_BRAIN_MAX_TOKENS,
+        timeout=CLOUD_TIMEOUT,
     )
     return r.choices[0].message.content or ""
 

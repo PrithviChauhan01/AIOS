@@ -6,6 +6,11 @@ cryptography==49.0.0
 chromadb==0.5.3
 requests==2.32.3
 pydantic==2.7.4
+# Imported directly by core/net.py for the provider timeout + retry policy. Both
+# already arrive as transitive deps of the SDKs, but this module depends on them
+# by name, so they are declared here rather than assumed.
+httpx
+tenacity
 groq
 cerebras-cloud-sdk
 dateparser

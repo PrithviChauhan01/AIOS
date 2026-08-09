@@ -22,6 +22,7 @@ import smtplib
 from email.message import EmailMessage
 
 from config import Config
+from core.net import CLOUD_TIMEOUT, with_retry
 from tools.base import Tool
 
 # session_id -> {"to", "to_name", "subject", "body"} pending an explicit confirm.
@@ -36,8 +37,17 @@ def _groq():
     global _client
     if _client is None:
         from groq import Groq
-        _client = Groq(api_key=Config.GROQ_API_KEY)
+        _client = Groq(api_key=Config.GROQ_API_KEY,
+                       timeout=CLOUD_TIMEOUT, max_retries=0)
     return _client
+
+
+# NOTE ON THE SEND ITSELF: _send_smtp is deliberately NOT retried. It already has a
+# 30s socket timeout (bounded), and a retry on an ambiguous SMTP failure is exactly
+# how one instruction becomes two delivered emails — the one outcome this tool's
+# whole confirm-gate exists to prevent. A failed send keeps the draft staged so Sir
+# decides whether to try again. Composition below is pure text generation, so it
+# retries like any other provider call.
 
 
 # ── Composition (her voice, via the cloud book) ──
@@ -62,21 +72,24 @@ def _parse_subject_body(text: str):
     return (subject, body) if subject and body else None
 
 
+@with_retry
+def _compose_call(messages: list):
+    return _groq().chat.completions.create(
+        model="llama-3.3-70b-versatile", messages=messages,
+        max_tokens=400, temperature=0.4, timeout=CLOUD_TIMEOUT)
+
+
 def _compose(recipient: str, topic: str, instruction: str):
     """Compose subject+body for a new email. Falls back to a minimal draft if the
     book is unavailable, so a compose hiccup never blocks the gate."""
     try:
-        r = _groq().chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": _COMPOSE_PROMPT},
-                {"role": "user", "content":
-                    f"Recipient: {recipient or 'the recipient'}\n"
-                    f"What to say / intent: {topic or instruction}\n"
-                    f"Full instruction from Sir: {instruction}"},
-            ],
-            max_tokens=400, temperature=0.4,
-        )
+        r = _compose_call([
+            {"role": "system", "content": _COMPOSE_PROMPT},
+            {"role": "user", "content":
+                f"Recipient: {recipient or 'the recipient'}\n"
+                f"What to say / intent: {topic or instruction}\n"
+                f"Full instruction from Sir: {instruction}"},
+        ])
         parsed = _parse_subject_body(r.choices[0].message.content)
         if parsed:
             return parsed
@@ -91,17 +104,13 @@ def _compose(recipient: str, topic: str, instruction: str):
 def _compose_revise(current: dict, instruction: str):
     """Recompose an existing draft per a change request. On failure, leaves it as-is."""
     try:
-        r = _groq().chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": _REVISE_PROMPT},
-                {"role": "user", "content":
-                    f"CURRENT SUBJECT: {current['subject']}\n"
-                    f"CURRENT BODY:\n{current['body']}\n\n"
-                    f"CHANGE REQUEST: {instruction}"},
-            ],
-            max_tokens=400, temperature=0.4,
-        )
+        r = _compose_call([
+            {"role": "system", "content": _REVISE_PROMPT},
+            {"role": "user", "content":
+                f"CURRENT SUBJECT: {current['subject']}\n"
+                f"CURRENT BODY:\n{current['body']}\n\n"
+                f"CHANGE REQUEST: {instruction}"},
+        ])
         parsed = _parse_subject_body(r.choices[0].message.content)
         if parsed:
             return parsed
@@ -232,6 +241,9 @@ class EmailTool(Tool):
 
     def has_pending(self, session_id):
         return has_pending(session_id)
+
+    def get_pending(self, session_id):
+        return get_pending(session_id)
 
     def confirm_send(self, session_id):
         return confirm_send(session_id)

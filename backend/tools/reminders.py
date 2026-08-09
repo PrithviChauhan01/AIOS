@@ -342,6 +342,26 @@ def delete_reminder(id: int) -> bool:
         conn.close()
 
 
+def clear_reminders(scope: str = "pending") -> dict:
+    """Bulk-delete reminders — "empty all the reminders" / "clear my reminders".
+
+    scope='pending' (default) removes only rows NOT yet done; scope='all' also
+    removes completed ones ("including completed"). Returns the REAL row count
+    deleted so the caller confirms an exact number, never a guessed "all of them"."""
+    conn = _conn()
+    try:
+        if scope == "all":
+            cur = conn.execute("DELETE FROM reminders")
+        else:
+            cur = conn.execute("DELETE FROM reminders WHERE done = 0")
+        conn.commit()
+        count = cur.rowcount
+        print(f"[reminder] CLEAR db={_db_path()} scope={scope} deleted={count}")
+    finally:
+        conn.close()
+    return {"ok": True, "deleted": count, "scope": scope}
+
+
 def cleanup_reminders() -> list:
     """One-off hygiene pass: delete rows that were never valid reminders — null/
     empty/malformed due_at, or empty/placeholder titles (the phantom row).
@@ -510,3 +530,6 @@ class RemindersTool(Tool):
 
     def delete(self, id: int) -> bool:
         return delete_reminder(id)
+
+    def clear(self, scope: str = "pending") -> dict:
+        return clear_reminders(scope)

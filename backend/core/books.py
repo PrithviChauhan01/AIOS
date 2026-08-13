@@ -9,6 +9,10 @@ from config import Config
 # the cooldown logic below depends on seeing).
 from core.net import (CLOUD_TIMEOUT, LONG_TIMEOUT, timeout_for, with_retry,
                       ollama_client)
+# Circuit breaker. Every _call_* below reports its outcome through net.with_retry's
+# choke point; selection here asks whether a provider is worth offering at all.
+from core import provider_health as health
+from core.provider_health import provider_of
 
 # ── Capability map — exact values from LLD §4 ──
 CAPABILITY_MAP = {
@@ -60,9 +64,53 @@ def _nemotron_cooling() -> bool:
     return _nemotron_cooldown_until > time.time()
 
 def _available(book: str) -> bool:
+    """SOFT bench — the rate-limit cooldown. Relaxable: when every book is cooling,
+    selection ignores it rather than answering nothing (see _pool)."""
     if book in _NEMOTRON_BOOKS and _nemotron_cooling():
         return False
     return _COOLDOWN.get(book, 0) < time.time()
+
+
+# ── Circuit gate ──
+# Two benches, deliberately different in kind:
+#
+#   _available  — the rate-limit cooldown. A guess that a provider WILL refuse us
+#                 shortly. Relaxed when everything is benched, because being wrong
+#                 costs one 429 and being right saves a turn.
+#   _closed     — the circuit breaker (core/provider_health.py). A MEASUREMENT that
+#                 a provider is failing right now — a bad key, an exhausted quota,
+#                 a dead endpoint. NEVER relaxed: relaxing it just spends the full
+#                 timeout budget to rediscover what we already know.
+#
+# So the fallback ladder is: usable → circuit-closed-only (cooldowns relaxed) →
+# the local book → nothing (the caller's loop finds no book and cognition returns
+# its existing degradation line). A turn never escalates past the local book.
+def _closed(book: str) -> bool:
+    return health.allow_book(book)
+
+
+def _usable(book: str) -> bool:
+    return _available(book) and _closed(book)
+
+
+def _local_fallback() -> list:
+    """Every cloud circuit is open → the local book, which is a TIGHTENING (local,
+    private) and never an escape. Empty when ollama's circuit is open too — there
+    is genuinely nowhere left to go, and the caller degrades gracefully."""
+    if _closed("ollama"):
+        print("[books] all cloud circuits open → falling back to ollama (local)")
+        return ["ollama"]
+    print("[books] all circuits open, ollama included → no book available")
+    return []
+
+
+def _pool(books) -> list:
+    """Apply both benches to a candidate list, relaxing ONLY the soft one."""
+    usable = [b for b in books if _usable(b)]
+    if usable:
+        return usable
+    # Everyone cooling — relax the cooldown (existing behaviour), never the circuit.
+    return [b for b in books if _closed(b)]
 
 def _is_rate_limit(err: Exception) -> bool:
     s = str(err).lower()
@@ -111,7 +159,11 @@ def select_book(capability_spec: dict, sensitivity_tier: str,
 
     complexity / loop_worthy steer the hard-reasoning preference (Nemotron). They may
     be passed explicitly or ride inside capability_spec — explicit args win."""
-    # secret → ollama only, hard filter, no exception (cooldown does not apply: nowhere else to go)
+    # secret → ollama only, hard filter, no exception. Neither bench applies: there is
+    # nowhere else to go BY DESIGN. If ollama's circuit is open the call is refused at
+    # the choke point and the turn FAILS to the degradation line — a secret turn never
+    # escapes to cloud because the local provider is unhealthy. Privacy sits above the
+    # circuit, always.
     if sensitivity_tier == "secret":
         return ["ollama"]
 
@@ -120,9 +172,12 @@ def select_book(capability_spec: dict, sensitivity_tier: str,
     if loop_worthy is None:
         loop_worthy = capability_spec.get("loop_worthy")
 
-    pool = [b for b in CAPABILITY_MAP if _available(b)]
-    if not pool:  # everyone benched — relax and let cooldowns sort themselves out
-        pool = list(CAPABILITY_MAP)
+    # Cooldowns relax when everything is benched; open circuits never do. ollama is
+    # in CAPABILITY_MAP, so an all-cloud-open pool naturally leaves the local book as
+    # the only candidate — the best-effort branch below then picks it.
+    pool = _pool(CAPABILITY_MAP)
+    if not pool:
+        return _local_fallback()
 
     candidates = [b for b in pool if _meets(b, capability_spec)]
     if candidates:
@@ -179,7 +234,8 @@ def select_book_for_tier(tier: str, sensitivity_tier: str,
     """Map a teacher's reasoning tier → ordered book list (best→worst), after applying
     the upgrade signal and the same availability/cooldown filter select_book uses.
     Privacy is absolute and overrides the tier entirely: secret → ollama only."""
-    # secret → ollama only, hard filter (privacy beats tier — identical to select_book)
+    # secret → ollama only, hard filter (privacy beats tier AND circuit — identical to
+    # select_book; an open local circuit fails the turn, it never widens it).
     if sensitivity_tier == "secret":
         return ["ollama"]
     eff = upgrade_tier(tier, complexity, loop_worthy)
@@ -188,8 +244,11 @@ def select_book_for_tier(tier: str, sensitivity_tier: str,
     # already drops the benched Nemotron books; this just surfaces it in the log.
     if _nemotron_cooling() and any(b in _NEMOTRON_BOOKS for b in order):
         print("[books] nemotron cooling → groq")
-    avail = [b for b in order if _available(b)]
-    return avail if avail else order  # all benched → keep order; cooldowns lapse on retry
+    avail = _pool(order)
+    # A tier list is cloud-only, so an empty one means every cloud circuit in this
+    # tier is open — that is exactly the fall-to-local case, not a reason to hand
+    # back dead candidates.
+    return avail if avail else _local_fallback()
 
 
 # ── Ensemble book pairing — two DIFFERENT books when the brain decides ensemble=true ──
@@ -197,12 +256,12 @@ def select_book_for_tier(tier: str, sensitivity_tier: str,
 # ensemble diversity — pairing them would be two calls to the same provider (and both
 # die together on a 429). Collapsing them lets the second slot fall to a genuinely
 # independent book (Groq), which is the whole point of running two passes.
+# provider_of draws exactly this partition ({groq, groq_fast} → one, {nemotron_super,
+# nemotron_ultra} → one, everything else its own) and is the same notion for the same
+# reason — one key, one endpoint, one quota, one failure. Sharing it keeps ensemble
+# diversity and circuit sharing from ever drifting apart.
 def _book_family(book: str) -> str:
-    if book in _NEMOTRON_BOOKS:
-        return "nemotron"
-    if book in ("groq", "groq_fast"):
-        return "groq"
-    return book
+    return provider_of(book)
 
 
 def select_ensemble_books(tier: str, sensitivity_tier: str,
@@ -241,7 +300,7 @@ def select_fast_book(sensitivity_tier: str) -> list:
     if sensitivity_tier == "secret":
         return ["ollama"]
     books = []
-    if _available("groq_fast"):
+    if _usable("groq_fast"):
         books.append("groq_fast")
     for b in select_book({"reasoning": "good"}, sensitivity_tier):
         if b not in books:
@@ -295,6 +354,61 @@ def nvidia_client():
                                     timeout=LONG_TIMEOUT, max_retries=0)
     return _clients["nvidia"]
 
+# ── Deterministic reachability probe (/health/deep) ──
+# Lists the provider's MODELS: a real HTTP round trip on the real key, no completion,
+# no tokens, no model asked to judge anything. Two deliberate properties:
+#
+#   READ-ONLY w.r.t. routing — a ping never reports to provider_health, so checking
+#   health can never open or close a circuit. A diagnostic that changes what it
+#   measures is worthless, and an operator refreshing a dashboard must not be able to
+#   bench a provider.
+#
+#   OPT-IN at the endpoint — these are real API calls against the same free tiers the
+#   assistant runs on. /health/deep answers from recorded call outcomes by default and
+#   only pings when explicitly asked to.
+_PING_CLIENTS = {
+    "groq": lambda: groq_client().models.list(),
+    "cerebras": lambda: _cerebras_client().models.list(),
+    "nvidia": lambda: nvidia_client().models.list(),
+    "openai": lambda: _openai_client().models.list(),
+    "mistral": lambda: _mistral_client().models.list(),
+    "ollama": lambda: ollama_client().list(),
+}
+
+# Which key each provider needs — reported so a "down" provider that simply has no
+# key configured reads as unconfigured rather than broken.
+_PROVIDER_KEY = {
+    "groq": lambda: Config.GROQ_API_KEY,
+    "cerebras": lambda: Config.CEREBRAS_API_KEY,
+    "nvidia": lambda: Config.NVIDIA_API_KEY,
+    "openai": lambda: os.getenv("OPENAI_API_KEY", ""),
+    "mistral": lambda: os.getenv("MISTRAL_API_KEY", ""),
+    "ollama": lambda: "local",  # no key — the daemon is either up or it isn't
+}
+
+
+def key_configured(provider: str) -> bool:
+    getter = _PROVIDER_KEY.get(provider)
+    return bool(getter and (getter() or "").strip())
+
+
+def ping_provider(provider: str) -> dict:
+    """BLOCKING reachability check for one provider (run it off the event loop).
+    Returns {ok, ms, error} — measured, never inferred."""
+    fn = _PING_CLIENTS.get(provider)
+    if fn is None:
+        return {"ok": False, "ms": None, "error": "no probe for this provider"}
+    if not key_configured(provider):
+        return {"ok": False, "ms": None, "error": "no key configured"}
+    t0 = time.monotonic()
+    try:
+        fn()
+        return {"ok": True, "ms": int((time.monotonic() - t0) * 1000), "error": None}
+    except Exception as e:
+        return {"ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                "error": f"{type(e).__name__}: {e}"[:200]}
+
+
 # ── Usage reporting ──
 # Every provider already returns a usage object on the SAME response; this just reads
 # it. Nothing here estimates or tokenizes — a provider that reports no prompt/
@@ -314,35 +428,35 @@ def _usage(u) -> tuple:
 # only) and passes an explicit per-call timeout sized to its output — a deliverable
 # asking for 4096 tokens legitimately needs longer than a 150-token confirmation.
 # A retry re-runs THIS function against THIS book, so it can never cross a tier.
-@with_retry
+@with_retry(provider="groq")
 def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return (r.choices[0].message.content, *_usage(r.usage))
 
-@with_retry
+@with_retry(provider="groq")
 def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return (r.choices[0].message.content, *_usage(r.usage))
 
-@with_retry
+@with_retry(provider="cerebras")
 def _call_cerebras(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _cerebras_client().chat.completions.create(
         model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return (r.choices[0].message.content, *_usage(r.usage))
 
-@with_retry
+@with_retry(provider="mistral")
 def _call_mistral(prompt: str, max_tokens: int = _MAX_TOKENS):
     # The Mistral SDK takes its timeout on the client (timeout_ms), not per call.
     r = _mistral_client().chat.complete(
         model=_MODELS["mistral"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
     return (r.choices[0].message.content, *_usage(r.usage))
 
-@with_retry
+@with_retry(provider="openai")
 def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _openai_client().chat.completions.create(
         model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}],
@@ -350,7 +464,7 @@ def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
     return (r.choices[0].message.content, *_usage(r.usage))
 
 # Nemotron Super — standard chat completion, no reasoning-budget params.
-@with_retry
+@with_retry(provider="nvidia")
 def _call_nemotron_super(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_super"], messages=[{"role": "user", "content": prompt}],
@@ -370,7 +484,7 @@ _ULTRA_REASONING_BUDGET = 16384
 _ULTRA_MIN_ANSWER_TOKENS = 512   # floor so a tiny caller cap can't starve the visible answer
 _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>\s*")
 
-@with_retry
+@with_retry(provider="nvidia")
 def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     # max_tokens is the FINAL-ANSWER budget; reasoning gets its own budget on top.
     answer_cap = max(max_tokens, _ULTRA_MIN_ANSWER_TOKENS)
@@ -393,7 +507,7 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     answer = _THINK_BLOCK_RE.sub("", answer).strip()
     return (answer, *_usage(r.usage))
 
-@with_retry
+@with_retry(provider="ollama")
 def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
     # num_predict caps the OUTPUT; num_ctx is the whole window (prompt + output).
     # The default num_ctx (2048) is smaller than a deliverable's prompt+material,
@@ -434,6 +548,11 @@ async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> di
             fn, prompt, max_tokens)
         return {"raw_text": raw_text, "book_used": book, "tokens": tokens,
                 "tokens_in": tokens_in, "tokens_out": tokens_out}
+    except health.CircuitOpen as e:
+        # Refused before the wire, not failed on it. Nothing to bench (the circuit
+        # IS the bench) and nothing to record — this call never happened.
+        print(f"[books] {book} skipped — {e}")
+        raise  # caller falls to the next candidate, exactly as for a failure
     except Exception as e:
         if _is_rate_limit(e):
             _COOLDOWN[book] = time.time() + _COOLDOWN_SECONDS

@@ -81,6 +81,9 @@ ALLOWED_META_KEYS = frozenset({
     "attempt", "attempts", "passed", "confidence",
     # cognition
     "gen_tier", "fast_lane", "lane", "local_only", "material_tier", "mood",
+    # provider health — WHY a book chain looked the way it did. Provider names and
+    # circuit states only ('groq:open'), never a key, an endpoint or an error body.
+    "circuits", "skipped",
 })
 
 # Trace-level summary columns a caller may set via Trace.set(). ts_end, total_ms,

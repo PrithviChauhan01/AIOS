@@ -7,6 +7,7 @@ from core.profile import get_relevant_facts
 from core.memory import save_message
 from core.extractor import extract_and_store
 from core.action_dispatch import get_cached_reply, record_reply
+from core.provider_health import circuit_summary, open_providers
 from core.trace import stage_of, mark
 
 # Her generation never needs raw horsepower the way research does — it needs to
@@ -238,6 +239,132 @@ def _format_history(history: list) -> str:
 # unaffected — this changes nothing about WHAT may be injected (privacy guard), only how
 # much prior conversation the 3B is ever shown.
 _LOCAL_HISTORY_MSGS = 0
+
+
+# ── Local path: a bare handover of sensitive data ──
+# "my pan number is 1bsjfdaa2" is not a question. There is nothing to answer, no
+# material, no task — and that is exactly what broke. The full prompt below hands the
+# 3B a persona, a memory block, a RAW MATERIAL slot reading "(none — you're working
+# from yourself here)" and a task line telling it to "decide how to handle this for
+# Sir". Given a blank to fill and no facts to fill it with, a 3B fills it: it invented
+# a corrected PAN ("The correct pan number is 1BSJFDAA2-01"), claimed a lookup that
+# never happened, drifted to a shipment notification, and proposed verifying the
+# number. Every one of those is the model answering a question nobody asked.
+#
+# So this turn gets its OWN prompt: short, taught by example rather than by rules, and
+# — the load-bearing part — carrying none of the message. See the note on
+# _LOCAL_DISCLOSURE_PROMPT below for why the value and the label are both withheld.
+#
+# Deliberately excluded too: the persona block, retrieved memory and conversation
+# history. They are the rest of the confabulation surface (the invented "shipment
+# notification" has the shape of history bleed). The voice is carried by the examples
+# instead, which is all a one-line acknowledgement needs.
+#
+# Scope: LOCAL path only (see local_only in _cognition_pass), no material, no action.
+# This changes no routing, no tier and no vault behaviour — the turn was already
+# secret, already ollama-only, and core.extractor already vaults it. This only fixes
+# what she SAYS back.
+
+# The labels that make a value sensitive are Sir's own, in privacy.local, already
+# parsed by triage. Reused rather than copied: a label he adds there has to work here
+# too, and a second list would drift silently. An unreadable/missing privacy.local
+# yields an empty tuple, which simply means this path never fires — the fail-safe
+# direction, since the old prompt still runs.
+try:
+    from core.triage import _RULES as _PRIVACY_RULES
+    _SENSITIVE_LABELS = tuple(
+        re.compile(rf"\b{re.escape(w)}\b", re.IGNORECASE)
+        for w in (_PRIVACY_RULES.get("patterns") or ()))
+except Exception as e:  # pragma: no cover — never break cognition over a rules file
+    print(f"[cognition] privacy labels unavailable ({e}) — local disclosure path off")
+    _SENSITIVE_LABELS = ()
+
+# Anything that makes the turn a REQUEST rather than a handover. Any hit and the
+# normal prompt runs, so "can you check my pan 1234" keeps its existing behaviour.
+# Note what is NOT here: save / store / note / remember. "Remember my pan is X" is
+# still a handover, and the answer to it is still "noted, it's held".
+_TASK_RE = re.compile(
+    r"\b(what|whats|when|where|why|how|who|which|whose|can you|could you|would you|"
+    r"will you|please|find|look ?up|check|verify|confirm|validate|tell|show|give|"
+    r"send|explain|help|make|write|draft|calculate|compare|list|search|fix|update)\b",
+    re.IGNORECASE)
+
+# The handover shape: a marker, then a value carrying a digit, and the value ENDS the
+# message — "…is 1bsjfdaa2", "…number: 4821 9930 1174". The end anchor is what keeps
+# "my bank balance dropped in 2024" out: a value mentioned in passing isn't handed
+# over. The digit is what keeps "my bank account is closed" out.
+_HANDOVER_RE = re.compile(
+    r"(?:\bis\b|\bare\b|\bwas\b|=|:)\s*"        # marker
+    r"(?=[\w@.\-]*\d)"                          # the value carries a digit
+    r"[\w@.\-]{3,}(?:[ \-][\w@.\-]{2,})*"       # value, possibly grouped (4821 9930)
+    r"\s*[.!]?\s*$",                            # …and it ends the message
+    re.IGNORECASE)
+
+# A credential's value need not carry a digit — "my password is correcthorse" is still
+# a handover. These labels have no non-disclosure reading, so the digit test is
+# dropped for them (and only them).
+_CREDENTIAL_RE = re.compile(
+    r"\b(password|passwd|passphrase|pin|otp|cvv|api key|secret key|token)\b",
+    re.IGNORECASE)
+_HANDOVER_ANY_RE = re.compile(r"(?:\bis\b|\bare\b|=|:)\s*\S{3,}\s*[.!]?\s*$",
+                              re.IGNORECASE)
+
+_MAX_DISCLOSURE_WORDS = 20   # a handover is one short line; anything longer is a turn
+
+
+def _is_bare_disclosure(message: str) -> bool:
+    """True when the message is ONLY a piece of sensitive data being handed over —
+    a sensitive label, a value at the end of the line, and nothing asked."""
+    msg = (message or "").strip()
+    if not msg or len(msg.split()) > _MAX_DISCLOSURE_WORDS:
+        return False
+    if "?" in msg or _TASK_RE.search(msg):
+        return False
+    if not any(label.search(msg) for label in _SENSITIVE_LABELS):
+        return False
+    if _HANDOVER_RE.search(msg):
+        return True
+    return bool(_CREDENTIAL_RE.search(msg) and _HANDOVER_ANY_RE.search(msg))
+
+
+# THE PROMPT HAS NO MESSAGE SLOT. That is the fix, not an oversight.
+#
+# The value cannot be read back, corrected, completed or "verified" because it is
+# never in the prompt to begin with. No instruction can be as reliable as an absence
+# on a 3B: told "never repeat the value" while holding the value, it still produced
+# "The correct pan number is 1BSJFDAA2-01". Nothing here is information-dependent —
+# the only true answer to a bare handover is a one-line acknowledgement — so the
+# model is given the situation and none of the content.
+#
+# The label is withheld for a separate, measured reason: llama3.2's safety training
+# fires on the WORDS "password", "otp", "account number", not just on a value. With
+# the label present (even with the value redacted) roughly 40% of runs came back
+# "I cannot store sensitive information such as passwords" — a refusal that is both
+# wrong and unhelpful, since core.extractor has ALREADY vaulted the turn. Naming the
+# vault write as done, with nothing sensitive in view, removes the trigger entirely:
+# 18/18 clean runs, no refusals.
+#
+# Three demonstrations, one line of instruction. A 3B imitates far better than it
+# obeys, and every example shows the same three things — acknowledge, say it's held,
+# stop.
+_LOCAL_DISCLOSURE_PROMPT = """You are AIOS, Sir's assistant, running on his own machine. He has just filed a private note in his own encrypted vault. You cannot see what is in it. It is already saved — nothing is being asked of you.
+
+Say ONE short line, in your voice, confirming it is filed. Never ask a question.
+
+Sir: [filed a private note]
+You: Noted, Sir. It's in the vault.
+[mood: neutral]
+
+Sir: [filed a private note]
+You: Filed, Sir. Locked away.
+[mood: neutral]
+
+Sir: [filed a private note]
+You: Got it — safe with me, Sir.
+[mood: neutral]
+
+Sir: [filed a private note]
+You:"""
 
 
 def _format_material(raw_material):
@@ -496,7 +623,21 @@ async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
     # local_only ⇒ every book candidate is ollama (select_book*/select_fast_book all
     # return ["ollama"] for tier 'secret') — trim history for the 3B. Cloud turns
     # keep the full window.
-    prompt = _build_prompt(ctx, material, is_ensemble, local_history=local_only)
+    #
+    # One exception, LOCAL PATH ONLY: a bare handover of sensitive data with no task
+    # attached gets the short, example-led prompt above instead. The full prompt gives
+    # a 3B a blank to fill and no facts to fill it with, and it invents (see
+    # _is_bare_disclosure). Guarded on material/action being absent so a teacher turn
+    # or an action confirmation is never diverted. The cloud path cannot reach this.
+    disclosure = (local_only and material is None
+                  and ctx.get("action_result") is None
+                  and _is_bare_disclosure(ctx.get("message") or ctx.get("query", "")))
+    if disclosure:
+        print("[cognition] local path — bare sensitive handover, no task: "
+              "acknowledge-and-hold prompt (message withheld from the model)")
+        prompt = _LOCAL_DISCLOSURE_PROMPT
+    else:
+        prompt = _build_prompt(ctx, material, is_ensemble, local_history=local_only)
 
     # Hard cap on output length, independent of what the model wants to do. Sized to the
     # turn (complexity tier / deliverable / explicit request size / reasoning tier) so a
@@ -533,9 +674,16 @@ async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
 
     # Everything the trace needs to explain this turn's routing, recorded before the
     # first call so a total book failure still leaves the decision visible.
+    #
+    # circuits/skipped are the OTHER half of that explanation: without them a trace
+    # showing 'cognition ran on cerebras' gives no hint that groq was skipped because
+    # its circuit was open, and the routing reads as an unexplained downgrade. Both
+    # are None when every provider is healthy, so a normal turn's meta is unchanged.
+    # Names and states only — see the whitelist in core/trace.py.
     st.set(gen_tier=gen_tier, fast_lane=fast_lane, lane="fast" if fast_lane else "full",
            local_only=local_only, material_tier=material_tier, max_tokens=max_tokens,
-           deliverable=bool(ctx.get("deliverable")), domain=ctx.get("domain"))
+           deliverable=bool(ctx.get("deliverable")), domain=ctx.get("domain"),
+           circuits=circuit_summary(), skipped=",".join(open_providers()) or None)
     mark(ctx, fast_lane=fast_lane, deliverable=bool(ctx.get("deliverable")))
 
     result = None

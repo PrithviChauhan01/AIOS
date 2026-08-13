@@ -51,11 +51,13 @@ You are present. You are his. You are the best there is at this — and you know
 
 # Bounded + retried by the shared policy (core/net.py); max_retries=0 leaves tenacity
 # as the only retry authority. The provider loop in chat() below is unchanged — it
-# still falls to the next provider once these have exhausted their attempts.
+# still falls to the next provider once these have exhausted their attempts, and a
+# provider whose circuit is open is refused instantly instead of dialled, so a dead
+# key costs one loop iteration rather than a full timeout budget.
 groq_client = Groq(api_key=Config.GROQ_API_KEY, timeout=CLOUD_TIMEOUT, max_retries=0)
 cerebras_client = Cerebras(api_key=Config.CEREBRAS_API_KEY, timeout=CLOUD_TIMEOUT, max_retries=0)
 
-@with_retry
+@with_retry(provider="groq")
 def _try_groq(messages):
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -64,7 +66,7 @@ def _try_groq(messages):
     )
     return response.choices[0].message.content, response.usage.total_tokens, "groq"
 
-@with_retry
+@with_retry(provider="cerebras")
 def _try_cerebras(messages):
     response = cerebras_client.chat.completions.create(
         model="gpt-oss-120b",

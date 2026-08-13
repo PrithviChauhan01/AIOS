@@ -20,19 +20,33 @@ triage, action extraction, email composition, STT):
   returned on the first attempt — retrying a rejected request just doubles the
   latency before the same answer.
 
+  HEALTH — a call decorated `@with_retry(provider="groq")` reports its outcome
+  (ok/fail, wall-clock latency, HTTP status) to core/provider_health.py, and is
+  refused outright when that provider's circuit is open. This is the SINGLE choke
+  point for both: every provider call in the system is already wrapped by this
+  decorator, so naming the provider is the whole wiring — no timing, counting or
+  circuit logic is scattered across call sites.
+
 Two invariants worth stating explicitly:
 
   PRIVACY — a retry re-invokes the SAME function against the SAME book. It never
   selects a different provider, so it cannot move a turn onto a tier the router
   didn't choose: a secret/private turn retries ollama→ollama, never ollama→cloud.
-  Book selection stays entirely in core/books.py.
+  Book selection stays entirely in core/books.py. The health gate here is the same
+  shape: it can only ever REFUSE a call, never redirect one.
 
   FALLBACK — `reraise=True` means the caller sees the ORIGINAL provider
   exception after the last attempt, not a tenacity wrapper. Every existing
   handler (call_book's rate-limit cooldown, the next-book loop in cognition, the
   fail-soft try/excepts in triage/extractor) keeps working untouched; retry is
-  invisible to them apart from happening later.
+  invisible to them apart from happening later. A refused call raises
+  provider_health.CircuitOpen, which those same handlers treat as any other
+  provider failure — fall to the next candidate.
 """
+
+import functools
+import re
+import time
 
 import httpx
 from tenacity import (
@@ -41,6 +55,8 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential_jitter,
 )
+
+from core import provider_health as health
 
 CONNECT_S = 5.0
 READ_S = 30.0
@@ -91,6 +107,34 @@ def _status_of(exc: BaseException) -> int | None:
     return code if isinstance(code, int) else None
 
 
+# Statuses that several SDKs only ever admit to in the message text — a Cerebras or
+# ollama error can carry no status attribute at all while plainly saying "rate limit
+# reached". The circuit breaker keys its two immediate-open rules on 429/401/403, so
+# it has to see those however they arrived. Word-bounded on the numerics so a model
+# id or a token count can't be read as a status.
+_RATE_LIMIT_RE = re.compile(
+    r"\b429\b|rate[ _-]?limit|too many requests|quota", re.IGNORECASE)
+_AUTH_RE = re.compile(
+    r"\b401\b|\b403\b|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|"
+    r"authentication", re.IGNORECASE)
+
+
+def status_of(exc: BaseException) -> int | None:
+    """The status a failure REPRESENTS: the SDK's own field where there is one, and
+    the status the message admits to where there isn't. Used by the health choke
+    point below — `_status_of` stays the strict, structural reading that retry
+    decisions are made on."""
+    status = _status_of(exc)
+    if status is not None:
+        return status
+    text = str(exc)
+    if _RATE_LIMIT_RE.search(text):
+        return 429
+    if _AUTH_RE.search(text):
+        return 401
+    return None
+
+
 def is_retryable(exc: BaseException) -> bool:
     """True only for failures a second attempt could plausibly fix.
 
@@ -98,6 +142,11 @@ def is_retryable(exc: BaseException) -> bool:
     importing groq/openai/cerebras error classes, so core/books.py can keep
     importing those SDKs lazily and a provider that isn't installed never breaks
     this module."""
+    # A refused call never happened. There is nothing to retry, and retrying would
+    # burn the half-open probe budget on a provider we just declined to dial.
+    if isinstance(exc, health.CircuitOpen):
+        return False
+
     if isinstance(exc, _TRANSPORT_ERRORS):
         return True
 
@@ -123,10 +172,7 @@ def _log_retry(state) -> None:
           f"({type(exc).__name__}: {exc}) — retrying")
 
 
-def with_retry(fn):
-    """Wrap a BLOCKING provider call with the shared retry policy. Sync on purpose:
-    every provider call in this codebase runs inside asyncio.to_thread, so the
-    backoff sleeps on the worker thread and never blocks the event loop."""
+def _retried(fn):
     return retry(
         stop=stop_after_attempt(MAX_ATTEMPTS),
         wait=wait_exponential_jitter(initial=0.5, max=4.0, jitter=0.5),
@@ -134,6 +180,72 @@ def with_retry(fn):
         before_sleep=_log_retry,
         reraise=True,  # callers keep seeing the provider's own exception
     )(fn)
+
+
+def _recorded(fn, provider: str):
+    """Report ONE attempt — wall-clock latency and its outcome. Inside the retry
+    wrapper on purpose: each attempt is a real dial, so three failing attempts are
+    three failures and trip the breaker as promptly as three failing calls would."""
+
+    @functools.wraps(fn)
+    def attempt(*args, **kwargs):
+        t0 = time.monotonic()
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as e:
+            health.record_fail(provider, int((time.monotonic() - t0) * 1000),
+                               status_of(e))
+            raise
+        health.record_ok(provider, int((time.monotonic() - t0) * 1000))
+        return result
+
+    return attempt
+
+
+def _gated(attempt, retried, provider: str):
+    """Check the circuit ONCE per logical call, OUTSIDE the retry wrapper.
+
+    Outside matters. With the check inside, a 429 on attempt 1 would trip the
+    breaker and attempt 2 would then raise CircuitOpen — the caller would see the
+    breaker's exception instead of the provider's 429, and every handler that reads
+    the original error (call_book's rate-limit cooldown, and the Nemotron 5-minute
+    bench in particular) would quietly stop firing. The FALLBACK invariant in this
+    module's docstring is load-bearing: a caller always sees the provider's own
+    exception.
+
+    A HALF-OPEN probe runs the UNRETRIED attempt — 'exactly one probe call' means
+    exactly one dial, not one call that may quietly dial twice."""
+
+    @functools.wraps(attempt)
+    def call(*args, **kwargs):
+        claim = health.begin_call(provider)
+        if not claim:
+            # Refused, not failed: nothing is recorded, because nothing happened.
+            raise health.CircuitOpen(provider, health.circuit_of(provider))
+        target = attempt if claim == health.PROBE else retried
+        return target(*args, **kwargs)
+
+    return call
+
+
+def with_retry(fn=None, *, provider: str | None = None):
+    """Wrap a BLOCKING provider call with the shared retry policy. Sync on purpose:
+    every provider call in this codebase runs inside asyncio.to_thread, so the
+    backoff sleeps on the worker thread and never blocks the event loop.
+
+    Usable bare (`@with_retry`) or with a provider (`@with_retry(provider="groq")`).
+    Naming the provider — the KEY/ENDPOINT, not the book; see
+    provider_health.provider_of — is the entire wiring for health tracking and the
+    circuit breaker. Without it the call is bounded and retried exactly as before
+    and reports nothing, so an auxiliary call site can opt in later by adding one
+    keyword and nothing else."""
+    def decorate(f):
+        if not provider:
+            return _retried(f)
+        attempt = _recorded(f, provider)
+        return _gated(attempt, _retried(attempt), provider)
+
+    return decorate(fn) if fn is not None else decorate
 
 
 # ── Local model (ollama) ──
@@ -151,7 +263,7 @@ def ollama_client():
     return _ollama_client
 
 
-@with_retry
+@with_retry(provider="ollama")
 def ollama_chat(model: str, messages: list, options: dict = None, **kwargs):
     """Bounded, retried replacement for ollama.chat(). Same arguments, same return
     value — callers keep their existing fail-safe try/except around it."""

@@ -67,7 +67,10 @@ _BRAIN_TIMEOUT_S = 8    # a slow brain must never hang a turn — timeout → st
 _BRAIN_MAX_TOKENS = 1200  # room for the composed prompt (~250 words) + the routing JSON
 
 
-@with_retry
+# provider="groq": the brain shares Groq's key, pool and quota with the Groq answer
+# book, so it shares its circuit too — a brain 429 is the answer book's 429. plan()
+# turns a refused call into the keyword fallback like any other failure.
+@with_retry(provider="groq")
 def _call_brain_sync(prompt: str) -> str:
     """Blocking Groq chat completion — run off-thread by _call_brain_model. Returns the
     model's text content (the routing JSON).

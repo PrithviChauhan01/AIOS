@@ -9,6 +9,7 @@ from api.health_routes import router as health_router
 from api.chat_routes import router as chat_router
 from api.dashboard_routes import router as dashboard_router
 from api.conversations_routes import router as conversations_router
+from api.trace_routes import router as trace_router
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
 from core.auth import generate_token
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(dashboard_router)
     app.include_router(conversations_router)
+    app.include_router(trace_router)
 
     @app.get("/token")
     async def token():

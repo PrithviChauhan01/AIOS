@@ -1,4 +1,5 @@
-from core.books import select_book_for_tier, call_book
+from core.books import select_book_for_tier, call_book, model_for
+from core.trace import stage_of, mark
 
 # Hard cap — every iteration is +1 book call. Cost-bounded by design.
 MAX_ITERATIONS = 2
@@ -32,6 +33,7 @@ async def run_looper(ctx: dict, teacher, book_output: str) -> dict:
 
     # Original book call already happened — that's attempt 1.
     if check["passes"]:
+        mark(ctx, loop_attempts=1)
         return {
             "refined_material": book_output,
             "confidence": "high",
@@ -55,15 +57,26 @@ async def run_looper(ctx: dict, teacher, book_output: str) -> dict:
         book = candidates[idx] if candidates else book_used
 
         attempts += 1
-        try:
-            result = await call_book(_correction_prompt(base_prompt, check["feedback"]), book)
-        except Exception:
-            continue  # call_book logged / benched it; spend the next iteration elsewhere
+        # One `looper:<n>` span per refinement iteration, with the retry's book call
+        # nested inside it as a `book` stage (tokens live only on `book` stages, so the
+        # trace-level totals never double count).
+        with stage_of(ctx, f"looper:{attempts}", attempt=attempts, book=book) as lst:
+            try:
+                with stage_of(ctx, "book", book=book, model=model_for(book)) as bst:
+                    result = await call_book(
+                        _correction_prompt(base_prompt, check["feedback"]), book)
+                    bst.set(tokens_in=result.get("tokens_in"),
+                            tokens_out=result.get("tokens_out"))
+            except Exception:
+                continue  # call_book logged / benched it; spend the next iteration elsewhere
 
-        best_material = result["raw_text"]
-        book_used = result["book_used"]
-        check = teacher.self_check(best_material, ctx)
+            best_material = result["raw_text"]
+            book_used = result["book_used"]
+            check = teacher.self_check(best_material, ctx)
+            lst.set(book=book_used, passed=bool(check["passes"]))
+
         if check["passes"]:
+            mark(ctx, loop_attempts=attempts)
             return {
                 "refined_material": best_material,
                 "confidence": "high",
@@ -72,6 +85,7 @@ async def run_looper(ctx: dict, teacher, book_output: str) -> dict:
             }
 
     # Still failing after the cap — hand back the best we got, flagged low.
+    mark(ctx, loop_attempts=attempts)
     return {
         "refined_material": best_material,
         "confidence": "low",

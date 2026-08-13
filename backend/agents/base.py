@@ -2,8 +2,9 @@ import asyncio
 from abc import ABC, abstractmethod
 from db.chroma_init import get_chroma_client
 from core.books import (
-    select_book_for_tier, select_ensemble_books, upgrade_tier, call_book,
+    select_book_for_tier, select_ensemble_books, upgrade_tier, call_book, model_for,
 )
+from core.trace import stage_of
 from tools.registry import fetch_from, format_pool_block
 
 _BRAIN_TIERS = ("fast", "strong", "frontier")
@@ -100,6 +101,9 @@ class Teacher(ABC):
         # the structural backstop, not the only line.
         wanted = [t for t in brain.get("tools", []) if t not in self.owns_tools]
         if wanted and sensitivity == "public":
+            # fetch_from records the tools it actually invoked against the ambient
+            # trace — `wanted` is only the request, so recording it here would claim
+            # a tool ran when an unknown name was dropped.
             fetched = await fetch_from(wanted, query)
             counts = ", ".join(f"{k}({len(v)})" for k, v in fetched.items())
             print(f"[{self.domain}] pool tools fired: {counts}")
@@ -138,6 +142,16 @@ class Teacher(ABC):
                                      complexity=complexity, loop_worthy=loop_worthy)
         return await self._single_pass(prompt, books, ctx, eff_tier)
 
+    async def _traced_book(self, prompt: str, book: str, ctx: dict):
+        """call_book under a `book` trace stage — the ONLY place a teacher's token
+        counts are recorded, and they are the provider's own reported numbers. The
+        exception path is unchanged: a failure is recorded on the stage and re-raised
+        for the caller's existing fallback loop to handle."""
+        with stage_of(ctx, "book", book=book, model=model_for(book)) as st:
+            result = await call_book(prompt, book)
+            st.set(tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
+            return result
+
     async def _ensemble_pass(self, prompt: str, books: list, ctx: dict, eff_tier: str):
         """Fire the two chosen books at once (asyncio.gather) — two independent research
         passes on the SAME prompt. Returns a result dict carrying an `ensemble` list of the
@@ -145,7 +159,7 @@ class Teacher(ABC):
         then falls back to a single pass). Never re-asks a book here — the two-pass spread
         IS the quality strategy; the single-book looper is bypassed for ensemble turns."""
         results = await asyncio.gather(
-            *(call_book(prompt, b) for b in books), return_exceptions=True)
+            *(self._traced_book(prompt, b, ctx) for b in books), return_exceptions=True)
         passes = [r for r in results if isinstance(r, dict)]
         if not passes:
             return None  # both failed — let the caller try the single-pass fallback
@@ -180,7 +194,7 @@ class Teacher(ABC):
         last = None
         for book in books:
             try:
-                result = await call_book(prompt, book)
+                result = await self._traced_book(prompt, book, ctx)
             except Exception:
                 continue  # call_book already logged / benched; fall to next candidate
             # Per-turn routing visibility: tier the teacher asked for, book that served it.

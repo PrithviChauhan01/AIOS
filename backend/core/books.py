@@ -295,6 +295,17 @@ def nvidia_client():
                                     timeout=LONG_TIMEOUT, max_retries=0)
     return _clients["nvidia"]
 
+# ── Usage reporting ──
+# Every provider already returns a usage object on the SAME response; this just reads
+# it. Nothing here estimates or tokenizes — a provider that reports no prompt/
+# completion split yields None for that half and the trace column stays NULL.
+def _usage(u) -> tuple:
+    """(total, prompt, completion) exactly as the provider reported them."""
+    return (getattr(u, "total_tokens", None) or 0,
+            getattr(u, "prompt_tokens", None),
+            getattr(u, "completion_tokens", None))
+
+
 # ── Per-book synchronous calls (run off-thread by call_book) ──
 # max_tokens is per-call: cognition hard-caps length (trivial ~60, deliverable
 # ~900). Defaults to _MAX_TOKENS for callers that don't care (e.g. teachers).
@@ -308,35 +319,35 @@ def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 @with_retry
 def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 @with_retry
 def _call_cerebras(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _cerebras_client().chat.completions.create(
         model=_MODELS["cerebras"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 @with_retry
 def _call_mistral(prompt: str, max_tokens: int = _MAX_TOKENS):
     # The Mistral SDK takes its timeout on the client (timeout_ms), not per call.
     r = _mistral_client().chat.complete(
         model=_MODELS["mistral"], messages=[{"role": "user", "content": prompt}], max_tokens=max_tokens)
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 @with_retry
 def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = _openai_client().chat.completions.create(
         model=_MODELS["gpt4o"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 # Nemotron Super — standard chat completion, no reasoning-budget params.
 @with_retry
@@ -344,7 +355,7 @@ def _call_nemotron_super(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_super"], messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, timeout=LONG_TIMEOUT)
-    return r.choices[0].message.content, r.usage.total_tokens
+    return (r.choices[0].message.content, *_usage(r.usage))
 
 # Nemotron Ultra — a REASONING model. It thinks in message.reasoning_content and
 # answers in message.content. We:
@@ -380,7 +391,7 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
     # Defensive: if a <think>…</think> block ever leaks into content, strip it so the
     # reply can never carry the thinking trace.
     answer = _THINK_BLOCK_RE.sub("", answer).strip()
-    return answer, r.usage.total_tokens
+    return (answer, *_usage(r.usage))
 
 @with_retry
 def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
@@ -393,8 +404,12 @@ def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = ollama_client().chat(
         model=_MODELS["ollama"], messages=[{"role": "user", "content": prompt}],
         options={"num_predict": max_tokens, "num_ctx": 8192})
-    tokens = r.get("prompt_eval_count", 0) + r.get("eval_count", 0)
-    return r["message"]["content"], tokens
+    # ollama names the same two numbers differently — prompt_eval_count is the input
+    # side, eval_count the generated side.
+    prompt_tokens = r.get("prompt_eval_count")
+    completion_tokens = r.get("eval_count")
+    tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+    return r["message"]["content"], tokens, prompt_tokens, completion_tokens
 
 _DISPATCH = {
     "groq": _call_groq,
@@ -413,8 +428,12 @@ async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> di
     if fn is None:
         raise ValueError(f"unknown book: {book}")
     try:
-        raw_text, tokens = await asyncio.to_thread(fn, prompt, max_tokens)
-        return {"raw_text": raw_text, "book_used": book, "tokens": tokens}
+        # tokens is the total (unchanged); tokens_in/tokens_out are the provider's own
+        # prompt/completion split, or None where a provider doesn't report one.
+        raw_text, tokens, tokens_in, tokens_out = await asyncio.to_thread(
+            fn, prompt, max_tokens)
+        return {"raw_text": raw_text, "book_used": book, "tokens": tokens,
+                "tokens_in": tokens_in, "tokens_out": tokens_out}
     except Exception as e:
         if _is_rate_limit(e):
             _COOLDOWN[book] = time.time() + _COOLDOWN_SECONDS

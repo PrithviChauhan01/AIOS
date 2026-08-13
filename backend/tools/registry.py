@@ -1,5 +1,6 @@
 import asyncio
 
+from core.trace import record_tool
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
 from tools.search import SearchTool
@@ -66,6 +67,9 @@ async def fetch_from(names: list, query: str) -> dict:
     """Run the named tools concurrently against one query. Returns {tool: results}.
     Unknown or failed tools contribute an empty list — never raises."""
     tools = [t for t in (get_tool(n) for n in names) if t is not None]
+    # Names only, recorded because they were INVOKED — whether they return rows or
+    # not is a separate question, and neither the query nor the results are traced.
+    record_tool(*(t.name for t in tools))
     fetched = await asyncio.gather(
         *(t.fetch(query) for t in tools), return_exceptions=True)
 

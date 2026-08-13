@@ -7,6 +7,7 @@ from core.profile import get_relevant_facts
 from core.memory import save_message
 from core.extractor import extract_and_store
 from core.action_dispatch import get_cached_reply, record_reply
+from core.trace import stage_of, mark
 
 # Her generation never needs raw horsepower the way research does — it needs to
 # reason and sound like herself. "good" keeps the free cloud books in play.
@@ -425,6 +426,17 @@ Reply with ONLY the words you say to Sir, then the single mood tag the system as
 
 
 async def cognition_pass(ctx: dict, raw_material=None) -> dict:
+    """THE mind — traced. The `cognition` span covers the whole pass (including the
+    persist + extract tail); the individual book attempts inside it record themselves
+    as nested `book` stages. Observation only: the reply is passed through untouched,
+    and stage_of is inert when ctx carries no trace."""
+    with stage_of(ctx, "cognition") as st:
+        reply = await _cognition_pass(ctx, raw_material, st)
+        st.set(book=reply.get("provider_used"), mood=reply.get("mood"))
+        return reply
+
+
+async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
     """THE mind. Reasons over the teacher's raw material and speaks HER response
     in HER voice. The raw material is input to her thinking, never her answer."""
     # ── STALE ACTION GUARD ──
@@ -457,6 +469,8 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
         if cached_reply is not None:
             print(f"[cognition] idempotent replay {action_result['_idem_key'][:12]} — "
                   "reusing the stored reply verbatim, no new book call")
+            st.set(idem_replay=True)
+            mark(ctx, idempotency_hit=True)
             return cached_reply
 
     material, is_ensemble = _format_material(raw_material)
@@ -517,10 +531,21 @@ async def cognition_pass(ctx: dict, raw_material=None) -> dict:
         books = select_book(_GEN_SPEC, route_tier,
                             complexity=ctx.get("complexity"), loop_worthy=ctx.get("loop_worthy"))
 
+    # Everything the trace needs to explain this turn's routing, recorded before the
+    # first call so a total book failure still leaves the decision visible.
+    st.set(gen_tier=gen_tier, fast_lane=fast_lane, lane="fast" if fast_lane else "full",
+           local_only=local_only, material_tier=material_tier, max_tokens=max_tokens,
+           deliverable=bool(ctx.get("deliverable")), domain=ctx.get("domain"))
+    mark(ctx, fast_lane=fast_lane, deliverable=bool(ctx.get("deliverable")))
+
     result = None
     for book in books:
         try:
-            result = await call_book(prompt, book, max_tokens=max_tokens)
+            with stage_of(ctx, "book", book=book, model=model_for(book),
+                          max_tokens=max_tokens) as bst:
+                result = await call_book(prompt, book, max_tokens=max_tokens)
+                bst.set(tokens_in=result.get("tokens_in"),
+                        tokens_out=result.get("tokens_out"))
             break
         except Exception:
             continue  # call_book logged / benched it; fall to next candidate

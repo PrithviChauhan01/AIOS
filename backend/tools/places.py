@@ -19,6 +19,7 @@ Two layers, same shape as the rest of the pool:
 import httpx
 
 from config import Config
+from core.trace import record_tool
 from tools.base import Tool
 
 _SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
@@ -50,6 +51,10 @@ async def search_places(query: str, region: str | None = None,
 
     Fail-soft by contract: a missing GOOGLE_PLACES_API_KEY, zero results, or any
     HTTP/parse error all return [] — this function never raises into cognition."""
+    # Recorded HERE, not at the registry: leadgen declares places in owns_tools and
+    # calls this structured layer directly, so the registry never sees its draw. Name
+    # only — the query and the returned rows never touch a trace.
+    record_tool("places")
     key = (Config.GOOGLE_PLACES_API_KEY or "").strip()
     if not key or not (query or "").strip():
         if not key:

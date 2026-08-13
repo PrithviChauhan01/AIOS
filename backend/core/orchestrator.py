@@ -1,12 +1,12 @@
 import asyncio
 import os
 import time
-import uuid
 
 from core.brain import plan
+from core.trace import Trace, stage_of as trace_stage, activate as trace_active
 from core.outcomes import log_outcome
 from core.triage import triage
-from tools.registry import fetch_from, format_pool_block
+from tools.registry import fetch_from, format_pool_block, get_tool
 from core.secret_mode import detect_toggle, is_secret_mode, set_secret_mode
 from core.memory import get_history, save_message
 from core.cognition import cognition_pass
@@ -115,7 +115,13 @@ async def _run_fanout_teacher(domain: str, base_ctx: dict, trace_id: str) -> dic
 
     t0 = time.monotonic()
     try:
-        teach = await teacher.run(domain_ctx)
+        # Same `teacher:<domain>` span the single-domain path opens — the fan-out just
+        # opens several concurrently, which the flat seq-ordered stage buffer handles.
+        with trace_stage(base_ctx, f"teacher:{domain}", tier=sub_brain["book_tier"],
+                         ensemble=bool(sub_brain["ensemble"])) as st:
+            teach = await teacher.run(domain_ctx)
+            st.set(book=teach.get("book_used"), deliverable=bool(teach.get("deliverable")),
+                   self_check_passed=bool(teach.get("self_check", {}).get("passes")))
     except Exception as e:
         _log(trace_id, "fanout_teacher", f"domain={domain} FAILED: {e}")
         return {"domain": domain, "material": None, "deliverable": False}
@@ -160,18 +166,56 @@ async def _run_fanout_teacher(domain: str, base_ctx: dict, trace_id: str) -> dic
 
 
 async def handle_message(message: str, session_id: str = "default", voice_flag: bool = False) -> dict:
+    """The spine, plus the trace that records it.
+
+    The Trace is created HERE and flushed exactly ONCE, in the finally block, so every
+    return path below (control toggle, greeting, action, teacher, short-circuit) and
+    every failure writes exactly one trace. Its trace_id IS the `[orch:xxxxxxxx]` id
+    in the logs and the `trace_id` in the response — there is no second id anywhere.
+
+    The flush is off-thread and fail-soft: it cannot fail the request, and it cannot
+    hold the event loop while SQLite writes."""
+    trace = Trace(session_id)
+    try:
+        # activate() makes this the ambient trace for the request, so the tool layer
+        # can record what it fired without a ctx being threaded down to it — leadgen
+        # calls tools.places.search_places directly, bypassing the registry entirely.
+        with trace_active(trace):
+            result = await _handle_message(message, session_id, voice_flag, trace)
+        # The response is the honest record of where the turn LANDED — read the
+        # summary straight off it rather than guessing at each return site.
+        trace.set(domain=result.get("domain"), sensitivity=result.get("sensitivity"),
+                  final_book=result.get("provider_used"))
+        return result
+    except BaseException as e:
+        trace.set(error=e)
+        raise
+    finally:
+        try:
+            await asyncio.to_thread(trace.flush)
+        except Exception as e:  # flush swallows its own errors; this is the backstop
+            print(f"[trace] warning: flush dispatch failed ({e})")
+
+
+async def _handle_message(message: str, session_id: str, voice_flag: bool,
+                          trace: Trace) -> dict:
     """The spine. Wires triage → (teacher → looper) → cognition end to end.
     A trace_id flows through every stage for debuggability."""
-    trace_id = str(uuid.uuid4())
+    trace_id = trace.trace_id
 
     # ── [1] ENTRY — light: load history, build context. No reasoning here. ──
-    ctx = {
-        "message": message,
-        "session_id": session_id,
-        "history": get_history(session_id),
-        "trace_id": trace_id,
-        "voice": voice_flag,
-    }
+    with trace.stage("entry", msg_len=len(message or ""), voice=bool(voice_flag)) as st:
+        ctx = {
+            "message": message,
+            "session_id": session_id,
+            "history": get_history(session_id),
+            "trace_id": trace_id,
+            # The trace rides on ctx so every downstream stage instruments ITSELF
+            # (see core.trace.stage_of). Nothing reads it to make a decision.
+            "trace": trace,
+            "voice": voice_flag,
+        }
+        st.set(history_msgs=len(ctx["history"]))
     _log(trace_id, "entry", f"session={session_id} len={len(message)}")
 
     # ── [1.5] SECRET-MODE TOGGLE — explicit, user-driven, checked BEFORE triage. ──
@@ -182,6 +226,7 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     toggle = detect_toggle(message)
     if toggle is not None:
         set_secret_mode(session_id, toggle == "on")
+        trace.set(secret_mode=toggle == "on")
         confirm = ("Secret mode on, Sir. Local only." if toggle == "on"
                    else "Secret mode off, Sir.")
         _log(trace_id, "secret_mode", f"toggle -> {toggle} (session={session_id})")
@@ -234,7 +279,10 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         }
 
     # ── [2] TRIAGE — sensitivity / complexity / domain / loop_worthy ──
-    verdict = triage(message)  # fail-safe → private+complex defaults live in triage
+    with trace.stage("triage") as st:
+        verdict = triage(message)  # fail-safe → private+complex defaults live in triage
+        st.set(sensitivity=verdict["sensitivity"], complexity=verdict["complexity"],
+               domain=verdict["domain"], loop_worthy=verdict["loop_worthy"])
     ctx.update(verdict)
     _log(trace_id, "triage", str(verdict))
 
@@ -246,6 +294,7 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     secret_mode = is_secret_mode(session_id)
     if secret_mode:
         ctx["sensitivity"] = "secret"
+    trace.set(secret_mode=secret_mode, complexity=ctx["complexity"])
     _log(trace_id, "secret_mode",
          f"state={'on' if secret_mode else 'off'} -> sensitivity={ctx['sensitivity']}")
 
@@ -263,9 +312,24 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
     # RUN the real tool, and hand cognition the REAL result so her confirmation
     # reflects an actual DB write — never a fabricated "Done, Sir". Extraction is
     # local (ollama), so it runs regardless of sensitivity and leaks nothing.
-    action = detect_action(message, session_id)
+    # The stage spans detect + execute — the gate, the local extraction and the real
+    # tool call are one indivisible step from the spine's point of view. Only the
+    # tool/verb NAMES and the ok flag are recorded; arguments and results never are.
+    res = None
+    with trace.stage("action_dispatch") as st:
+        action = detect_action(message, session_id)
+        st.set(detected=action is not None)
+        if action is not None:
+            res = run_action(action)
+            st.set(tool=action.get("tool"), verb=fn_name(action),
+                   ok=bool(res.get("ok")), idem_replay=bool(res.get("_idem_replay")))
+            # Only a REAL registry tool counts as invoked — the 'unsupported' pseudo
+            # tool executes nothing, it just declines honestly (see _run_unsupported).
+            if get_tool(action.get("tool")) is not None:
+                trace.add_tools([action.get("tool")])
+            trace.set(idempotency_hit=bool(res.get("_idem_replay")))
+
     if action is not None:
-        res = run_action(action)
         ctx["action"] = action["action"]
         # The result lives ONLY here, on this request's ctx — there is no module-level
         # or global action_result anywhere, so one can never outlive the request that
@@ -407,6 +471,9 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
             # so "hidden gems in Delhi" presents Places rows instead of hallucinating.
             # brain already returns tools=[] for secret/private turns.
             if brain["tools"]:
+                # No trace.add_tools here: fetch_from records what it ACTUALLY
+                # resolved and ran, which is not the same list as what the brain
+                # asked for (an unknown name is dropped there, never invoked).
                 fetched = await fetch_from(brain["tools"], message)
                 counts = ", ".join(f"{k}({len(v)})" for k, v in fetched.items())
                 _log(trace_id, "pool", f"general-path tools fired: {counts}")
@@ -427,7 +494,14 @@ async def handle_message(message: str, session_id: str = "default", voice_flag: 
         # Wall-clock timer spans the teacher's work + any looper refinement (the material-
         # production stage), for the passive outcomes log below. Cognition is timed apart.
         teach_t0 = time.monotonic()
-        teach = await teacher.run(ctx)
+        # The teacher span is opened HERE rather than inside Teacher.run because
+        # leadgen/jobs override run() and can return without calling super() — opening
+        # it at the invocation site is the only way every teacher turn gets exactly one.
+        with trace.stage(f"teacher:{domain}", tier=brain["book_tier"],
+                         ensemble=bool(brain["ensemble"])) as st:
+            teach = await teacher.run(ctx)
+            st.set(book=teach.get("book_used"), deliverable=bool(teach.get("deliverable")),
+                   self_check_passed=bool(teach.get("self_check", {}).get("passes")))
         ctx["deliverable"] = teach.get("deliverable", False)  # let cognition see it
         file_path = teach.get("file_path")  # leadgen export wrote a real .xlsx, if any
         ensemble = teach.get("ensemble")  # list of raw book outputs when 2 books ran

@@ -17,6 +17,7 @@ Two layers, mirroring the rest of the pool:
 import httpx
 
 from config import Config
+from core.trace import record_tool
 from tools.base import Tool
 
 _SEARCH_URL = "https://api.tavily.com/search"
@@ -33,6 +34,9 @@ async def web_search(query: str, max_results: int = 5) -> list[dict]:
     extracted snippet for the page). Raises TavilyKeyMissing if no API key is
     configured, and propagates httpx errors on a failed request — callers that
     must stay fail-soft should wrap this (see SearchTool.fetch)."""
+    # Recorded HERE, not at the registry: leadgen/jobs declare search in owns_tools
+    # and call this structured layer directly. Name only — never the query or hits.
+    record_tool("search")
     key = (Config.TAVILY_API_KEY or "").strip()
     if not key:
         raise TavilyKeyMissing(

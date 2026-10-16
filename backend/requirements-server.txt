@@ -1,0 +1,27 @@
+# Server (Linux/EC2) dependencies: requirements.txt minus voice/audio/Windows-only
+# libs (sounddevice, faster-whisper, kokoro, resemblyzer, ten-vad, openwakeword,
+# win11toast). Run with NOTIFIER=email or NOTIFIER=log — toast needs win11toast.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+pyjwt==2.8.0
+cryptography==49.0.0
+chromadb==0.5.3
+requests==2.32.3
+pydantic==2.7.4
+# Imported directly by core/net.py for the provider timeout + retry policy. Both
+# already arrive as transitive deps of the SDKs, but this module depends on them
+# by name, so they are declared here rather than assumed.
+httpx
+tenacity
+groq
+cerebras-cloud-sdk
+dateparser
+apscheduler
+pypdf
+python-docx
+openpyxl
+openai
+# Not in requirements.txt but imported (lazily) by core/net.py for the local
+# book — secret-tier turns cannot run without it. Point OLLAMA_URL at the daemon.
+ollama

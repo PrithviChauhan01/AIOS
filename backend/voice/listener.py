@@ -110,18 +110,28 @@ VAD_MIN_SILENCE_MS = 1100     # trailing silence that ends a capture (was 600 �
 MAX_CAPTURE_SECONDS = 15      # wall-clock cap on a single utterance
 
 # Captured speech comes in very quiet → Whisper hallucinates on near-silence, so we
-# peak-normalize each utterance to a target (audible, never clipped). TEN VAD decides
-# speech vs silence per frame, so a captured (non-empty) buffer is trusted as real speech
-# and only an empty buffer (VAD never fired) is dropped — no absolute amplitude floor,
-# which was miscalibrated for this quiet mic and wrongly zeroed real captures to empty.
+# peak-normalize each utterance to a target (audible, never clipped). A non-empty buffer
+# is NOT trusted on TEN VAD's word alone: VAD (and the energy onset below) fire on
+# room-tone too, and normalization then makes that noise loud enough for Whisper to
+# invent words over. So the gate below decides, and it decides pre-normalization.
 NORM_TARGET = 0.7        # peak-normalization target amplitude
 PREROLL_SECONDS = 0.4    # audio kept from before VAD fires, so opening words survive
 # Real-speech gate measured on the RAW capture, BEFORE normalization. Normalization
 # scales even quiet room-tone up to NORM_TARGET, so the silence decision MUST happen on
 # the un-normalized signal — otherwise every near-silent buffer passes and Whisper
 # transcribes amplified noise as "Yeah". Tune so normal speech passes, breath/room-tone
-# is rejected; watch the logged raw_rms to calibrate.
-SPEECH_RMS_FLOOR = 0.01  # raw RMS below this = no speech, skip
+# is rejected; watch the logged speech_rms/noise_rms to calibrate.
+SPEECH_RMS_FLOOR = 0.01  # raw RMS of the VOICED frames below this = no speech, skip
+# Per-frame energy that counts as speech onset when TEN VAD misses a quiet voice.
+# Deliberately ABOVE SPEECH_RMS_FLOOR: while the two were the same number, one frame of
+# room-tone loud enough to START a capture was by definition loud enough to satisfy the
+# buffer gate too, so noise self-started and then self-approved its own capture.
+ENERGY_ONSET_RMS = 0.015
+# Contrast gate. Quiet speech and amplified room-tone can sit at the same ABSOLUTE level,
+# so a floor alone cannot separate them. Voiced frames must also stand this far above the
+# room-tone measured inside the same capture (the frames VAD/energy called silence).
+SPEECH_SNR_RATIO = 2.0   # voiced energy must be >= 2x (≈+6dB) the room-tone estimate
+MIN_NOISE_FRAMES = 8     # ~128ms of silence needed before that ratio is trustworthy
 
 _oww = None
 _vad = None
@@ -280,11 +290,19 @@ def _capture_speech(src) -> np.ndarray:
 
     # Energy fallback: TEN VAD sometimes never fires on a quiet-but-present voice
     # (notably when AirPods hand off / come back weak). So a frame counts as speech if
-    # VAD fires OR its raw energy clears the speech floor — measured on the int16 scale
-    # to match SPEECH_RMS_FLOOR (which is on the float32 [-1,1] scale). Without this a
+    # VAD fires OR its raw energy clears ENERGY_ONSET_RMS — measured on the int16 scale
+    # here to match the constant (which is on the float32 [-1,1] scale). Without this a
     # VAD miss yields an empty buffer that looks like a VAD bug.
-    energy_floor_int16 = SPEECH_RMS_FLOOR * 32768.0
+    energy_floor_int16 = ENERGY_ONSET_RMS * 32768.0
     energy_fallback = False  # diagnostic: did energy carry the onset where VAD didn't?
+
+    # Per-frame mean-square energy, split by the VAD/energy verdict on that frame, both
+    # on the float32 [-1,1] scale. voiced_sq is the utterance's real speech energy
+    # (undiluted by pre-roll and the trailing 1.1s of silence, which drag a whole-buffer
+    # RMS down and used to sink short quiet utterances); noise_sq is this room's tone,
+    # measured in this very capture, which is what the contrast gate compares against.
+    voiced_sq = []
+    noise_sq = []
 
     t_start = time.perf_counter()
     t_speech = None          # when speech onset was detected (VAD or energy)
@@ -298,6 +316,10 @@ def _capture_speech(src) -> np.ndarray:
 
         vad_active = prob >= VAD_THRESHOLD
         energy_active = frame_rms >= energy_floor_int16
+
+        # Bookkeep this frame's energy under whichever verdict it got, for the gate below.
+        frame_ms_energy = (frame_rms / 32768.0) ** 2
+        (voiced_sq if (vad_active or energy_active) else noise_sq).append(frame_ms_energy)
 
         if vad_active or energy_active:
             if not speech_started:
@@ -334,13 +356,31 @@ def _capture_speech(src) -> np.ndarray:
     # Real-speech gate on the RAW signal, measured BEFORE normalization. (Normalizing
     # first would scale room-tone up to NORM_TARGET and let every near-silent buffer
     # through — that is what made Whisper hallucinate "Yeah" on near-silence.)
+    #
+    # Two tests, both pre-normalization:
+    #   1. absolute — the voiced frames must carry some energy at all;
+    #   2. contrast — they must also stand clear of this capture's own room-tone.
+    # Test 2 is what catches noise that tripped VAD or the energy onset: amplified
+    # room-tone has voiced ≈ noise, real speech does not, however quiet the mic is.
     raw_rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+    speech_rms = float(np.sqrt(np.mean(voiced_sq))) if voiced_sq else 0.0
+    # Only trust the room-tone estimate once there is enough silence to measure it; a
+    # capture that ran into the wall-clock cap may have none, and then test 2 is skipped.
+    noise_rms = (
+        float(np.sqrt(np.mean(noise_sq))) if len(noise_sq) >= MIN_NOISE_FRAMES else 0.0
+    )
+    snr = (speech_rms / noise_rms) if noise_rms > 0 else 0.0
     if audio.size == 0:
         # VAD never detected speech — nothing to transcribe.
         print("[skip] no speech detected")
-    elif raw_rms < SPEECH_RMS_FLOOR:
-        # VAD fired but the raw energy is room-tone/breath, not speech.
-        print(f"[skip] no-speech raw_rms={raw_rms:.4f}")
+    elif speech_rms < SPEECH_RMS_FLOOR:
+        # VAD fired but even the voiced frames are room-tone/breath, not speech.
+        print(f"[skip] no-speech speech_rms={speech_rms:.4f} raw_rms={raw_rms:.4f}")
+        audio = np.zeros(0, dtype=np.float32)
+    elif noise_rms > 0 and speech_rms < noise_rms * SPEECH_SNR_RATIO:
+        # Loud enough in absolute terms, but no louder than the room — noise, not speech.
+        print(f"[skip] no-contrast speech_rms={speech_rms:.4f} "
+              f"noise_rms={noise_rms:.4f} snr={snr:.2f}")
         audio = np.zeros(0, dtype=np.float32)
     else:
         # Peak-normalize the captured speech so the loudest sample hits NORM_TARGET —
@@ -365,13 +405,17 @@ def _capture_speech(src) -> np.ndarray:
         vad_wait_ms=vad_wait_ms,
         capture_ms=capture_ms,
         raw_rms=raw_rms,  # pre-normalization energy — transcriber uses it to drop filler
+        speech_rms=speech_rms,  # voiced frames only — what the absolute gate decided on
+        noise_rms=noise_rms,    # this capture's room-tone (0.0 = too little silence to measure)
+        snr=snr,                # speech_rms / noise_rms — what the contrast gate decided on
     )
 
     # Confirm the buffer handed to the transcriber is non-empty and carries signal,
     # and show the raw RMS the gate decided on so the floor can be calibrated.
     final_amp = float(np.abs(audio).max()) if audio.size else 0.0
     print(f"[capture] final buffer: len={audio.size} samples "
-          f"({audio.size / SR:.2f}s) raw_rms={raw_rms:.4f} max_amp={final_amp:.3f}"
+          f"({audio.size / SR:.2f}s) raw_rms={raw_rms:.4f} speech_rms={speech_rms:.4f} "
+          f"noise_rms={noise_rms:.4f} snr={snr:.2f} max_amp={final_amp:.3f}"
           f"{' [energy-fallback]' if energy_fallback else ''}")
     return audio
 

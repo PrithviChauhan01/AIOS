@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
     mode        TEXT,
-    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
+    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    redacted    INTEGER DEFAULT 0,   -- 1 = `content` is a placeholder, not what was said
+    vault_id    TEXT                 -- the vault row holding the real content, if any
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -192,13 +194,30 @@ CREATE INDEX IF NOT EXISTS idx_traces_ts_start       ON traces (ts_start);
 
 SCHEMA += TRACE_DDL
 
-# Columns added to the trace tables AFTER they first shipped. CREATE TABLE IF NOT
-# EXISTS is a no-op on a database that already has the older table, so each one needs
-# an explicit ALTER. Idempotent and additive by construction: a missing column is
-# added, an existing one is left alone, and nothing is ever dropped or rewritten.
+# Columns added to a table AFTER it first shipped. CREATE TABLE IF NOT EXISTS is a
+# no-op on a database that already has the older table, so each one needs an explicit
+# ALTER. Idempotent and additive by construction: a missing column is added, an
+# existing one is left alone, and nothing is ever dropped or rewritten.
 _TRACE_ADDED_COLUMNS = (
     ("trace_stages", "parent_seq", "INTEGER"),
 )
+
+# `redacted` / `vault_id` on conversations. A pre-existing database has 740-odd rows
+# in that table, so these MUST arrive by ALTER — the CREATE above never re-runs.
+# Adding the columns is separate from cleaning the rows: existing plaintext is dealt
+# with by db/redact_secrets.py, which is explicitly invoked and never runs on import.
+_CONVERSATION_ADDED_COLUMNS = (
+    ("conversations", "redacted", "INTEGER DEFAULT 0"),
+    ("conversations", "vault_id", "TEXT"),
+)
+
+
+def _add_missing_columns(conn, specs) -> None:
+    for table, column, decl in specs:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            print(f"[db] migrated: {table}.{column} added")
 
 
 def ensure_trace_schema(conn) -> None:
@@ -206,11 +225,17 @@ def ensure_trace_schema(conn) -> None:
     database is missing. Safe to call on every write path — core.trace.flush() does,
     so a trace can be written by a process that never ran init_sqlite()."""
     conn.executescript(TRACE_DDL)
-    for table, column, decl in _TRACE_ADDED_COLUMNS:
-        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-            print(f"[db] migrated: {table}.{column} added")
+    _add_missing_columns(conn, _TRACE_ADDED_COLUMNS)
+
+
+def ensure_conversation_schema(conn) -> None:
+    """Add the redaction columns to an existing conversations table.
+
+    Called by init_sqlite AND once per process by core.memory.save_message. That
+    second call is not belt-and-braces: without the columns the redacting INSERT
+    fails, and a failed INSERT on a secret turn is a turn that breaks. Cheap
+    (one PRAGMA) and idempotent."""
+    _add_missing_columns(conn, _CONVERSATION_ADDED_COLUMNS)
 
 
 def init_sqlite():
@@ -218,6 +243,7 @@ def init_sqlite():
     conn = sqlite3.connect(Config.SQLITE_PATH)
     conn.executescript(SCHEMA)
     ensure_trace_schema(conn)
+    ensure_conversation_schema(conn)
     conn.commit()
     conn.close()
     print("[db] SQLite ready")

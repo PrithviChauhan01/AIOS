@@ -19,6 +19,7 @@ def _anchor(path: str) -> str:
 
 
 class Config:
+    HOST = os.getenv("HOST") or "127.0.0.1"
     PORT = int(os.getenv("PORT", 5000))
     DEBUG = os.getenv("FLASK_ENV") != "production"
     JWT_SECRET = os.getenv("JWT_SECRET", "change_this")
@@ -49,6 +50,11 @@ class Config:
     # always open the same file, independent of CWD.
     SQLITE_PATH = _anchor(os.getenv("SQLITE_PATH", "./db/aios.db"))
     CHROMA_PATH = _anchor(os.getenv("CHROMA_PATH", "./db/chroma"))
+    # Encrypted vault table lives in the main SQLite file unless pointed elsewhere.
+    VAULT_PATH = _anchor(os.getenv("VAULT_PATH") or SQLITE_PATH)
+    OLLAMA_URL = os.getenv("OLLAMA_URL") or "http://localhost:11434"
+    # Reminder delivery backend: toast (Windows) | email (to self) | log.
+    NOTIFIER = os.getenv("NOTIFIER", "toast")
     VISION_ENABLED = os.getenv("VISION_ENABLED", "false").lower() == "true"
 
     @classmethod

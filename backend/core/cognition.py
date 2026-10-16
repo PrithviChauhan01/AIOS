@@ -728,9 +728,17 @@ async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
     session_id = ctx.get("session_id", "default")
     # route_tier carries the guard: private/secret → 'secret' → extractor vaults the
     # turn locally instead of sending the (private) response to the cloud extractor.
-    await asyncio.to_thread(save_message, session_id, "user", message)
+    #
+    # The vault write runs FIRST so its id can ride on the conversations row. That row
+    # stores a placeholder for a secret turn (core.memory.save_message) — the raw value
+    # belongs in the vault and nowhere else, and vault_id is what ties the two together.
+    # Order is the only change: extract_and_store swallows its own errors and reads
+    # nothing from conversations, so nothing here depends on it running last.
+    # The assistant reply is saved untouched — it is her acknowledgement, not the value.
+    vault_id = await asyncio.to_thread(extract_and_store, message, response, route_tier)
+    await asyncio.to_thread(save_message, session_id, "user", message,
+                            tier=route_tier, vault_id=vault_id)
     await asyncio.to_thread(save_message, session_id, "assistant", response)
-    await asyncio.to_thread(extract_and_store, message, response, route_tier)
 
     reply = {
         "response": response,

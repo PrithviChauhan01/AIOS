@@ -12,6 +12,7 @@ silence/filler gate are untouched (listener.py / loop.py own those).
 """
 
 import os
+import re
 import wave
 import tempfile
 
@@ -34,6 +35,18 @@ _GROQ_PROMPT = (
     "Conversation with AIOS, an AI assistant. The user is called Sir. "
     "Names: AIOS, Sir."
 )
+
+
+def _is_all_filler(text: str) -> bool:
+    """True when EVERY clause of the transcript is a known hallucination filler.
+
+    Whisper repeats itself on noise — "Yeah. Yeah.", "Thank you, thank you." — and an
+    exact whole-string match against _FILLER let all of those through as real speech.
+    Splitting on sentence/clause punctuation catches the repeats while still leaving any
+    transcript with one real word in it alone."""
+    parts = [p.strip(" .!?,-'\"") for p in re.split(r"[.!?,;\n]+", text.lower())]
+    parts = [p for p in parts if p]
+    return bool(parts) and all(p in _FILLER for p in parts)
 
 
 def _get_model():
@@ -140,7 +153,7 @@ def transcribe(audio, raw_rms=None, force_local=False) -> str:
     # Drop pure-filler hallucinations when the capture was quiet. Whisper still emits
     # "Yeah"/"Thank you"/"you" on low-energy audio that slips past no_speech_threshold;
     # if raw energy was low AND the entire transcript is just filler, treat it as noise.
-    if raw_rms is not None and raw_rms < FILLER_RMS_CEILING:
-        if text.lower().strip(" .!?,") in _FILLER:
-            return ""
+    if raw_rms is not None and raw_rms < FILLER_RMS_CEILING and _is_all_filler(text):
+        print(f"[transcriber] dropped filler {text!r} (raw_rms={raw_rms:.4f})")
+        return ""
     return text

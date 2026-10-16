@@ -38,17 +38,21 @@ def _extract_call(user_message: str, assistant_response: str):
 
 
 def extract_and_store(user_message: str, assistant_response: str, tier: str = "public"):
+    """Returns the vault id when this turn was vaulted, else None. The id is the only
+    thing added here — what gets vaulted, and when, is unchanged. core.memory records
+    it on the (redacted) conversations row so a redacted turn points at where its real
+    content actually lives."""
     # ── SECRET (or any non-cloud tier) → NEVER touch Groq. ──
     # The raw user message goes straight to the encrypted local vault: no cloud
     # round-trip, no embedding. This is the path that closes the leak.
     if tier not in _CLOUD_TIERS:
         try:
-            vault_store(user_message, {"category": "secret_turn", "tier": "secret"})
+            return vault_store(user_message, {"category": "secret_turn", "tier": "secret"})
         except Exception as e:
             # Don't break the chat flow; but make a vault failure visible rather
             # than silently dropping a secret. We still never fall back to cloud.
             print(f"[extractor] vault_store failed for secret turn: {e}")
-        return
+        return None
 
     # ── PUBLIC / PRIVATE → extract via Groq, tagging each fact with the tier. ──
     try:

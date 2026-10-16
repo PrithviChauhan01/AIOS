@@ -13,16 +13,22 @@ that flag between utterances. handle_message is async; blocking mic/STT/TTS work
 to threads so the event loop stays free.
 
 Run from backend/:  python -m voice.loop
+
+Remote mode: if AIOS_API_URL and AIOS_TOKEN are both set, each utterance is POSTed
+to {AIOS_API_URL}/chat with a Bearer token instead of calling handle_message
+in-process — so the mic/speaker can stay on the laptop while the backend runs elsewhere.
 """
 
 import asyncio
+import os
 import sys
 import threading
 import time
 
 import numpy as np
+import requests
 
-from core.orchestrator import handle_message
+import config  # noqa: F401 — loads backend/.env so AIOS_API_URL/AIOS_TOKEN are visible
 from voice.speaker import speak
 from voice import activity
 from voice import listener
@@ -30,6 +36,33 @@ from voice.listener import capture
 from voice.transcriber import transcribe
 
 _STOP_WORDS = ("stop", "stop listening")
+
+_API_URL = os.getenv("AIOS_API_URL", "").rstrip("/")
+_TOKEN = os.getenv("AIOS_TOKEN", "")
+_REMOTE_TIMEOUT_S = 180  # covers a slow local-book turn on the server side
+
+
+def _remote_chat(text: str) -> dict:
+    """Blocking POST to the remote backend's /chat. Same result shape as handle_message."""
+    r = requests.post(
+        f"{_API_URL}/chat",
+        json={"message": text, "session_id": "voice", "voice": False},
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+        timeout=_REMOTE_TIMEOUT_S,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+async def _chat(text: str) -> dict:
+    if _API_URL and _TOKEN:
+        try:
+            return await asyncio.to_thread(_remote_chat, text)
+        except Exception as e:
+            print(f"[loop] remote /chat failed: {type(e).__name__}: {e}")
+            return {"response": "I couldn't reach the server, Sir.", "mood": "neutral"}
+    from core.orchestrator import handle_message  # in-process: loads the full backend
+    return await handle_message(text, session_id="voice", voice_flag=False)
 
 
 def _enter_watcher(toggle):
@@ -55,6 +88,8 @@ async def _run():
             print("[loop] listening ON — speak, or say 'stop' to pause.")
 
     threading.Thread(target=_enter_watcher, args=(toggle,), daemon=True).start()
+    if _API_URL and _TOKEN:
+        print(f"[loop] remote mode — POSTing to {_API_URL}/chat")
     print("[loop] AIOS voice loop ready. Press Enter to start/stop listening. Ctrl+C to exit.")
 
     while True:
@@ -109,7 +144,7 @@ async def _run():
 
         print(f"You: {text}")
         t0 = time.perf_counter()
-        result = await handle_message(text, session_id="voice", voice_flag=False)
+        result = await _chat(text)
         cognition_ms = (time.perf_counter() - t0) * 1000.0
         response = result.get("response", "")
         mood = result.get("mood", "neutral")

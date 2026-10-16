@@ -10,6 +10,7 @@ store rather than store in the clear, and we never fall back to a cloud path.
 """
 
 import json
+import os
 import sqlite3
 import uuid
 
@@ -60,7 +61,8 @@ def _get_fernet():
 
 
 def _connect():
-    conn = sqlite3.connect(Config.SQLITE_PATH)
+    os.makedirs(os.path.dirname(Config.VAULT_PATH), exist_ok=True)
+    conn = sqlite3.connect(Config.VAULT_PATH)
     conn.execute(_VAULT_SCHEMA)  # defensive: table exists even if init didn't run
     return conn
 

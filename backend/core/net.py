@@ -56,6 +56,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+from config import Config
 from core import provider_health as health
 
 CONNECT_S = 5.0
@@ -259,7 +260,7 @@ def ollama_client():
     global _ollama_client
     if _ollama_client is None:
         import ollama
-        _ollama_client = ollama.Client(timeout=LOCAL_TIMEOUT)
+        _ollama_client = ollama.Client(host=Config.OLLAMA_URL, timeout=LOCAL_TIMEOUT)
     return _ollama_client
 
 

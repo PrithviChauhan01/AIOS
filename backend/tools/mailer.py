@@ -142,6 +142,13 @@ def _send_smtp(to: str, subject: str, body: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def send_to_self(subject: str, body: str) -> dict:
+    """System notification (e.g. a fired reminder) to Sir's OWN address. This is
+    the one path that skips the confirm gate: the recipient is hardwired to
+    GMAIL_ADDRESS and not a parameter, so nothing can route it to anyone else."""
+    return _send_smtp((Config.GMAIL_ADDRESS or "").strip(), subject, body)
+
+
 # ── Gate state machine ──
 def make_draft(to: str, recipient: str, topic: str, instruction: str) -> dict:
     """Build (but do NOT send) a draft. Returns the draft, or a clarify if we don't

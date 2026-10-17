@@ -5,11 +5,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import Config
-from api.health_routes import router as health_router
+from api.health_routes import router as health_router, health_check
 from api.chat_routes import router as chat_router
 from api.dashboard_routes import router as dashboard_router
 from api.conversations_routes import router as conversations_router
 from api.trace_routes import router as trace_router
+from api.public_chat_routes import router as public_chat_router
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
 from core.auth import generate_token
@@ -18,6 +19,11 @@ from core.scheduler import start_scheduler, stop_scheduler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if Config.PUBLIC_MODE:
+        # Nothing to open: public turns persist nothing, and no reminders fire.
+        print("[aios] PUBLIC_MODE — anonymous /chat only; no stores, no scheduler")
+        yield
+        return
     init_sqlite()
     init_chroma()
     start_scheduler()  # reminder firing — runs whenever the backend is up
@@ -43,6 +49,13 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    if Config.PUBLIC_MODE:
+        # Public surface is /health and /chat only. No /token, and none of the routers
+        # that read Sir's data (dashboard, conversations, traces, /health/deep).
+        app.add_api_route("/health", health_check, methods=["GET"])
+        app.include_router(public_chat_router)
+        return app
 
     app.include_router(health_router)
     app.include_router(chat_router)

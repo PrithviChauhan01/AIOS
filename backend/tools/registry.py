@@ -1,5 +1,7 @@
 import asyncio
 
+from config import Config
+
 from core.trace import record_tool
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
@@ -31,7 +33,13 @@ _REGISTRY = {
 
 
 def get_tool(name: str) -> Tool | None:
-    return _REGISTRY.get(name)
+    tool = _REGISTRY.get(name)
+    # Public mode: a state-writing tool is unreachable, full stop. Every path to a
+    # tool (action dispatch, fetch_from, teachers' pool draws) resolves through here,
+    # so this is the structural backstop under action_dispatch's polite refusal.
+    if tool is not None and tool.is_action and Config.PUBLIC_MODE:
+        return None
+    return tool
 
 
 def is_action_tool(name: str) -> bool:

@@ -1,5 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
+from config import Config
 from db.chroma_init import get_chroma_client
 from core.books import (
     select_book_for_tier, select_ensemble_books, upgrade_tier, call_book, model_for,
@@ -47,6 +48,8 @@ class Teacher(ABC):
     # ── Shared machinery ──
     def retrieve_memory(self, query: str, n_results: int = 5) -> list:
         """Semantic recall against this Teacher's own Chroma namespace."""
+        if Config.PUBLIC_MODE:
+            return []  # domain memory is Sir's — public turns run memory-less
         client = get_chroma_client()
         collection = client.get_or_create_collection(self.memory_ns)
         count = collection.count()

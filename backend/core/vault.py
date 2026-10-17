@@ -61,6 +61,11 @@ def _get_fernet():
 
 
 def _connect():
+    # Every vault entry point opens through here, so this one check disables the
+    # vault entirely in public mode. Raising (not returning) is the contract the
+    # privacy path already expects from a vault failure: do not proceed.
+    if Config.PUBLIC_MODE:
+        raise RuntimeError("vault is disabled in public mode")
     os.makedirs(os.path.dirname(Config.VAULT_PATH), exist_ok=True)
     conn = sqlite3.connect(Config.VAULT_PATH)
     conn.execute(_VAULT_SCHEMA)  # defensive: table exists even if init didn't run

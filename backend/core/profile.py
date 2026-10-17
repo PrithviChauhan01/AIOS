@@ -1,3 +1,4 @@
+from config import Config
 from db.chroma_init import get_chroma_client
 import uuid
 
@@ -13,6 +14,8 @@ def store_fact(fact: str, category: str = "general", tier: str = "public"):
     if tier not in _CHROMA_TIERS:
         print(f"[profile] refusing to embed fact at tier '{tier}' — not stored in Chroma")
         return
+    if Config.PUBLIC_MODE:
+        return  # public mode never writes long-term memory
     client = get_chroma_client()
     collection = client.get_collection("long_term_memory")
     collection.add(
@@ -33,6 +36,8 @@ _MAX_DISTANCE = 1.65
 
 
 def get_relevant_facts(query: str, n_results: int = 4, cloud_bound: bool = True) -> list:
+    if Config.PUBLIC_MODE:
+        return []  # mem_core is Sir's — a public turn never reads it
     client = get_chroma_client()
     collection = client.get_collection("long_term_memory")
     count = collection.count()

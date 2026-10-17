@@ -55,6 +55,8 @@ def save_message(session_id: str, role: str, content: str, mode: str = "default"
     'secret' redacts a user message to SECRET_PLACEHOLDER and records where the real
     content went. Callers that pass no tier (the greeting path, which runs before
     triage and cannot be secret) are unaffected."""
+    if Config.PUBLIC_MODE:
+        return  # public visitors' turns live only in core.public_session, never on disk
     redact = tier == "secret" and role == "user"
     stored = SECRET_PLACEHOLDER if redact else content
     conn = sqlite3.connect(Config.SQLITE_PATH)

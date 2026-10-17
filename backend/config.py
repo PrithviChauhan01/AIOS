@@ -18,6 +18,18 @@ def _anchor(path: str) -> str:
     return path if os.path.isabs(path) else os.path.normpath(os.path.join(_BACKEND_DIR, path))
 
 
+# The personal stores' default locations. Public mode refuses to boot pointed at any
+# of them (see Config.validate_public) — a public visitor must never share a file
+# with Sir's memory, conversations or vault, even read-only.
+_PERSONAL_SQLITE = _anchor("./db/aios.db")
+_PERSONAL_CHROMA = _anchor("./db/chroma")
+_PERSONAL_DEFAULTS = (_PERSONAL_SQLITE, _PERSONAL_CHROMA)
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
 class Config:
     HOST = os.getenv("HOST") or "127.0.0.1"
     PORT = int(os.getenv("PORT", 5000))
@@ -57,9 +69,23 @@ class Config:
     NOTIFIER = os.getenv("NOTIFIER", "toast")
     VISION_ENABLED = os.getenv("VISION_ENABLED", "false").lower() == "true"
 
+    # ── Public mode ──
+    # true → the same app serves anonymous visitors: no JWT, in-memory session
+    # history only, every writing tool refused, neutral persona, per-IP rate limit.
+    # Default false — personal mode is untouched unless this is set explicitly.
+    PUBLIC_MODE = os.getenv("PUBLIC_MODE", "false").lower() == "true"
+    PUBLIC_SESSION_IDLE_S = 30 * 60      # a visitor's history expires after 30 min idle
+    PUBLIC_MAX_INPUT_CHARS = 2000
+    PUBLIC_RATE_SHORT = (20, 10 * 60)    # 20 messages / 10 minutes, per IP
+    PUBLIC_RATE_DAILY = (100, 24 * 60 * 60)  # 100 messages / day, per IP
+
     @classmethod
     def validate(cls):
-        """Fail closed at startup on an insecure auth secret. Call before serving."""
+        """Fail closed at startup on an insecure auth secret (personal mode) or on a
+        public deployment pointed at the personal stores. Call before serving."""
+        if cls.PUBLIC_MODE:
+            cls.validate_public()
+            return  # public mode issues no JWTs, so the secret is never used
         if len(cls.JWT_SECRET.encode("utf-8")) < JWT_MIN_BYTES:
             raise RuntimeError(
                 f"JWT_SECRET is too short (need >= {JWT_MIN_BYTES} bytes). "
@@ -67,3 +93,18 @@ class Config:
                 "in backend/.env, e.g.:\n"
                 '    python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
+
+    @classmethod
+    def validate_public(cls):
+        """Refuse to boot in public mode if any store resolves to a personal default.
+        An unset SQLITE_PATH/CHROMA_PATH falls back to exactly those defaults, so a
+        public deployment must point all three somewhere of its own explicitly."""
+        for name in ("SQLITE_PATH", "CHROMA_PATH", "VAULT_PATH"):
+            path = getattr(cls, name)
+            if any(_same_path(path, d) for d in _PERSONAL_DEFAULTS):
+                raise RuntimeError(
+                    f"PUBLIC_MODE=true but {name} resolves to a personal default "
+                    f"({path}). Refusing to run a public server against personal data. "
+                    f"Set SQLITE_PATH, CHROMA_PATH and VAULT_PATH to public-only "
+                    f"locations in the public deployment's environment."
+                )

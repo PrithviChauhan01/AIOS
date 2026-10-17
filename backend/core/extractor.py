@@ -42,6 +42,8 @@ def extract_and_store(user_message: str, assistant_response: str, tier: str = "p
     thing added here — what gets vaulted, and when, is unchanged. core.memory records
     it on the (redacted) conversations row so a redacted turn points at where its real
     content actually lives."""
+    if Config.PUBLIC_MODE:
+        return None  # no fact mining, no vault — public turns are never remembered
     # ── SECRET (or any non-cloud tier) → NEVER touch Groq. ──
     # The raw user message goes straight to the encrypted local vault: no cloud
     # round-trip, no embedding. This is the path that closes the leak.

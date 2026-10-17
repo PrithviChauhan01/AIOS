@@ -18,6 +18,8 @@ def log_outcome(*, domain: str, book_used: str, ensemble: bool,
 
     book_used is comma-joined for an ensemble ("nemotron_super,groq"); ensemble booleans
     are stored as 0/1. ts defaults to CURRENT_TIMESTAMP in the table."""
+    if Config.PUBLIC_MODE:
+        return
     try:
         conn = sqlite3.connect(Config.SQLITE_PATH)
         try:

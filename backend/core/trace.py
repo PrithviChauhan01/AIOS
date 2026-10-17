@@ -318,13 +318,23 @@ class Trace:
             totals[idx] = sum(values) if values else None
         return totals[0], totals[1]
 
+    def stage_timings(self) -> list[dict]:
+        """Per-stage latency, in start order — the response-side view public mode
+        returns in place of a flushed row. Names, books and ms only; never meta."""
+        with self._lock:
+            stages = list(self._stages)
+        return [{"stage": st.stage, "ms": st.ms, "book": st.book} for st in stages]
+
     # ── The one write ──
     def flush(self) -> bool:
         """Write this trace: ONE transaction, 1 traces row + N trace_stages rows.
 
         Never raises and never re-writes — a second call is a no-op. Returns True on
         a successful write, False if anything at all went wrong (the request is
-        unaffected either way)."""
+        unaffected either way). Public mode never writes: its trace is in-memory only
+        and surfaces through stage_timings() on the response instead."""
+        if Config.PUBLIC_MODE:
+            return False
         try:
             with self._lock:
                 if self._flushed:

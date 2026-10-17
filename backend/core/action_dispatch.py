@@ -28,6 +28,7 @@ import re
 import threading
 import time
 
+from config import Config
 from core.net import ollama_chat
 from tools.registry import get_tool, is_action_tool
 
@@ -720,6 +721,8 @@ def detect_action(message: str, session_id: str = "default") -> dict | None:
     key the execute stage checks. Returns the intent dict for a real action command,
     or None for ordinary chat."""
     action = _detect(message, session_id)
+    if action is not None and Config.PUBLIC_MODE:
+        return _public_refusal(action)
     if action is not None:
         action.setdefault("raw_message", message or "")
         action["idem_key"] = _idempotency_key(action, message or "")
@@ -815,6 +818,34 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
         return {"tool": "unsupported", "action": "decline",
                 "session_id": session_id, "raw_message": msg}
     return None
+
+
+# ── Public mode: every action is refused ──
+# Detection runs exactly as in personal mode — the same gates and the same local
+# extraction, so "how do email servers work" is still ordinary chat — but whatever
+# it finds is swapped for a polite decline. Nothing reaches _execute's real tools:
+# run_action re-checks, and tools.registry.get_tool hides every writing tool besides.
+_PUBLIC_REFUSAL_NOUN = {
+    "reminders": "set or manage reminders",
+    "jobs": "log job applications",
+    "documents": "save or read documents",
+    "email": "send email",
+    "fitness": "log workouts",
+    "leads": "save leads",
+    "study": "log study sessions",
+    "habits": "track habits",
+}
+
+
+def _public_refusal(action: dict) -> dict:
+    noun = _PUBLIC_REFUSAL_NOUN.get(action.get("tool"), "make changes like that")
+    return {
+        "tool": "disabled", "action": "refuse", "blocked": action.get("tool"),
+        "session_id": action.get("session_id"),
+        "raw_message": action.get("raw_message", ""),
+        "ask": (f"Sorry — this is the public demo of AIOS, so I can't {noun} here. "
+                "Happy to help with questions, explanations or planning instead."),
+    }
 
 
 # ── Idempotency ──
@@ -977,6 +1008,8 @@ def run_action(action: dict) -> dict:
     A guarded result carries "_idem_key" (so cognition can key its OWN reply cache
     off the same identity) and, on a replay, "_idem_replay": True — see
     core/cognition.py's idempotent-replay short-circuit."""
+    if Config.PUBLIC_MODE and action.get("tool") != "disabled":
+        action = _public_refusal(action)  # backstop: detect_action already did this
     key = action.get("idem_key")
     guarded = bool(key) and _is_write(action)
 
@@ -1002,6 +1035,8 @@ def _execute(action: dict) -> dict:
     """Dispatch to the REAL tool via the registry, respecting is_action. Returns the
     actual tool result dict (success, the needs/ask clarify path, or a not-found).
     Never raises."""
+    if action.get("tool") == "disabled":
+        return {"ok": False, "error": "disabled_public", "ask": action.get("ask")}
     if action.get("tool") == "unsupported":
         return _run_unsupported(action)
     if action.get("tool") == "jobs":
@@ -1272,6 +1307,8 @@ def fn_name(action: dict) -> str:
     """Module-function name for an action, for logging ('set' → 'set_reminder',
     'log' → 'log_application'). Dispatches by the action's "tool" tag."""
     verb = action.get("action")
+    if action.get("tool") == "disabled":
+        return f"refuse:{action.get('blocked')}"
     if action.get("tool") == "unsupported":
         return "decline"
     if action.get("tool") == "jobs":
@@ -1295,7 +1332,7 @@ def action_material(action: dict, res: dict) -> str:
     """Render the REAL tool result into a text block for cognition. This is the
     truth she confirms from — she must not embellish past what it states.
     Dispatches by the action's "tool" tag."""
-    if action.get("tool") == "unsupported":
+    if action.get("tool") in ("unsupported", "disabled"):
         return _unsupported_material(action.get("action"), res)
     if action.get("tool") == "jobs":
         return _jobs_material(action.get("action"), res)

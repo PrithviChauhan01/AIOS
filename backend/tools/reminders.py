@@ -51,6 +51,14 @@ _PARTS = {
 # Default time when a date is given but no clock time (e.g. "tomorrow").
 _DEFAULT_HOUR = 9
 
+# An ISO date, optionally with a time ("2026-10-15", "2026-10-15 14:30",
+# "2026-10-15T14:30:00"). Checked before everything else: the clock parser would
+# otherwise read the "10" in "2026-10-15" as 10:00 and the date would be lost.
+_ISO_RE = re.compile(
+    r"\b(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?\b",
+    re.IGNORECASE)  # parse_due lowercases first, so the 'T' arrives as 't'
+_ISO_DEFAULT_HOUR = 10
+
 # Junk-title guard. A reminder title must name a concrete task. LLM-driven flows
 # sometimes hand set_reminder a *definition* of a deadline ("the target to
 # achieve by a specific date") or a bare placeholder ("reminder", "todo")
@@ -139,6 +147,23 @@ def _at(date, hour, minute):
     return datetime(date.year, date.month, date.day, hour, minute, 0)
 
 
+def _parse_iso(text: str):
+    """An ISO date in the text → that datetime, or None if there is none. A time
+    after the date ('T14:30' / ' 14:30') wins; else a clock phrase elsewhere in the
+    text ('2026-10-15 at 6pm'); else 10:00. Raises ValueError on an impossible
+    date (2026-13-40) rather than silently parsing something else."""
+    m = _ISO_RE.search(text)
+    if not m:
+        return None
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if m.group(4) is not None:
+        return datetime(year, month, day, int(m.group(4)), int(m.group(5)),
+                        int(m.group(6) or 0))
+    rest = (text[:m.start()] + " " + text[m.end():]).strip()
+    hour, minute = (_parse_clock(rest) if rest else None) or (_ISO_DEFAULT_HOUR, 0)
+    return datetime(year, month, day, hour, minute, 0)
+
+
 def _fallback_parse(text: str, now: datetime):
     """Deterministic parser for the phrases AIOS uses. Used as the primary path
     (predictable for known phrasings) and as the sole parser when dateparser is
@@ -206,7 +231,7 @@ def parse_due(text, now: datetime = None) -> datetime:
     now = now or datetime.now()
     norm = _normalize(text)
 
-    dt = _fallback_parse(norm, now)
+    dt = _parse_iso(norm) or _fallback_parse(norm, now)
     if dt is None and dateparser is not None:
         dt = dateparser.parse(norm, settings={
             "RELATIVE_BASE": now,

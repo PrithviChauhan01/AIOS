@@ -219,11 +219,6 @@ def _as_date(when) -> str:
     """A follow-up phrase or date → 'YYYY-MM-DD'. Raises ValueError if unparseable."""
     if isinstance(when, date) and not isinstance(when, datetime):
         return when.isoformat()
-    # ISO first: parse_due reads "2026-10-15" as a clock time (tomorrow 10:00).
-    try:
-        return date.fromisoformat(str(when).strip()).isoformat()
-    except ValueError:
-        pass
     from tools.reminders import parse_due
     return parse_due(when, now=_now()).date().isoformat()
 

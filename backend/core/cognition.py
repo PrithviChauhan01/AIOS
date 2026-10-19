@@ -473,7 +473,9 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
                 task_block += (
                     " This result is a deliverable: after ONE short framing line, "
                     "reproduce it IN FULL exactly as given — keep any markdown table "
-                    "intact, every row and column, nothing added.")
+                    "intact, every row and column, nothing added. If it is a list you "
+                    "looked up, frame it as that (\"Here's what's due…\") — do not say "
+                    "you logged or saved anything.")
         else:
             task_block = (
                 "The action you attempted for Sir did NOT succeed — the RAW MATERIAL above "
@@ -693,7 +695,7 @@ async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
            circuits=circuit_summary(), skipped=",".join(open_providers()) or None)
     mark(ctx, fast_lane=fast_lane, deliverable=bool(ctx.get("deliverable")))
 
-    result = None
+    result = response = mood = None
     for book in books:
         try:
             with stage_of(ctx, "book", book=book, model=model_for(book),
@@ -701,34 +703,43 @@ async def _cognition_pass(ctx: dict, raw_material, st) -> dict:
                 result = await call_book(prompt, book, max_tokens=max_tokens)
                 bst.set(tokens_in=result.get("tokens_in"),
                         tokens_out=result.get("tokens_out"))
-            break
         except Exception:
             continue  # call_book logged / benched it; fall to next candidate
 
-    if result is None:
-        return {
-            "response": "Something's off with my connection, Sir. Give me a moment.",
-            "mood": "neutral",
-            "provider_used": "none",
-            "tokens": 0,
-        }
+        # Surface fast vs full so latency wins are visible per turn. max_tokens is the
+        # cap we imposed; tokens is what the call actually used (prompt + completion).
+        print(f"[cognition] lane={'fast' if fast_lane else 'full'} "
+              f"book={result['book_used']} model={model_for(result['book_used'])} "
+              f"max_tokens={max_tokens} tokens={result['tokens']}")
 
-    # Surface fast vs full so latency wins are visible per turn. max_tokens is the cap we
-    # imposed; tokens is what the call actually used (prompt + completion).
-    print(f"[cognition] lane={'fast' if fast_lane else 'full'} "
-          f"book={result['book_used']} model={model_for(result['book_used'])} "
-          f"max_tokens={max_tokens} tokens={result['tokens']}")
+        # Mood first (pulls + removes the [mood: x] tag), then strip any leaked analysis
+        # scaffolding so only her spoken reply remains.
+        response, mood = _extract_mood(result["raw_text"])
+        response = _strip_analysis(response)
+        # …then unwrap a reply the model handed back entirely inside quotes.
+        response = _strip_quote_wrap(response)
+        # Deliverables only: drop any section header the combine left empty (bare
+        # 'CONTEXT:' with no body) so a hollow skeleton can never render.
+        if ctx.get("deliverable"):
+            response = _drop_empty_sections(response)
+        if response.strip():
+            break
+        # A reasoning model (gpt-oss, Nemotron) can spend a small cap thinking and
+        # return no content — an empty bubble. That is a failed book: try the next.
+        print(f"[cognition] {result['book_used']} returned an empty reply — next book")
+        response = None
 
-    # Mood first (pulls + removes the [mood: x] tag), then strip any leaked analysis
-    # scaffolding so only her spoken reply remains.
-    response, mood = _extract_mood(result["raw_text"])
-    response = _strip_analysis(response)
-    # …then unwrap a reply the model handed back entirely inside quotes.
-    response = _strip_quote_wrap(response)
-    # Deliverables only: drop any section header the combine left empty (bare 'CONTEXT:'
-    # with no body) so a hollow skeleton can never render. Full sections pass untouched.
-    if ctx.get("deliverable"):
-        response = _drop_empty_sections(response)
+    if response is None:
+        # Never an empty reply. On the action path the tool already ran, so say
+        # truthfully whether it succeeded rather than implying nothing happened.
+        if action_result is not None and action_result.get("ok"):
+            text = ("That's done, Sir — it's saved — but my reply didn't come through. "
+                    "Ask me to show it.")
+        elif action_result is not None:
+            text = "That didn't go through, Sir, and my reply failed too — try again."
+        else:
+            text = "Something's off with my connection, Sir. Give me a moment."
+        return {"response": text, "mood": "neutral", "provider_used": "none", "tokens": 0}
 
     # Persist the turn + mine durable facts — same path /chat uses, off the loop.
     message = ctx.get("message") or ctx.get("query", "")

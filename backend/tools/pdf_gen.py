@@ -1,6 +1,7 @@
 import os
 import re
 import time
+from xml.sax.saxutils import escape as xml_escape
 
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -70,4 +71,60 @@ def make_pdf(title: str, body_text: str, out_dir: str = "outputs") -> str:
             story.append(Paragraph(line, styles["Normal"]))
 
     doc.build(story)
+    return path
+
+
+def make_invoice_pdf(number: str, business: str, business_contact: str, client: str,
+                     client_contact: str, item: str, amount: float, currency: str,
+                     issued: str, due: str, status: str = "", out_dir: str = "outputs") -> str:
+    """One-line-item invoice: from / bill-to, number + dates, the line item and total.
+    Amounts are printed with the currency CODE (INR 50,000.00) — the default fonts
+    have no ₹ glyph. Returns the saved file path."""
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{number.lower().replace('-', '_')}_{_slug(client)}.pdf")
+    styles = getSampleStyleSheet()
+    total = f"{currency} {amount:,.2f}"
+    doc = SimpleDocTemplate(path, leftMargin=0.9 * inch, rightMargin=0.9 * inch,
+                            topMargin=0.9 * inch, bottomMargin=0.9 * inch)
+
+    def esc(text):
+        # Paragraph text is XML: "Dina Films & Media" must not break the build.
+        return xml_escape(_clean(str(text or "")))
+
+    def para(text, style="Normal"):
+        return Paragraph(esc(text).replace("\n", "<br/>"), styles[style])
+
+    def block(label, *lines):
+        return Paragraph(f"<b>{label}</b><br/>" + "<br/>".join(esc(l) for l in lines if l),
+                         styles["Normal"])
+
+    meta = Table([["Invoice", number], ["Issued", issued], ["Due", due]]
+                 + ([["Status", status.upper()]] if status else []),
+                 colWidths=[1.0 * inch, 1.8 * inch])
+    meta.setStyle(TableStyle([("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                              ("ALIGN", (1, 0), (1, -1), "RIGHT")]))
+    parties = Table([[block("From", business, business_contact),
+                      block("Bill to", client, client_contact)]],
+                    colWidths=[3.3 * inch, 3.3 * inch])
+    parties.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    lines = Table([["Description", "Amount"], [para(item), total], ["Total", total]],
+                  colWidths=[4.9 * inch, 1.7 * inch])
+    lines.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.black),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    doc.build([
+        Paragraph("INVOICE", styles["Title"]),
+        HRFlowable(width="100%", thickness=1, spaceBefore=2, spaceAfter=10),
+        meta, Spacer(1, 16), parties, Spacer(1, 22), lines, Spacer(1, 18),
+        para(f"Payment due by {due}. Please quote {number} with your payment."),
+    ])
     return path

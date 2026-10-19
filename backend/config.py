@@ -67,6 +67,10 @@ class Config:
     # describe the product ONLY with this text, so set it to what Studio OS really is.
     STUDIO_OS_PITCH = os.getenv(
         "STUDIO_OS_PITCH", "Studio OS, software I'm building for creative studios")
+    # The "from" block on invoice PDFs.
+    BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Prithvi")
+    BUSINESS_CONTACT = os.getenv("BUSINESS_CONTACT", "") or os.getenv("GMAIL_ADDRESS", "")
+    INVOICE_DUE_DAYS = int(os.getenv("INVOICE_DUE_DAYS", "14"))
 
     # Anchored to backend/ so writer and scheduler (and every other consumer)
     # always open the same file, independent of CWD.

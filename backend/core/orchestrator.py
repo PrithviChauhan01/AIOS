@@ -13,7 +13,8 @@ from core.cognition import cognition_pass
 from core.greeting import detect_greeting, greeting_reply
 from core.looper import run_looper
 from core.action_dispatch import (
-    LEADS_TABLE_VERBS, detect_action, run_action, action_material, fn_name,
+    BUSINESS_TABLE_VERBS, LEADS_TABLE_VERBS, detect_action, run_action, action_material,
+    fn_name,
 )
 from agents.leadgen import LeadgenTeacher, get_cached_leadgen, is_export_request
 from agents.study import StudyTeacher
@@ -348,6 +349,8 @@ async def _handle_message(message: str, session_id: str, voice_flag: bool,
         # The leads pipeline / follow-up list is a table — same deliverable room.
         if action.get("tool") == "leads" and action["action"] in LEADS_TABLE_VERBS:
             ctx["deliverable"] = True
+        if action.get("tool") == "business" and action["action"] in BUSINESS_TABLE_VERBS:
+            ctx["deliverable"] = True
         # Hand the retrieved material's sensitivity tier to the cloud guard in
         # cognition. The guard there (not this call site) decides cloud vs local for
         # ALL tiers and tools — private AND secret force local. This stays generic:
@@ -373,7 +376,8 @@ async def _handle_message(message: str, session_id: str, voice_flag: bool,
             "domain": domain,
             "sensitivity": sensitivity,
             "trace_id": trace_id,
-            "file_path": None,
+            # A real file an action wrote (invoice PDF) — surfaced like a teacher export.
+            "file_path": res.get("file_path") if res.get("ok") else None,
         }
 
     # ── EXPORT FOLLOW-UP OVERRIDE ──

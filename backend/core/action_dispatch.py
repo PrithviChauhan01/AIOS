@@ -156,6 +156,26 @@ _LEADS_FN_NAME = {
 # Pipeline reads render as a deliverable table, not a one-line confirmation.
 LEADS_TABLE_VERBS = ("pipeline", "list_stage", "due")
 
+# Clients / projects / invoices (Slice B4) — parsed by core.business_parse.
+_BUSINESS_FN_NAME = {
+    "add_client": "add_client",
+    "client_from_lead": "client_from_lead",
+    "add_project": "add_project",
+    "update_project": "update_project",
+    "create_invoice": "create_invoice",
+    "mark_invoice": "mark_invoice",
+    "invoice_pdf": "invoice_pdf",
+    "due_week": "due_this_week",
+    "list_clients": "list_clients",
+    "unpaid": "unpaid_invoices",
+}
+BUSINESS_TABLE_VERBS = ("due_week", "list_clients", "unpaid")
+
+# session_id -> lead_id after a lead was marked WON and has no client yet: the NEXT
+# turn may accept ("yes") the offer to create the client. One turn only — anything
+# else drops the offer and the line routes normally.
+_CLIENT_OFFER: dict = {}
+
 # Study gate: reporting/listing a study session. A study verb paired with a
 # duration/session/day word ("studied DP for two hours today"), an explicit log
 # verb on a study noun, or a listing ask. Specific enough to keep the extractor off
@@ -775,6 +795,16 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
         return {"tool": "email", "action": "need_address",
                 "session_id": session_id, "raw_message": msg}
 
+    # 0.6 CLIENT OFFER — last turn a lead was marked won and I offered to make it a
+    # client. A plain yes accepts; anything else drops the offer (one confirm only).
+    lead_id = _CLIENT_OFFER.pop(session_id, None)
+    if lead_id is not None and _AFFIRM.search(msg) and not _NEGATE.search(msg):
+        return {"tool": "business", "action": "client_from_lead", "lead_id": lead_id,
+                "session_id": session_id, "raw_message": msg}
+    if lead_id is not None and _NEGATE.search(msg) and len(msg.split()) <= 4:
+        return {"tool": "business", "action": "decline_offer", "lead_id": lead_id,
+                "session_id": session_id, "raw_message": msg}
+
     # 1–7. Tool gates in order; a line that gates but fails extraction can fall
     # through to the next tool's gate.
     if _GATE.search(msg):
@@ -800,6 +830,10 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
     if outreach is not None:
         return {"tool": "email", "action": "lead_draft", **outreach,
                 "session_id": session_id}
+    from core.business_parse import parse_business_command
+    business = parse_business_command(msg)
+    if business is not None:
+        return {"tool": "business", **business, "session_id": session_id}
     pipeline = parse_pipeline_command(msg)
     if pipeline is not None:
         return {"tool": "leads", **pipeline, "session_id": session_id}
@@ -866,6 +900,7 @@ _PUBLIC_REFUSAL_NOUN = {
     "leads": "save leads",
     "study": "log study sessions",
     "habits": "track habits",
+    "business": "manage clients, projects or invoices",
 }
 
 
@@ -910,6 +945,8 @@ _WRITE_VERBS = {
     "fitness": {"log"},
     "study": {"log"},
     "habits": {"mark"},
+    "business": {"add_client", "client_from_lead", "add_project", "update_project",
+                 "create_invoice", "mark_invoice"},
     "email": {"draft", "send", "revise", "cancel", "cancel_awaiting", "lead_draft", "set_to"},
 }
 
@@ -1077,6 +1114,8 @@ def _execute(action: dict) -> dict:
         return _run_fitness(action)
     if action.get("tool") == "leads":
         return _run_leads(action)
+    if action.get("tool") == "business":
+        return _run_business(action)
     if action.get("tool") == "study":
         return _run_study(action)
     if action.get("tool") == "habits":
@@ -1312,7 +1351,14 @@ def _run_leads(action: dict) -> dict:
                     "ask": "I have no search results in hand to save, Sir — "
                            "run the search first, then tell me to save them."}
         if verb == "stage":
-            return tool.set_stage(action.get("name"), action.get("stage"), action.get("when"))
+            res = tool.set_stage(action.get("name"), action.get("stage"), action.get("when"))
+            # Won, and no client yet → offer to create one; the NEXT turn's "yes" does it.
+            if res.get("ok") and res["lead"]["stage"] == "won":
+                btool = get_tool("business")
+                if btool is not None and btool.client_for_lead(res["lead"]["id"]) is None:
+                    _CLIENT_OFFER[action.get("session_id", "default")] = res["lead"]["id"]
+                    res = {**res, "offer_client": True}
+            return res
         if verb == "note":
             return tool.add_note(action.get("name"), action.get("text"))
         if verb == "follow_up":
@@ -1328,6 +1374,44 @@ def _run_leads(action: dict) -> dict:
         print(f"[orch] leads action {verb} failed: {e}")
         return {"ok": False, "error": str(e)}
     return {"ok": False, "error": f"unknown leads verb {verb}"}
+
+
+def _run_business(action: dict) -> dict:
+    """Execute a clients/projects/invoices action against the REAL BusinessTool."""
+    name = "business"
+    if not is_action_tool(name):
+        return {"ok": False, "error": f"{name} is not an action tool"}
+    tool = get_tool(name)
+    verb = action["action"]
+    a = action.get
+    try:
+        if verb == "add_client":
+            return tool.add_client(a("name"), a("contact"))
+        if verb == "client_from_lead":
+            return tool.client_from_lead(a("lead_id"))
+        if verb == "decline_offer":
+            return {"ok": True, "declined": True}
+        if verb == "add_project":
+            return tool.add_project(a("client"), a("title"), a("deadline"), a("fee"))
+        if verb == "update_project":
+            return tool.update_project(a("title"), a("status"), a("deadline"))
+        if verb == "create_invoice":
+            return tool.create_invoice(a("target"), a("amount"), a("due"),
+                                       a("currency") or "INR")
+        if verb == "mark_invoice":
+            return tool.mark_invoice(a("target"), a("status"))
+        if verb == "invoice_pdf":
+            return tool.invoice_pdf(a("target"))
+        if verb == "due_week":
+            return {"ok": True, **tool.due_this_week()}
+        if verb == "list_clients":
+            return {"ok": True, "items": tool.list_clients()}
+        if verb == "unpaid":
+            return {"ok": True, "items": tool.unpaid_invoices()}
+    except Exception as e:
+        print(f"[orch] business action {verb} failed: {e}")
+        return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": f"unknown business verb {verb}"}
 
 
 def _run_study(action: dict) -> dict:
@@ -1419,6 +1503,8 @@ def fn_name(action: dict) -> str:
         return _FITNESS_FN_NAME.get(verb, verb)
     if action.get("tool") == "leads":
         return _LEADS_FN_NAME.get(verb, verb)
+    if action.get("tool") == "business":
+        return _BUSINESS_FN_NAME.get(verb, verb)
     if action.get("tool") == "study":
         return _STUDY_FN_NAME.get(verb, verb)
     if action.get("tool") == "habits":
@@ -1442,6 +1528,8 @@ def action_material(action: dict, res: dict) -> str:
         return _fitness_material(action.get("action"), res)
     if action.get("tool") == "leads":
         return _leads_material(action.get("action"), res)
+    if action.get("tool") == "business":
+        return _business_material(action.get("action"), res)
     if action.get("tool") == "study":
         return _study_material(action.get("action"), res)
     if action.get("tool") == "habits":
@@ -1725,9 +1813,11 @@ def _pipeline_material(verb: str, res: dict) -> str:
     if verb == "stage":
         follow_line = (f" Next follow-up: {follow}." if follow
                        else " No follow-up is scheduled.")
+        offer = (f" Then ASK Sir one short question: shall I create a client from {name}? "
+                 "(yes/no)" if res.get("offer_client") else "")
         return (f"ACTION EXECUTED — {name} moved from {res.get('from_stage')} to "
                 f"{lead.get('stage')}.{follow_line} Confirm to Sir in one sentence that "
-                "states BOTH the new stage and the follow-up line above.")
+                f"states BOTH the new stage and the follow-up line above.{offer}")
     if verb == "note":
         return (f"ACTION EXECUTED — note added to {name}: \"{res.get('note')}\". "
                 "Confirm briefly.")
@@ -1783,6 +1873,102 @@ def _leads_material(verb: str, res: dict) -> str:
     )
     return ("ACTION EXECUTED — these are Sir's saved leads. Present them "
             "cleanly:\n" + lines)
+
+
+def _reminder_line(res: dict, what: str) -> str:
+    rem = res.get("reminder")
+    if rem is None:
+        return ""
+    if rem.get("ok"):
+        return f" A reminder is set for {rem.get('due_at')} ({what})."
+    return f" The {what} reminder could NOT be set — say so."
+
+
+def _business_material(verb: str, res: dict) -> str:
+    """Clients/projects/invoices results for cognition — only what really happened."""
+    from tools.business import money
+    if verb == "decline_offer":
+        return "ACTION EXECUTED — no client was created, as Sir declined. Acknowledge briefly."
+    if not res.get("ok"):
+        return ("ACTION NOT DONE — nothing was changed "
+                f"({res.get('needs') or res.get('error')}). Do NOT claim it was done. "
+                f"Put this to Sir: {res.get('ask') or res.get('error')}")
+
+    if verb in ("add_client", "client_from_lead"):
+        c = res["client"]
+        if res.get("already"):
+            return f"ACTION EXECUTED — {c['name']} was already a client (#{c['id']}). Say so briefly."
+        src = f", created from lead #{c['lead_id']}" if c.get("lead_id") else ""
+        return (f"ACTION EXECUTED — client {c['name']} added (#{c['id']}{src}"
+                + (f", contact {c['contact']}" if c.get("contact") else "")
+                + f"). Confirm in one sentence that names {c['name']} as the new client.")
+    if verb == "add_project":
+        p = res["project"]
+        extra = "".join([f", deadline {p['deadline']}" if p.get("deadline") else "",
+                         f", fee {money(p['fee'])}" if p.get("fee") else ""])
+        return (f"ACTION EXECUTED — project \"{p['title']}\" added for {p['client']} "
+                f"(status {p['status']}{extra}).{_reminder_line(res, 'deadline')} Confirm briefly.")
+    if verb == "update_project":
+        p = res["project"]
+        changes = []
+        if p["status"] != res.get("from_status"):
+            changes.append(f"status {res.get('from_status')} → {p['status']}")
+        if p.get("deadline") != res.get("from_deadline"):
+            changes.append(f"deadline {res.get('from_deadline') or 'none'} → {p['deadline']}")
+        return (f"ACTION EXECUTED — project \"{p['title']}\" ({p['client']}): "
+                f"{'; '.join(changes) or 'no change'}.{_reminder_line(res, 'deadline')} "
+                "Confirm briefly.")
+    if verb == "create_invoice":
+        i = res["invoice"]
+        return (f"ACTION EXECUTED — invoice {i['number']} created as a DRAFT for {i['client']} "
+                f"(\"{i['project']}\"): {money(i['amount'], i['currency'])}, issued "
+                f"{i['issued_at']}, due {i['due_at']}.{_reminder_line(res, 'due date')} "
+                "It is NOT sent — say so. Do NOT offer to send it: there is no invoice-"
+                "sending action; Sir sends it himself and says 'mark it sent'. Confirm briefly.")
+    if verb == "mark_invoice":
+        i = res["invoice"]
+        late = " — it is past its due date, so it shows as OVERDUE" if i["status"] == "overdue" else ""
+        return (f"ACTION EXECUTED — invoice {i['number']} ({i['client']}, "
+                f"{money(i['amount'], i['currency'])}) marked {i['status']}{late}. Confirm briefly.")
+    if verb == "invoice_pdf":
+        i = res["invoice"]
+        return (f"ACTION EXECUTED — PDF of invoice {i['number']} for {i['client']} "
+                f"({money(i['amount'], i['currency'])}, due {i['due_at']}) written to "
+                f"{res['file_path']}. Name the file; do not list its contents.")
+
+    if verb == "list_clients":
+        items = res.get("items") or []
+        if not items:
+            return "ACTION EXECUTED — there are NO clients yet. Tell Sir plainly."
+        rows = "\n".join(
+            f"| {c['name']} | {c.get('contact') or '—'} | {c['projects']} | "
+            f"{', '.join(money(u['total'], u['currency']) for u in c['unpaid']) or '—'} |"
+            for c in items)
+        return (f"ACTION EXECUTED — Sir's clients ({len(items)}). Present this table exactly:"
+                "\n\n| Client | Contact | Projects | Unpaid |\n|---|---|---|---|\n" + rows)
+    if verb == "unpaid":
+        items = res.get("items") or []
+        if not items:
+            return "ACTION EXECUTED — there are NO unpaid invoices. Tell Sir plainly."
+        rows = "\n".join(
+            f"| {i['number']} | {i['client']} | {money(i['amount'], i['currency'])} | "
+            f"{i['due_at']} | {i['status']} |" for i in items)
+        return (f"ACTION EXECUTED — unpaid invoices ({len(items)}, soonest due first). Present "
+                "this table exactly:\n\n| Invoice | Client | Amount | Due | Status |\n"
+                "|---|---|---|---|---|\n" + rows)
+    # due_week
+    projects, invoices = res.get("projects") or [], res.get("invoices") or []
+    if not projects and not invoices:
+        return (f"ACTION EXECUTED — nothing is due between today and {res.get('until')}: no "
+                "project deadlines and no unpaid invoices. Tell Sir plainly.")
+    rows = [(p["deadline"], f"| {p['deadline']} | Deadline | {p['title']} ({p['client']}) | {p['status']} |")
+            for p in projects]
+    rows += [(i["due_at"], f"| {i['due_at']} | Invoice {i['number']} | {i['client']} — "
+                           f"{money(i['amount'], i['currency'])} | {i['status']} |") for i in invoices]
+    table = "\n".join(r for _, r in sorted(rows))
+    return (f"ACTION EXECUTED — due by {res.get('until')} (anything earlier is already late). "
+            "Present this table exactly:\n\n| Date | What | Detail | Status |\n"
+            "|---|---|---|---|\n" + table)
 
 
 def _study_material(verb: str, res: dict) -> str:

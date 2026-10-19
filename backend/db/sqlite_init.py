@@ -194,6 +194,48 @@ CREATE INDEX IF NOT EXISTS idx_traces_ts_start       ON traces (ts_start);
 
 SCHEMA += TRACE_DDL
 
+# Clients / projects / invoices (Slice B4). New tables only — CREATE IF NOT EXISTS
+# never touches an existing database's rows. Kept separate so tools/business.py can
+# create them on a database that never ran init_sqlite (tests, scripts).
+BUSINESS_DDL = """
+CREATE TABLE IF NOT EXISTS clients (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    contact     TEXT,
+    lead_id     INTEGER REFERENCES leads(id),
+    notes       TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id   INTEGER NOT NULL REFERENCES clients(id),
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'planned',  -- planned | active | review | done
+    deadline    DATE,
+    fee         REAL,
+    notes       TEXT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id),
+    number      TEXT NOT NULL UNIQUE,              -- INV-YYYY-NNN
+    amount      REAL NOT NULL,
+    currency    TEXT NOT NULL DEFAULT 'INR',
+    issued_at   DATE NOT NULL,
+    due_at      DATE NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'draft',     -- draft | sent | paid | overdue
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_client ON projects (client_id);
+CREATE INDEX IF NOT EXISTS idx_invoices_project ON invoices (project_id);
+"""
+
+SCHEMA += BUSINESS_DDL
+
 # Columns added to a table AFTER it first shipped. CREATE TABLE IF NOT EXISTS is a
 # no-op on a database that already has the older table, so each one needs an explicit
 # ALTER. Idempotent and additive by construction: a missing column is added, an

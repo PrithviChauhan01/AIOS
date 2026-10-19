@@ -14,6 +14,7 @@ from tools.documents import DocumentsTool
 from tools.mailer import EmailTool
 from tools.fitness import FitnessTool
 from tools.leads import LeadsTool
+from tools.business import BusinessTool
 from tools.study import StudyTool
 from tools.habits import HabitsTool
 
@@ -29,6 +30,7 @@ _REGISTRY = {
     "email": EmailTool(),           # ACTION — first EXTERNAL action, confirm-gated
     "fitness": FitnessTool(),       # ACTION — logs PRs/workouts to fitness_logs
     "leads": LeadsTool(),           # ACTION — persists prospecting rows (bulk)
+    "business": BusinessTool(),     # ACTION — clients / projects / invoices
     "study": StudyTool(),           # ACTION — logs study sessions
     "habits": HabitsTool(),         # ACTION — daily habit marks/checks
 }

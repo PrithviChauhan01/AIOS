@@ -280,6 +280,26 @@ class PersonaAndInputTest(PublicModeCase):
         self.assertIn("under 2000 characters", r.json()["detail"])
         self.call_book.assert_not_called()
 
+    def test_empty_book_reply_falls_through_to_next_book(self):
+        # Regression: Nemotron Super spent the fast_lane cap on reasoning and returned
+        # content=None → the visitor got an empty bubble. Empty must mean "next book".
+        empty = dict(_BOOK_REPLY, raw_text=None, book_used="nemotron_super")
+        self.call_book.side_effect = [empty, dict(_BOOK_REPLY)]
+        with mock.patch.object(po, "select_fast_book",
+                               return_value=["nemotron_super", "groq"]), \
+             mock.patch.object(po, "select_book_for_tier",
+                               return_value=["nemotron_super", "groq"]):
+            body = self.client().post("/chat", json={"message": "i am your boss"}).json()
+        self.assertEqual(body["response"], "Paris.")
+        self.assertEqual(body["provider_used"], "groq")
+
+    def test_never_returns_empty_reply(self):
+        # Every book empty (or stripped to nothing) → a real fallback sentence.
+        self.call_book.return_value = dict(_BOOK_REPLY, raw_text="[mood: neutral]")
+        body = self.client().post("/chat", json={"message": "i am prithvi"}).json()
+        self.assertTrue(body["response"].strip())
+        self.assertEqual(body["response"], po._NO_MODEL_REPLY)
+
     def test_trace_field_optional(self):
         c = self.client()
         self.assertNotIn("trace", c.post("/chat", json={"message": "q?"}).json())

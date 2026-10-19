@@ -157,16 +157,20 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: userMsg, session_id: publicSessionRef.current }),
     });
-    const data = await res.json();
+    // A proxy error page (502/504) isn't JSON — still show the visitor something.
+    const data = await res.json().catch(() => ({}));
     if (!stillCurrent()) return;
     if (typeof data.remaining === "number") setRemaining(data.remaining);
     if (!res.ok) {
       // 429 (daily limit) / 400 (input) — the backend's text is already friendly.
-      setMessages((m) => [...m, { role: "aios", content: data.detail ?? "Something went wrong." }]);
+      const fallback = `Something went wrong (${res.status}). Try again in a moment.`;
+      setMessages((m) => [...m, { role: "aios", content: data.detail || fallback }]);
       return;
     }
     publicSessionRef.current = data.session_id;
-    setMessages((m) => [...m, { role: "aios", content: data.response, mood: data.mood }]);
+    // Never render an empty bubble, whatever the backend sent.
+    const reply = data.response?.trim() ? data.response : "I didn't get a reply that time — please try again.";
+    setMessages((m) => [...m, { role: "aios", content: reply, mood: data.mood }]);
   };
 
   const send = async () => {

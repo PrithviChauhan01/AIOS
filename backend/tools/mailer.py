@@ -75,8 +75,8 @@ def _parse_subject_body(text: str):
 @with_retry
 def _compose_call(messages: list):
     return _groq().chat.completions.create(
-        model="llama-3.3-70b-versatile", messages=messages,
-        max_tokens=400, temperature=0.4, timeout=CLOUD_TIMEOUT)
+        model="openai/gpt-oss-120b", messages=messages,
+        max_tokens=400, reasoning_effort="low", temperature=0.4, timeout=CLOUD_TIMEOUT)
 
 
 def _compose(recipient: str, topic: str, instruction: str):

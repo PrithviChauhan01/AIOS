@@ -28,7 +28,8 @@ Rules:
 def _extract_call(user_message: str, assistant_response: str):
     """The one outbound call — wrapped so a hung/rate-limited extractor is bounded."""
     return client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
+        reasoning_effort="low",  # thinking counts against the 256-token cap
         messages=[
             {"role": "system", "content": EXTRACT_PROMPT},
             {"role": "user", "content": f"User said: {user_message}\nAssistant replied: {assistant_response}"}

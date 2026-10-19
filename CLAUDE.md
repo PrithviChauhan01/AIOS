@@ -49,7 +49,7 @@ Request flow for a chat turn (`POST /chat` in `backend/api/chat_routes.py`):
 The split matters: SQLite is "what was said," Chroma is "what to remember." `get_relevant_facts` does a semantic query against Chroma on every turn to build context; raw history comes from SQLite.
 
 ### Provider routing
-`core/router.py` tries providers in a fixed order (Groq `llama-3.3-70b-versatile`, then Cerebras `qwen-3-32b`), returning the first success along with `provider_used` and `tokens_used`. Add a new provider by writing a `_try_*` function and inserting it into the list in `chat()`. The fact extractor (`core/extractor.py`) is hardcoded to Groq and fails silently — it must never break the main chat flow.
+`core/router.py` tries providers in a fixed order (Groq `openai/gpt-oss-120b`, then Cerebras `gpt-oss-120b`), returning the first success along with `provider_used` and `tokens_used`. Add a new provider by writing a `_try_*` function and inserting it into the list in `chat()`. The fact extractor (`core/extractor.py`) is hardcoded to Groq and fails silently — it must never break the main chat flow.
 
 ### Identity / system prompt
 The assistant persona lives entirely in `SYSTEM_PROMPT` in `core/router.py`: terse, formal, addresses the user as "Sir." If a change touches tone or behavior of responses, that constant is the source of truth.

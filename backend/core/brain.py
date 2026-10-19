@@ -54,7 +54,7 @@ import re
 from config import Config
 from core.net import CLOUD_TIMEOUT, with_retry
 
-# ── The dedicated brain model — Groq llama-3.3-70b-versatile. ──
+# ── The dedicated brain model — Groq openai/gpt-oss-120b (llama-3.3 retired 2026-08-16). ──
 # On api.groq.com, keyed by GROQ_API_KEY. It reuses core.books' shared Groq client (the
 # same one the Groq answer book rides), so the brain and the answer book share ONE Groq
 # connection pool AND one quota — an accepted trade: on a 429 the call raises and plan()
@@ -62,7 +62,7 @@ from core.net import CLOUD_TIMEOUT, with_retry
 # failure. Groq is fast enough (sub-second to a few seconds) that the brain step stays
 # imperceptible per turn — the earlier NVIDIA-NIM Qwen brain ran 130-200s/call and was
 # abandoned. The call is capped at _BRAIN_TIMEOUT_S so a slow brain can't hang a turn.
-BRAIN_MODEL = "llama-3.3-70b-versatile"
+BRAIN_MODEL = "openai/gpt-oss-120b"
 _BRAIN_TIMEOUT_S = 8    # a slow brain must never hang a turn — timeout → static fallback
 _BRAIN_MAX_TOKENS = 1200  # room for the composed prompt (~250 words) + the routing JSON
 
@@ -85,6 +85,7 @@ def _call_brain_sync(prompt: str) -> str:
         messages=[{"role": "user", "content": prompt}],
         max_tokens=_BRAIN_MAX_TOKENS,
         timeout=CLOUD_TIMEOUT,
+        reasoning_effort="low",  # gpt-oss thinking counts against max_tokens and the 8s cap
     )
     return r.choices[0].message.content or ""
 

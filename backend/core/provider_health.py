@@ -93,6 +93,7 @@ _RATE_LIMIT_STATUS = 429
 _PROVIDER_OF_BOOK = {
     "groq": "groq",
     "groq_fast": "groq",          # same api.groq.com key as groq
+    "groq_qwen": "groq",
     "cerebras": "cerebras",
     "mistral": "mistral",
     "gpt4o": "openai",

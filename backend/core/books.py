@@ -33,8 +33,10 @@ _CONTEXT   = {"small": 0, "med": 1, "large": 2, "huge": 3}
 _COST      = {"free": 0, "ltd": 1}  # lower is cheaper, cheaper preferred
 
 _MODELS = {
-    "groq":     "llama-3.3-70b-versatile",
-    "groq_fast":"llama-3.1-8b-instant",
+    # Groq retired the llama-3.x models on 2026-08-16 — gpt-oss replaces both tiers.
+    "groq":     "openai/gpt-oss-120b",
+    "groq_fast":"openai/gpt-oss-20b",
+    "groq_qwen":"qwen/qwen3.8-27b",   # same Groq key, separate per-model quota
     "cerebras":"gpt-oss-120b",
     "mistral":  "mistral-large-latest",
     "gpt4o":    "gpt-4o",
@@ -86,7 +88,9 @@ def _available(book: str) -> bool:
 # the local book → nothing (the caller's loop finds no book and cognition returns
 # its existing degradation line). A turn never escalates past the local book.
 def _closed(book: str) -> bool:
-    return health.allow_book(book)
+    # An unconfigured book (no key / no SDK) is as dead as an open circuit — and,
+    # like one, never relaxed. _CONFIGURED is computed once at import, below.
+    return book in _CONFIGURED and health.allow_book(book)
 
 
 def _usable(book: str) -> bool:
@@ -147,9 +151,9 @@ def _fit_key(book: str, spec: dict):
 # dropped here and the caller simply falls through to the next one.
 def _hard_reasoning_order(loop_worthy, complexity) -> list:
     if loop_worthy:
-        return ["nemotron_ultra", "nemotron_super", "groq", "cerebras"]
+        return ["nemotron_ultra", "nemotron_super", "groq", "groq_qwen", "cerebras"]
     if complexity == "complex":
-        return ["nemotron_super", "groq", "cerebras"]
+        return ["nemotron_super", "groq", "groq_qwen", "cerebras"]
     return []
 
 def select_book(capability_spec: dict, sensitivity_tier: str,
@@ -209,9 +213,9 @@ def select_book(capability_spec: dict, sensitivity_tier: str,
 # fallback); Groq 70b → Cerebras is the quota-fallback tail once Nemotron is exhausted
 # or benched. 'fast' stays Groq-only — formats/light reasoning don't need Nemotron.
 _TIER_BOOKS = {
-    "fast":     ["groq", "cerebras"],                                          # formats/light reasoning
-    "strong":   ["nemotron_super", "nemotron_ultra", "groq", "cerebras"],      # real reasoning
-    "frontier": ["nemotron_super", "nemotron_ultra", "groq", "cerebras"],      # hardest
+    "fast":     ["groq", "groq_qwen", "cerebras"],                                     # formats/light reasoning
+    "strong":   ["nemotron_super", "nemotron_ultra", "groq", "groq_qwen", "cerebras"], # real reasoning
+    "frontier": ["nemotron_super", "nemotron_ultra", "groq", "groq_qwen", "cerebras"], # hardest
 }
 _TIER_ORDER = ["fast", "strong", "frontier"]
 _DEFAULT_TIER = "fast"
@@ -392,6 +396,44 @@ def key_configured(provider: str) -> bool:
     return bool(getter and (getter() or "").strip())
 
 
+# ── Startup configuration gate ──
+# A book whose key or SDK is missing would fail on every single call (gpt4o and
+# mistral on most installs). Decide once at import, log once, and keep it out of
+# selection entirely instead of spending a turn rediscovering it.
+_PROVIDER_PACKAGE = {
+    "groq": "groq",
+    "cerebras": "cerebras.cloud.sdk",
+    "nvidia": "openai",
+    "openai": "openai",
+    "mistral": "mistralai",
+    "ollama": "ollama",
+}
+
+
+def _package_present(name: str) -> bool:
+    import importlib.util
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:  # parent package missing (cerebras.cloud.sdk)
+        return False
+
+
+def _configured_books() -> set:
+    ok = set()
+    for book in _MODELS:
+        provider = provider_of(book)
+        if not key_configured(provider):
+            print(f"[books] {book} disabled — no API key for {provider}")
+        elif not _package_present(_PROVIDER_PACKAGE.get(provider, provider)):
+            print(f"[books] {book} disabled — package for {provider} not installed")
+        else:
+            ok.add(book)
+    return ok
+
+
+_CONFIGURED = _configured_books()
+
+
 def ping_provider(provider: str) -> dict:
     """BLOCKING reachability check for one provider (run it off the event loop).
     Returns {ok, ms, error} — measured, never inferred."""
@@ -432,14 +474,25 @@ def _usage(u) -> tuple:
 def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq"], messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens), reasoning_effort="low")
     return (r.choices[0].message.content, *_usage(r.usage))
 
+# gpt-oss is a reasoning model and its thinking counts against max_tokens — "low"
+# keeps a 150-token fast-lane cap from being spent before the answer starts.
 @with_retry(provider="groq")
 def _call_groq_fast(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
         model=_MODELS["groq_fast"], messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens, timeout=timeout_for(max_tokens))
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens), reasoning_effort="low")
+    return (r.choices[0].message.content, *_usage(r.usage))
+
+# Qwen on Groq — the alternative when gpt-oss-120b is rate-limited (Groq quotas are
+# per model). Thinking off: it is a fallback voice, not a reasoning pass.
+@with_retry(provider="groq")
+def _call_groq_qwen(prompt: str, max_tokens: int = _MAX_TOKENS):
+    r = groq_client().chat.completions.create(
+        model=_MODELS["groq_qwen"], messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens, timeout=timeout_for(max_tokens), reasoning_effort="none")
     return (r.choices[0].message.content, *_usage(r.usage))
 
 @with_retry(provider="cerebras")
@@ -463,17 +516,21 @@ def _call_gpt4o(prompt: str, max_tokens: int = _MAX_TOKENS):
         max_tokens=max_tokens, timeout=timeout_for(max_tokens))
     return (r.choices[0].message.content, *_usage(r.usage))
 
-# Nemotron Super — standard chat completion, no reasoning-budget params.
+# Nemotron Super — thinks by DEFAULT, and the thinking counts against max_tokens: on a
+# 150-token fast-lane cap it spent the whole budget reasoning and returned
+# content=None (the public-mode empty bubble). Thinking off; Ultra is the reasoning book.
 @with_retry(provider="nvidia")
 def _call_nemotron_super(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = nvidia_client().chat.completions.create(
         model=_MODELS["nemotron_super"], messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens, timeout=LONG_TIMEOUT)
-    return (r.choices[0].message.content, *_usage(r.usage))
+        max_tokens=max_tokens, timeout=LONG_TIMEOUT,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    answer = _THINK_BLOCK_RE.sub("", r.choices[0].message.content or "").strip()
+    return (answer, *_usage(r.usage))
 
 # Nemotron Ultra — a REASONING model. It thinks in message.reasoning_content and
 # answers in message.content. We:
-#   * turn thinking on + give it a real budget (extra_body),
+#   * turn thinking on (extra_body) and size max_tokens for a real reasoning budget,
 #   * pass the caller's cap as the FINAL-ANSWER budget and add the reasoning budget ON
 #     TOP — the API's max_tokens covers reasoning + content together, so if we only sent
 #     max(cap, budget) a long think would eat the window and the visible answer would cut
@@ -494,8 +551,9 @@ def _call_nemotron_ultra(prompt: str, max_tokens: int = _MAX_TOKENS):
         max_tokens=api_max,
         # Always the long budget: even a small answer cap sits behind a 16k reasoning pass.
         timeout=LONG_TIMEOUT,
-        extra_body={"chat_template_kwargs": {"enable_thinking": True},
-                    "reasoning_budget": _ULTRA_REASONING_BUDGET})
+        # No separate thinking-budget param: the endpoint doesn't take it. The budget
+        # is enforced by api_max above (reasoning + answer share max_tokens).
+        extra_body={"chat_template_kwargs": {"enable_thinking": True}})
     msg = r.choices[0].message
     reasoning = getattr(msg, "reasoning_content", None)
     if reasoning:
@@ -528,6 +586,7 @@ def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
 _DISPATCH = {
     "groq": _call_groq,
     "groq_fast": _call_groq_fast,
+    "groq_qwen": _call_groq_qwen,
     "cerebras": _call_cerebras,
     "mistral": _call_mistral,
     "gpt4o": _call_gpt4o,

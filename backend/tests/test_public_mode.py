@@ -1,4 +1,4 @@
-"""Public-mode tests: disabled tools, rate limit, no persistence (+ boot guard, input cap).
+"""Public-mode tests: disabled tools, 5/day rate limit, no persistence (+ boot guard, input cap).
 
 Run from backend/:   venv\\Scripts\\python -m unittest discover -s tests -v
 
@@ -152,36 +152,55 @@ class RateLimitTest(PublicModeCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def test_short_window_20_per_10_minutes(self):
-        for _ in range(20):
-            self.assertTrue(rate_limit.check("1.2.3.4")[0])
-        allowed, retry, msg = rate_limit.check("1.2.3.4")
+    def test_ipv6_shares_quota_per_64(self):
+        for i in range(5):
+            self.assertTrue(rate_limit.check(f"2001:db8:1:2::{i + 1}")[0])
+        self.assertFalse(rate_limit.check("2001:db8:1:2:ffff::9")[0])
+        self.assertTrue(rate_limit.check("2001:db8:1:3::1")[0])  # different /64
+
+    def test_five_per_day_with_remaining(self):
+        for left in (4, 3, 2, 1, 0):
+            allowed, remaining, _, _ = rate_limit.check("1.2.3.4")
+            self.assertTrue(allowed)
+            self.assertEqual(remaining, left)
+        allowed, remaining, retry, msg = rate_limit.check("1.2.3.4")
         self.assertFalse(allowed)
+        self.assertEqual(remaining, 0)
         self.assertGreater(retry, 0)
-        self.assertIn("a little fast", msg)
+        self.assertIn("free AIOS messages", msg)
         self.assertTrue(rate_limit.check("5.6.7.8")[0])  # per IP
-        self.now[0] += 10 * 60 + 1
+        self.now[0] += 24 * 60 * 60 + 1
         self.assertTrue(rate_limit.check("1.2.3.4")[0])
 
-    def test_daily_cap_100(self):
-        for i in range(100):
-            self.now[0] += 31  # 31s apart → never trips the 20/10min window
-            self.assertTrue(rate_limit.check("1.2.3.4")[0], i)
-        self.now[0] += 31
-        allowed, _, msg = rate_limit.check("1.2.3.4")
-        self.assertFalse(allowed)
-        self.assertIn("today's message limit", msg)
-        self.now[0] += 24 * 60 * 60
+    def test_refused_requests_are_not_counted(self):
+        for _ in range(5):
+            rate_limit.check("1.2.3.4")
+        self.now[0] += 60
+        for _ in range(10):
+            self.assertFalse(rate_limit.check("1.2.3.4")[0])
+        # The wait is measured from the FIRST hit, not extended by the refusals.
+        self.now[0] += 24 * 60 * 60 - 60 + 1
         self.assertTrue(rate_limit.check("1.2.3.4")[0])
 
-    def test_endpoint_returns_429_with_friendly_text(self):
+    def test_endpoint_reports_remaining_then_429(self):
         c = self.client()
-        for _ in range(20):
-            self.assertEqual(c.post("/chat", json={"message": "hi"}).status_code, 200)
+        self.assertEqual(c.get("/quota").json(), {"remaining": 5, "limit": 5})
+        for left in (4, 3, 2, 1, 0):
+            r = c.post("/chat", json={"message": "hi"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["remaining"], left)
         r = c.post("/chat", json={"message": "hi"})
         self.assertEqual(r.status_code, 429)
-        self.assertIn("a little fast", r.json()["detail"])
+        self.assertEqual(r.json()["remaining"], 0)
+        self.assertIn("come back tomorrow", r.json()["detail"])
         self.assertIn("Retry-After", r.headers)
+        self.assertEqual(c.get("/quota").json()["remaining"], 0)
+
+    def test_invalid_input_does_not_spend_quota(self):
+        c = self.client()
+        c.post("/chat", json={"message": ""})
+        c.post("/chat", json={"message": "x" * (Config.PUBLIC_MAX_INPUT_CHARS + 1)})
+        self.assertEqual(c.get("/quota").json()["remaining"], 5)
 
 
 class NoPersistTest(PublicModeCase):

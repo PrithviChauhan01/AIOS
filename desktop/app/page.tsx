@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import { useToken } from "@/lib/token-context";
 import { useSession } from "@/lib/session-context";
-import { API_BASE } from "@/lib/api";
+import { ownerFetch, publicFetch } from "@/lib/api";
 import Orb, { type OrbState } from "@/components/Orb";
 
 // AIOS-only markdown rendering (deliverables — numbered lead/job lists, bold
@@ -38,7 +38,7 @@ function moodClass(mood?: Mood): string {
 }
 
 export default function Home() {
-  const { token } = useToken();
+  const { token, logout } = useToken();
   const { sessionId } = useSession();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -46,23 +46,35 @@ export default function Home() {
   const [onboardingQuestion, setOnboardingQuestion] = useState("");
   const [awaitingOnboarding, setAwaitingOnboarding] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
+  // Public mode: free messages left today (null until the backend says), and the
+  // server-issued session id — held in memory only, like the history behind it.
+  const [remaining, setRemaining] = useState<number | null>(null);
+  const publicSessionRef = useRef<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-  // Which session is live RIGHT NOW, readable from inside an awaited send() — the
-  // closure's `sessionId` is whatever it was when the send started, which is exactly
-  // the value we must not trust once New Chat has moved on.
+  // Which session / identity is live RIGHT NOW, readable from inside an awaited
+  // send() — the closure's values are whatever they were when the send started,
+  // which is exactly what we must not trust once New Chat or logout has moved on.
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Restore recent turns for the active session on every mount (including
+  // Every identity or session switch starts from a blank pane — a public chat
+  // never bleeds into the owner's view or vice versa.
+  //
+  // Owner: restore recent turns for the active session on every mount (including
   // remounting after nav away and back — the page component unmounts on route
   // change), and again whenever New Chat swaps sessionId to a fresh id (that
   // fetch just comes back empty, which is exactly the blank slate New Chat
   // wants — the old session's turns stay in SQLite and surface via the
   // dashboard's Conversations view instead).
+  //
+  // Public: fetch today's remaining count and drop the old public session id so
+  // the next message starts a fresh server-side session.
   //
   // No "already loaded this session" ref guard here — that pattern breaks
   // under React Strict Mode's double-invoke-on-mount (on by default for the
@@ -72,13 +84,25 @@ export default function Home() {
   // below is already the correct/sufficient guard against the stale first
   // response — let the effect re-run on every mount.
   useEffect(() => {
-    if (!token) return;
     setMessages([]);
     let cancelled = false;
 
-    fetch(`${API_BASE}/conversations?session_id=${encodeURIComponent(sessionId)}&limit=30`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
+    if (!token) {
+      publicSessionRef.current = null;
+      setAwaitingOnboarding(false);
+      setOnboardingQuestion("");
+      publicFetch("/quota")
+        .then((r) => r.json())
+        .then((d: { remaining: number }) => {
+          if (!cancelled) setRemaining(d.remaining);
+        })
+        .catch(() => {}); // unknown count — the first reply will report it
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    ownerFetch(`/conversations?session_id=${encodeURIComponent(sessionId)}&limit=30`, token)
       .then((r) => r.json())
       .then((turns: { role: string; content: string; mood: Mood | null }[]) => {
         if (cancelled) return;
@@ -96,41 +120,25 @@ export default function Home() {
     };
   }, [token, sessionId]);
 
-  const send = async () => {
-    if (!input.trim() || !token) return;
-    const userMsg = input.trim();
-    const sentSession = sessionId; // the session this turn belongs to
-    setInput("");
-    setMessages((m) => [...m, { role: "user", content: userMsg }]);
-    setLoading(true);
+  const outOfMessages = !token && remaining === 0;
 
-    const res = await fetch(`${API_BASE}/chat`, {
+  const sendOwner = async (userMsg: string, stillCurrent: () => boolean) => {
+    const res = await ownerFetch("/chat", token, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: userMsg,
         session_id: sessionId,
         onboarding_answer: awaitingOnboarding,
-        voice: voiceEnabled,
+        voice: voiceOn,
       }),
     });
-
-    const data = await res.json();
-
-    // A turn can take tens of seconds. If New Chat rotated the session while this
-    // request was in flight, the reply belongs to the OUTGOING session — appending it
-    // here would drop the previous chat's answer into the blank new one (that is the
-    // "New Chat replays the previous answer" bug). It is already persisted server-side
-    // under `sentSession`, so dropping it loses nothing: it shows up in the dashboard's
-    // Conversations view, and again in this pane if that session is ever reloaded.
-    if (sessionIdRef.current !== sentSession) {
-      setLoading(false);
+    if (res.status === 401) {
+      logout(); // expired or revoked — drop back to public mode
       return;
     }
-
+    const data = await res.json();
+    if (!stillCurrent()) return;
     setMessages((m) => [...m, { role: "aios", content: data.response, mood: data.mood }]);
 
     if (data.onboarding_question) {
@@ -141,11 +149,59 @@ export default function Home() {
       setAwaitingOnboarding(false);
       setOnboardingQuestion("");
     }
-
-    setLoading(false);
   };
 
-  const orbState: OrbState = loading ? "speaking" : voiceEnabled ? "listening" : "idle";
+  const sendPublic = async (userMsg: string, stillCurrent: () => boolean) => {
+    const res = await publicFetch("/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: userMsg, session_id: publicSessionRef.current }),
+    });
+    const data = await res.json();
+    if (!stillCurrent()) return;
+    if (typeof data.remaining === "number") setRemaining(data.remaining);
+    if (!res.ok) {
+      // 429 (daily limit) / 400 (input) — the backend's text is already friendly.
+      setMessages((m) => [...m, { role: "aios", content: data.detail ?? "Something went wrong." }]);
+      return;
+    }
+    publicSessionRef.current = data.session_id;
+    setMessages((m) => [...m, { role: "aios", content: data.response, mood: data.mood }]);
+  };
+
+  const send = async () => {
+    if (!input.trim() || loading || outOfMessages) return;
+    const userMsg = input.trim();
+    const sentSession = sessionId; // the session this turn belongs to
+    const sentToken = token; // and the identity
+    setInput("");
+    setMessages((m) => [...m, { role: "user", content: userMsg }]);
+    setLoading(true);
+
+    // A turn can take tens of seconds. If New Chat rotated the session (or the owner
+    // logged in/out) while this request was in flight, the reply belongs to the
+    // OUTGOING pane — appending it here would drop the previous chat's answer into
+    // the blank new one (that is the "New Chat replays the previous answer" bug). An
+    // owner turn is already persisted server-side under `sentSession`, so dropping it
+    // loses nothing: it shows up in the dashboard's Conversations view.
+    const stillCurrent = () =>
+      sessionIdRef.current === sentSession && tokenRef.current === sentToken;
+
+    try {
+      if (sentToken) await sendOwner(userMsg, stillCurrent);
+      else await sendPublic(userMsg, stillCurrent);
+    } catch {
+      if (stillCurrent()) {
+        setMessages((m) => [...m, { role: "aios", content: "I couldn't reach the server. Try again in a moment." }]);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Voice is spoken by the personal backend's own speaker — owner only.
+  const voiceOn = !!token && voiceEnabled;
+  const orbState: OrbState = loading ? "speaking" : voiceOn ? "listening" : "idle";
 
   return (
     <main className="flex-1 min-h-0 flex overflow-hidden bg-bg text-fg">
@@ -154,17 +210,19 @@ export default function Home() {
         <div className="flex-1 min-h-0">
           <Orb state={orbState} />
         </div>
-        <div className="shrink-0 pb-[22px] flex justify-center">
-          <button
-            type="button"
-            onClick={() => setVoiceEnabled((v) => !v)}
-            aria-pressed={voiceEnabled}
-            className={`voice-toggle ${voiceEnabled ? "on" : ""}`}
-          >
-            <span className="voice-dot" />
-            <span className="voice-label">Voice</span>
-          </button>
-        </div>
+        {token && (
+          <div className="shrink-0 pb-[22px] flex justify-center">
+            <button
+              type="button"
+              onClick={() => setVoiceEnabled((v) => !v)}
+              aria-pressed={voiceOn}
+              className={`voice-toggle ${voiceOn ? "on" : ""}`}
+            >
+              <span className="voice-dot" />
+              <span className="voice-label">Voice</span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* chat */}
@@ -192,21 +250,30 @@ export default function Home() {
           <div ref={bottomRef} />
         </div>
 
-        <div className="composer-pill m-3.5">
+        <div className={`composer-pill m-3.5 ${!token && remaining !== null ? "mb-1.5" : ""}`}>
           <input
             className="flex-1 bg-transparent outline-none text-fg text-[13px] placeholder-fg-dim"
-            placeholder="Speak…"
+            placeholder={outOfMessages ? "That's all for today — come back tomorrow!" : "Speak…"}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && send()}
+            maxLength={token ? undefined : 2000}
+            disabled={outOfMessages}
             autoFocus
           />
-          <button type="button" onClick={send} disabled={!input.trim()} className="raised-btn" aria-label="Send">
+          <button type="button" onClick={send} disabled={!input.trim() || loading || outOfMessages} className="raised-btn" aria-label="Send">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M5 12h14M13 6l6 6-6 6" />
             </svg>
           </button>
         </div>
+        {!token && remaining !== null && (
+          <p className="relative z-10 text-center text-[11px] text-fg-dim pb-3 px-4" aria-live="polite">
+            {remaining > 0
+              ? `${remaining} free message${remaining === 1 ? "" : "s"} left today`
+              : "You've used today's free messages. Thanks for trying AIOS — come back tomorrow!"}
+          </p>
+        )}
       </div>
     </main>
   );

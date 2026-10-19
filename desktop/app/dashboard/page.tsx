@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useToken } from "@/lib/token-context";
-import { API_BASE } from "@/lib/api";
+import { ownerFetch } from "@/lib/api";
 
 interface Column {
   key: string;
@@ -597,17 +597,14 @@ function HabitsSection({
 }
 
 export default function DashboardPage() {
-  const { token, setToken } = useToken();
-  const [tokenInput, setTokenInput] = useState("");
+  const { token } = useToken();
   const [overview, setOverview] = useState<OverviewState>(null);
   const [data, setData] = useState<Record<string, ResourceState>>({});
   const [reloadTick, setReloadTick] = useState(0);
 
   const authedFetch = useCallback(
     async (path: string) => {
-      const res = await fetch(`${API_BASE}${path}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await ownerFetch(path, token);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return res.json();
     },
@@ -616,10 +613,7 @@ export default function DashboardPage() {
 
   const authedPost = useCallback(
     async (path: string) => {
-      const res = await fetch(`${API_BASE}${path}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await ownerFetch(path, token, { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return res.json();
     },
@@ -667,23 +661,9 @@ export default function DashboardPage() {
           )}
         </div>
 
+        {/* Personal data — nothing below renders or fetches without the owner token. */}
         {!token && (
-          <div className="flex items-center gap-2 text-xs text-fg-dim mb-6">
-            <span>Fetching a token automatically — or paste one:</span>
-            <input
-              placeholder="paste JWT token"
-              value={tokenInput}
-              onChange={(e) => setTokenInput(e.target.value)}
-              className="bg-glass border border-border rounded-full px-3 py-1.5 text-fg text-xs w-56 outline-none"
-            />
-            <button
-              type="button"
-              onClick={() => setToken(tokenInput.trim())}
-              className="pill-btn hover:text-accent hover:border-border-hi transition cursor-pointer"
-            >
-              Use token
-            </button>
-          </div>
+          <p className="text-xs text-fg-dim mb-6">Owner login required.</p>
         )}
 
         {token && (

@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { useToken } from "./token-context";
-import { API_BASE } from "./api";
+import { ownerFetch } from "./api";
 
 const SESSION_KEY = "aios_session_id";
 
@@ -45,13 +45,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(SESSION_KEY, id);
     setSessionId(id);
 
+    // Owner only — a public chat has nothing server-side to archive (its history
+    // is in-memory on the public backend and simply expires).
     if (token) {
-      fetch(`${API_BASE}/conversations/archive`, {
+      ownerFetch("/conversations/archive", token, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: outgoing }),
       }).catch(() => {}); // best-effort tag — history is never deleted either way
     }

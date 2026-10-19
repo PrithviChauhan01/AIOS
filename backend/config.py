@@ -35,6 +35,12 @@ class Config:
     PORT = int(os.getenv("PORT", 5000))
     DEBUG = os.getenv("FLASK_ENV") != "production"
     JWT_SECRET = os.getenv("JWT_SECRET", "change_this")
+    JWT_TTL_HOURS = 12
+
+    # Owner login (POST /token, personal mode). Generate both with
+    # scripts/setup_owner.py. Unset → every login attempt fails.
+    OWNER_PASSWORD_HASH = os.getenv("OWNER_PASSWORD_HASH", "")
+    OWNER_TOTP_SECRET = os.getenv("OWNER_TOTP_SECRET", "")
 
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
     CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
@@ -76,8 +82,7 @@ class Config:
     PUBLIC_MODE = os.getenv("PUBLIC_MODE", "false").lower() == "true"
     PUBLIC_SESSION_IDLE_S = 30 * 60      # a visitor's history expires after 30 min idle
     PUBLIC_MAX_INPUT_CHARS = 2000
-    PUBLIC_RATE_SHORT = (20, 10 * 60)    # 20 messages / 10 minutes, per IP
-    PUBLIC_RATE_DAILY = (100, 24 * 60 * 60)  # 100 messages / day, per IP
+    PUBLIC_RATE_DAILY = (5, 24 * 60 * 60)  # 5 messages / day, per IP
 
     @classmethod
     def validate(cls):
@@ -93,6 +98,9 @@ class Config:
                 "in backend/.env, e.g.:\n"
                 '    python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
+        if not (cls.OWNER_PASSWORD_HASH and cls.OWNER_TOTP_SECRET):
+            print("[config] WARNING: OWNER_PASSWORD_HASH / OWNER_TOTP_SECRET not set — "
+                  "owner login will refuse every attempt. Run scripts/setup_owner.py.")
 
     @classmethod
     def validate_public(cls):

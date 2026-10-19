@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import Config
@@ -14,7 +17,13 @@ from api.public_chat_routes import router as public_chat_router
 from db.sqlite_init import init_sqlite
 from db.chroma_init import init_chroma
 from core.auth import generate_token
+from core import owner_auth
 from core.scheduler import start_scheduler, stop_scheduler
+
+
+class TokenRequest(BaseModel):
+    password: str = Field("", max_length=1024)  # bounded: it is hashed per attempt
+    code: str = Field("", max_length=16)
 
 
 @asynccontextmanager
@@ -63,9 +72,17 @@ def create_app() -> FastAPI:
     app.include_router(conversations_router)
     app.include_router(trace_router)
 
-    @app.get("/token")
-    async def token():
-        return {"token": generate_token()}
+    @app.post("/token")
+    async def token(data: TokenRequest, request: Request):
+        ip = request.client.host if request.client else "unknown"
+        # bcrypt is deliberately slow — keep it off the event loop.
+        outcome = await run_in_threadpool(owner_auth.attempt, ip, data.password, data.code)
+        if outcome == "ok":
+            return {"token": generate_token()}
+        if outcome == "locked":
+            return JSONResponse(status_code=429,
+                                content={"detail": "Too many attempts. Try again later."})
+        return JSONResponse(status_code=401, content={"detail": "Invalid credentials."})
 
     return app
 

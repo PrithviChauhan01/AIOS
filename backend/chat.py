@@ -1,3 +1,4 @@
+import getpass
 import requests
 import sys
 
@@ -5,7 +6,11 @@ BASE_URL = "http://127.0.0.1:5000"
 SESSION_ID = "main"
 
 def get_token():
-    r = requests.get(f"{BASE_URL}/token")
+    password = getpass.getpass("Owner password: ")
+    code = input("6-digit code: ").strip()
+    r = requests.post(f"{BASE_URL}/token", json={"password": password, "code": code})
+    if r.status_code != 200:
+        sys.exit(f"Login failed: {r.json().get('detail', r.status_code)}")
     return r.json()["token"]
 
 def chat(message, token, onboarding_answer=False):

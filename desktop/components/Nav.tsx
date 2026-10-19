@@ -1,20 +1,30 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTheme } from "@/lib/theme-context";
 import { useSession } from "@/lib/session-context";
+import { useToken } from "@/lib/token-context";
+import OwnerLogin from "@/components/OwnerLogin";
 
-const LINKS = [
-  { href: "/", label: "Chat" },
-  { href: "/dashboard", label: "Dashboard" },
-];
+const CHAT = { href: "/", label: "Chat" };
+const DASHBOARD = { href: "/dashboard", label: "Dashboard" };
 
 export default function Nav() {
   const pathname = usePathname();
   const router = useRouter();
   const { theme, toggleTheme } = useTheme();
   const { newChat } = useSession();
+  const { token, logout } = useToken();
+  const [loginOpen, setLoginOpen] = useState(false);
+  // The dashboard is personal data — its link exists only for the logged-in owner.
+  const LINKS = token ? [CHAT, DASHBOARD] : [CHAT];
+
+  const handleLogout = () => {
+    logout();
+    if (pathname !== "/") router.push("/");
+  };
 
   const activeIndex = Math.max(
     0,
@@ -68,6 +78,24 @@ export default function Nav() {
           New Chat
         </button>
 
+        {token ? (
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="pill-btn hover:text-accent hover:border-border-hi transition cursor-pointer"
+          >
+            Logout
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setLoginOpen(true)}
+            className="text-[11px] text-fg-dim hover:text-fg transition cursor-pointer px-1"
+          >
+            Owner login
+          </button>
+        )}
+
         <button
           type="button"
           onClick={toggleTheme}
@@ -89,6 +117,7 @@ export default function Nav() {
           )}
         </button>
       </div>
+      {loginOpen && <OwnerLogin onClose={() => setLoginOpen(false)} />}
     </nav>
   );
 }

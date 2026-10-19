@@ -212,6 +212,17 @@ _CONVERSATION_ADDED_COLUMNS = (
 )
 
 
+# The sales pipeline on `leads` (Slice B2). Existing rows keep every column and land
+# in stage 'found' via the DEFAULT. `notes` is an append-only log — tools/leads.py
+# only ever concatenates onto it, never rewrites it.
+_LEADS_ADDED_COLUMNS = (
+    ("leads", "stage", "TEXT DEFAULT 'found'"),
+    ("leads", "last_contact_at", "DATETIME"),
+    ("leads", "next_follow_up_at", "DATE"),
+    ("leads", "notes", "TEXT"),
+)
+
+
 def _add_missing_columns(conn, specs) -> None:
     for table, column, decl in specs:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -238,12 +249,22 @@ def ensure_conversation_schema(conn) -> None:
     _add_missing_columns(conn, _CONVERSATION_ADDED_COLUMNS)
 
 
+def ensure_leads_schema(conn) -> None:
+    """Add the pipeline columns to an existing leads table. Called by init_sqlite and
+    once per database by tools/leads.py, so a process that never ran init_sqlite
+    (tests, scripts) still writes against the full schema. Idempotent."""
+    _add_missing_columns(conn, _LEADS_ADDED_COLUMNS)
+    # Rows that predate the column got the DEFAULT; this only catches an explicit NULL.
+    conn.execute("UPDATE leads SET stage = 'found' WHERE stage IS NULL")
+
+
 def init_sqlite():
     os.makedirs(os.path.dirname(Config.SQLITE_PATH), exist_ok=True)
     conn = sqlite3.connect(Config.SQLITE_PATH)
     conn.executescript(SCHEMA)
     ensure_trace_schema(conn)
     ensure_conversation_schema(conn)
+    ensure_leads_schema(conn)
     conn.commit()
     conn.close()
     print("[db] SQLite ready")

@@ -145,7 +145,16 @@ _LEADS_GATE = re.compile(
 _LEADS_FN_NAME = {
     "save": "save_leads",
     "list": "list_leads",
+    # pipeline (Slice B2) — parsed by agents.leadgen.parse_pipeline_command
+    "stage": "set_stage",
+    "note": "add_note",
+    "follow_up": "set_follow_up",
+    "list_stage": "list_by_stage",
+    "pipeline": "list_by_stage",
+    "due": "due_follow_ups",
 }
+# Pipeline reads render as a deliverable table, not a one-line confirmation.
+LEADS_TABLE_VERBS = ("pipeline", "list_stage", "due")
 
 # Study gate: reporting/listing a study session. A study verb paired with a
 # duration/session/day word ("studied DP for two hours today"), an explicit log
@@ -771,6 +780,14 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
             action["tool"] = "reminders"
             action["session_id"] = session_id
             return action
+    # Pipeline commands ("mark Verve Media as contacted", "who should I follow up with
+    # today?") — deterministic, parsed by the leadgen teacher, which owns the language.
+    # Ahead of the jobs/leads gates: "add note to 8K: …" must not reach an extractor.
+    # Local import: agents.leadgen pulls the teacher stack, which imports core.
+    from agents.leadgen import parse_pipeline_command
+    pipeline = parse_pipeline_command(msg)
+    if pipeline is not None:
+        return {"tool": "leads", **pipeline, "session_id": session_id}
     if _JOBS_GATE.search(msg):
         action = _extract_jobs(msg)
         if action is not None:
@@ -874,7 +891,7 @@ _WRITE_VERBS = {
     "reminders": {"set", "complete", "delete", "clear"},
     "jobs": {"log"},
     "documents": {"save", "delete"},
-    "leads": {"save"},
+    "leads": {"save", "stage", "note", "follow_up"},
     "fitness": {"log"},
     "study": {"log"},
     "habits": {"mark"},
@@ -1222,6 +1239,19 @@ def _run_leads(action: dict) -> dict:
             return {"ok": False, "needs": "rows",
                     "ask": "I have no search results in hand to save, Sir — "
                            "run the search first, then tell me to save them."}
+        if verb == "stage":
+            return tool.set_stage(action.get("name"), action.get("stage"), action.get("when"))
+        if verb == "note":
+            return tool.add_note(action.get("name"), action.get("text"))
+        if verb == "follow_up":
+            return tool.set_follow_up(action.get("name"), action.get("when"))
+        if verb == "list_stage":
+            return {"ok": True, "items": tool.list_by_stage(action.get("stage")),
+                    "stage": action.get("stage")}
+        if verb == "pipeline":
+            return {"ok": True, "items": tool.list_by_stage()}
+        if verb == "due":
+            return {"ok": True, "items": tool.due_follow_ups()}
     except Exception as e:
         print(f"[orch] leads action {verb} failed: {e}")
         return {"ok": False, "error": str(e)}
@@ -1548,10 +1578,64 @@ def _fitness_material(verb: str, res: dict) -> str:
             "cleanly:\n" + lines)
 
 
+def _short_date(value) -> str:
+    return str(value)[:10] if value else "—"
+
+
+def _pipeline_table(items: list) -> str:
+    rows = "\n".join(
+        f"| {r['studio_name']} | {r.get('stage') or 'found'} | "
+        f"{_short_date(r.get('last_contact_at'))} | {_short_date(r.get('next_follow_up_at'))} |"
+        for r in items)
+    return ("| Studio | Stage | Last contact | Next follow-up |\n"
+            "|---|---|---|---|\n" + rows)
+
+
+def _pipeline_material(verb: str, res: dict) -> str:
+    """Pipeline writes confirm exactly what changed; reads are a deliverable table."""
+    if verb in LEADS_TABLE_VERBS:
+        items = res.get("items") or []
+        if verb == "due":
+            if not items:
+                return ("ACTION EXECUTED — you checked the pipeline: NO follow-ups are due "
+                        "today or overdue. Tell Sir plainly; do not invent any.")
+            return ("ACTION EXECUTED — these leads are due or OVERDUE for follow-up "
+                    f"(most overdue first, {len(items)} total). Present this table to Sir "
+                    "exactly as given:\n\n" + _pipeline_table(items))
+        if not items:
+            scope = f"in stage '{res.get('stage')}'" if verb == "list_stage" else "in the pipeline"
+            return (f"ACTION EXECUTED — you checked: there are NO leads {scope}. Tell Sir "
+                    "plainly; do not invent any.")
+        scope = f"in stage '{res.get('stage')}'" if verb == "list_stage" else "— the full pipeline"
+        return (f"ACTION EXECUTED — Sir's leads {scope} ({len(items)} total). Present this "
+                "table exactly as given:\n\n" + _pipeline_table(items))
+
+    if not res.get("ok"):
+        return ("ACTION NOT DONE — nothing in the pipeline was changed "
+                f"({res.get('needs') or res.get('error')}). Do NOT claim anything was "
+                f"updated. Put this to Sir: {res.get('ask') or res.get('error')}")
+    lead = res.get("lead") or {}
+    name = lead.get("studio_name")
+    follow = lead.get("next_follow_up_at")
+    if verb == "stage":
+        follow_line = (f" Next follow-up: {follow}." if follow
+                       else " No follow-up is scheduled.")
+        return (f"ACTION EXECUTED — {name} moved from {res.get('from_stage')} to "
+                f"{lead.get('stage')}.{follow_line} Confirm to Sir in one sentence that "
+                "states BOTH the new stage and the follow-up line above.")
+    if verb == "note":
+        return (f"ACTION EXECUTED — note added to {name}: \"{res.get('note')}\". "
+                "Confirm briefly.")
+    return (f"ACTION EXECUTED — next follow-up for {name} set to {follow}. "
+            "Confirm exactly this to Sir.")
+
+
 def _leads_material(verb: str, res: dict) -> str:
     """Render a leads action result for cognition. The saved/skipped split is stated
     exactly — a re-save of an existing set writes nothing new and she must say so
     rather than claim N fresh rows."""
+    if verb in ("stage", "note", "follow_up") or verb in LEADS_TABLE_VERBS:
+        return _pipeline_material(verb, res)
     if verb == "save":
         if res.get("ok"):
             saved = res.get("items") or []

@@ -467,6 +467,13 @@ def _build_prompt(ctx: dict, material: str, is_ensemble: bool,
                 "confirmation), present it and ASK for confirmation — do NOT say it was "
                 "sent or done."
             )
+            if ctx.get("deliverable"):
+                # A read that returns a table (the leads pipeline) — "minimally" must
+                # not mean dropping rows.
+                task_block += (
+                    " This result is a deliverable: after ONE short framing line, "
+                    "reproduce it IN FULL exactly as given — keep any markdown table "
+                    "intact, every row and column, nothing added.")
         else:
             task_block = (
                 "The action you attempted for Sir did NOT succeed — the RAW MATERIAL above "

@@ -116,6 +116,92 @@ _EXPORT_INTENT_SIGNALS = (
 )
 
 
+# ── Pipeline commands (Slice B2) ──
+# Leadgen owns the LANGUAGE of the sales pipeline; core.action_dispatch owns the
+# EXECUTION (the only stage that runs a tool) and calls parse_pipeline_command from
+# its gate. Deterministic regexes, no LLM: a pipeline write must never hinge on a
+# model's reading, and a line that matches none of these is ordinary chat.
+_PIPELINE_STAGE_WORDS = {
+    "found": "found",
+    "contacted": "contacted", "reached out": "contacted",
+    "replied": "replied", "responded": "replied",
+    "demo": "demo", "demo booked": "demo", "demo scheduled": "demo",
+    "won": "won", "signed": "won", "closed won": "won",
+    "lost": "lost", "dead": "lost", "closed lost": "lost",
+}
+_STAGE_ALT = "|".join(sorted((re.escape(w) for w in _PIPELINE_STAGE_WORDS),
+                             key=len, reverse=True))
+_FU = r"follow[\s-]?ups?"
+_P_DUE = re.compile(
+    rf"\b(?:who|which\s+leads?)\b[^.?]{{0,40}}\b{_FU}\b"
+    rf"|\b{_FU}\b[^.?]{{0,20}}\b(?:today|due|overdue)\b"
+    rf"|\bwho\s+needs\s+(?:a\s+)?{_FU}\b", re.IGNORECASE)
+_P_PIPELINE = re.compile(
+    r"\b(?:show|view|see|display|give|what'?s|whats|how'?s)\b[^.?]{0,25}\bpipeline\b"
+    r"|^\s*(?:my\s+)?pipeline\s*\??$", re.IGNORECASE)
+_P_LIST_STAGE = re.compile(
+    rf"\b(?:show|list|which|what)\b[^.?]{{0,25}}\bleads?\b[^.?]{{0,15}}"
+    rf"\b(?:in|at|marked(?:\s+as)?)\s+(?:the\s+)?(?P<stage>{_STAGE_ALT})\b"
+    rf"|\b(?:show|list)\b\s+(?:me\s+)?(?:my\s+|all\s+)?(?:the\s+)?(?P<stage2>{_STAGE_ALT})\s+leads\b",
+    re.IGNORECASE)
+_P_NOTE = re.compile(
+    r"^\s*(?:(?:please\s+)?(?:add|log|put)\s+(?:a\s+)?note\s+(?:to|for|on)|note\s+(?:for|on|to))"
+    r"\s+(?P<name>.+?)(?:\s*:\s*|\s+[-–—]\s+)(?P<text>.+?)\s*$", re.IGNORECASE)
+_P_STAGE = re.compile(
+    rf"^\s*(?:please\s+)?(?:mark|move|set|put|update)\s+(?P<name>.+?)\s+"
+    rf"(?:(?:as|to|in(?:to)?|at)\s+)?(?:the\s+)?(?P<stage>{_STAGE_ALT})(?:\s+stage)?\b"
+    rf"(?P<rest>.*)$", re.IGNORECASE)
+_P_FOLLOW_UP = re.compile(
+    rf"^\s*(?:please\s+)?(?:set\s+(?:a\s+|the\s+)?)?{_FU}\s+(?:with|for|on)\s+(?P<name>.+?)\s+"
+    rf"(?P<when>(?:on|for|to|by|in)\s+.+|tomorrow|today|next\s+\w+)\s*$", re.IGNORECASE)
+_P_REST_WHEN = re.compile(rf"\b{_FU}\s+(?P<when>(?:on|by|in|for)\s+.+|tomorrow|next\s+\w+)",
+                          re.IGNORECASE)
+
+
+def _clean_lead_name(name: str) -> str:
+    name = (name or "").strip().strip("\"'“”‘’").strip()
+    name = re.sub(r"^(?:the|lead)\s+", "", name, flags=re.IGNORECASE)
+    return re.sub(r"(?:'s|’s)$", "", name).strip()
+
+
+def _clean_when(when: str) -> str:
+    """'on Friday' → 'Friday'; 'in 3 days' stays (parse_due reads the 'in')."""
+    return re.sub(r"^(?:on|for|to|by)\s+", "", (when or "").strip(" .!"),
+                  flags=re.IGNORECASE)
+
+
+def parse_pipeline_command(message: str) -> dict | None:
+    """A pipeline command → {"action": stage|note|follow_up|due|pipeline|list_stage,
+    ...fields}, or None. Reads are checked before writes so "who should I follow up
+    with today?" can never parse as setting a follow-up for "who"."""
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    if _P_DUE.search(msg):
+        return {"action": "due"}
+    if _P_PIPELINE.search(msg):
+        return {"action": "pipeline"}
+    m = _P_LIST_STAGE.search(msg)
+    if m:
+        word = (m.group("stage") or m.group("stage2")).lower()
+        return {"action": "list_stage", "stage": _PIPELINE_STAGE_WORDS[word]}
+    m = _P_NOTE.search(msg)
+    if m and _clean_lead_name(m.group("name")):
+        return {"action": "note", "name": _clean_lead_name(m.group("name")),
+                "text": m.group("text").strip()}
+    m = _P_STAGE.search(msg)
+    if m and _clean_lead_name(m.group("name")):
+        when = _P_REST_WHEN.search(m.group("rest") or "")
+        return {"action": "stage", "name": _clean_lead_name(m.group("name")),
+                "stage": _PIPELINE_STAGE_WORDS[m.group("stage").lower()],
+                "when": _clean_when(when.group("when")) if when else None}
+    m = _P_FOLLOW_UP.search(msg.rstrip(".!"))
+    if m and _clean_lead_name(m.group("name")):
+        return {"action": "follow_up", "name": _clean_lead_name(m.group("name")),
+                "when": _clean_when(m.group("when"))}
+    return None
+
+
 def is_export_request(message: str) -> bool:
     """True if the message asks for the leads as a file. Shared with the orchestrator
     so an export follow-up ('make a call sheet for those') can be routed back here."""

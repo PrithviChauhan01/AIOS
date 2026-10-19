@@ -12,7 +12,9 @@ from core.memory import get_history, save_message
 from core.cognition import cognition_pass
 from core.greeting import detect_greeting, greeting_reply
 from core.looper import run_looper
-from core.action_dispatch import detect_action, run_action, action_material, fn_name
+from core.action_dispatch import (
+    LEADS_TABLE_VERBS, detect_action, run_action, action_material, fn_name,
+)
 from agents.leadgen import LeadgenTeacher, get_cached_leadgen, is_export_request
 from agents.study import StudyTeacher
 from agents.work import WorkTeacher
@@ -341,6 +343,9 @@ async def _handle_message(message: str, session_id: str, voice_flag: bool,
         # she must present in full — give cognition deliverable room, not the 60-token
         # confirmation cap.
         if action.get("tool") == "email" and action["action"] in ("draft", "revise", "reconfirm"):
+            ctx["deliverable"] = True
+        # The leads pipeline / follow-up list is a table — same deliverable room.
+        if action.get("tool") == "leads" and action["action"] in LEADS_TABLE_VERBS:
             ctx["deliverable"] = True
         # Hand the retrieved material's sensitivity tier to the cloud guard in
         # cognition. The guard there (not this call site) decides cloud vs local for

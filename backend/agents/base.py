@@ -145,13 +145,15 @@ class Teacher(ABC):
                                      complexity=complexity, loop_worthy=loop_worthy)
         return await self._single_pass(prompt, books, ctx, eff_tier)
 
-    async def _traced_book(self, prompt: str, book: str, ctx: dict):
+    async def _traced_book(self, prompt: str, book: str, ctx: dict, max_tokens: int = None):
         """call_book under a `book` trace stage — the ONLY place a teacher's token
         counts are recorded, and they are the provider's own reported numbers. The
         exception path is unchanged: a failure is recorded on the stage and re-raised
-        for the caller's existing fallback loop to handle."""
+        for the caller's existing fallback loop to handle. max_tokens=None keeps
+        call_book's default cap."""
         with stage_of(ctx, "book", book=book, model=model_for(book)) as st:
-            result = await call_book(prompt, book)
+            kwargs = {"max_tokens": max_tokens} if max_tokens else {}
+            result = await call_book(prompt, book, **kwargs)
             st.set(tokens_in=result.get("tokens_in"), tokens_out=result.get("tokens_out"))
             return result
 

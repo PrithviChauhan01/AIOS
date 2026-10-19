@@ -15,7 +15,7 @@ so save() takes the whole row set in a single transaction. A single manually
 named lead is just the N=1 case.
 
 Re-saving the same set is a normal thing for Sir to do ("save those" twice, or
-a repeat search) — so an already-stored studio_name is SKIPPED, not duplicated,
+a repeat search) — so an already-stored studio_name + location is SKIPPED, not duplicated,
 and the real saved/skipped split is returned so cognition confirms what actually
 happened rather than claiming N new rows.
 """
@@ -37,10 +37,14 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def _dedup_key(name, location) -> tuple:
+    return ((name or "").strip().lower(), (location or "").strip().lower())
+
+
 def _contact_of(row: dict) -> str | None:
-    """Phone + website into the single `contact` column, in that order — the two
+    """Phone + email + website into the single `contact` column, in that order — the
     fields Sir actually calls/opens from a call sheet."""
-    parts = [str(row.get(k)).strip() for k in ("phone", "website")
+    parts = [str(row.get(k)).strip() for k in ("phone", "email", "website")
              if row.get(k) and str(row.get(k)).strip() not in ("", "—")]
     return " · ".join(parts) or None
 
@@ -80,26 +84,29 @@ def save_leads(rows: list, location: str = None) -> dict:
     saved, skipped = [], []
     conn = _conn()
     try:
-        # Existing names, lowercased — the dedup key. Loaded once, then kept in sync
-        # as we insert, so duplicates WITHIN one batch are caught too.
-        existing = {(r["studio_name"] or "").strip().lower()
-                    for r in conn.execute("SELECT studio_name FROM leads")}
+        # Existing (name, location) pairs, lowercased — the dedup key: the same studio
+        # name in another city is a different lead. Loaded once, then kept in sync as
+        # we insert, so duplicates WITHIN one batch are caught too.
+        existing = {_dedup_key(r["studio_name"], r["location"])
+                    for r in conn.execute("SELECT studio_name, location FROM leads")}
         for row in rows:
             name = str(row.get("name") or row.get("studio_name") or "").strip()
             if not name:
                 continue
-            if name.lower() in existing:
+            loc = str(row.get("location") or row.get("address") or location or "").strip() or None
+            key = _dedup_key(name, loc)
+            if key in existing:
                 skipped.append(name)
                 continue
-            loc = str(row.get("location") or row.get("address") or location or "").strip() or None
-            contact = _contact_of(row)
+            # An already-shaped row (leadgen's web leads) carries its own contact.
+            contact = row.get("contact") or _contact_of(row)
             research = _research_of(row)
             cur = conn.execute(
                 "INSERT INTO leads (studio_name, location, contact, research) "
                 "VALUES (?, ?, ?, ?)",
                 (name, loc, contact, research),
             )
-            existing.add(name.lower())
+            existing.add(key)
             saved.append({"id": cur.lastrowid, "studio_name": name, "location": loc,
                           "contact": contact, "research": research})
         conn.commit()

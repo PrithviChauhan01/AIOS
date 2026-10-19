@@ -1,7 +1,11 @@
+import asyncio
+import json
 import os
 import re
+from urllib.parse import urlparse
 
 from agents.base import Teacher
+from core.books import select_book_for_tier
 
 # ── Refusal / empty signals — a book that punts is a self-check failure ──
 _REFUSALS = (
@@ -24,8 +28,34 @@ _RESEARCH_SIGNALS = (
 # fabrication creeps in.
 _NOT_FOUND_PREFIX = "NO_RESULTS:"           # search/Places ran, found nothing
 _PLACES_PREFIX = "REAL BUSINESS RESULTS"    # verified Google Places rows
+_WEB_PREFIX = "REAL WEB LEADS"              # Tavily-sourced, field-verified leads
 _EXPORT_PREFIX = "CALL SHEET EXPORTED:"     # xlsx written to outputs/
-_PASSTHROUGH_PREFIXES = (_NOT_FOUND_PREFIX, _PLACES_PREFIX, _EXPORT_PREFIX)
+_PASSTHROUGH_PREFIXES = (_NOT_FOUND_PREFIX, _PLACES_PREFIX, _WEB_PREFIX, _EXPORT_PREFIX)
+
+# ── Web prospecting (Tavily → book structures → code verifies) ──
+_NOT_FOUND = "not found"
+_DEFAULT_LEAD_COUNT = 5
+_MAX_LEAD_COUNT = 10
+_SEARCH_RESULTS_PER_QUERY = 8
+_PROMPT_SOURCE_CHARS = 800
+# Up to 20 JSON rows (~80 tokens each) — the default 1024 cap truncated the array
+# mid-object and the reply failed to parse.
+_STRUCTURE_MAX_TOKENS = 3000
+_COUNT_RE = re.compile(r"\b(\d{1,2})\b")
+_LOCATION_RE = re.compile(
+    r"\b(?:in|near|around)\s+([a-z][a-z .'-]*?)\s*(?:[,.?!]|$|\band\b|\bwith\b|\bfor\b)",
+    re.IGNORECASE)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# Only internationally formatted numbers are pulled from an extracted page — a bare
+# digit run on a web page is as likely an order id as a phone.
+_INTL_PHONE_RE = re.compile(r"\+\d{1,3}[\s-]?\(?\d[\d\s()-]{7,14}\d")
+# A phone-shaped run in source text. No parentheses: "+918693838888) 03" must split
+# into the number and the junk, not read as one 14-digit phone.
+_PHONE_RUN_RE = re.compile(r"\+?\d[\d\s-]{6,16}\d")
+# Mail hosts anyone can sign up on. An address elsewhere must sit on the business's
+# own or source domain — lead-list sites print obfuscated look-alikes (anuj@e795f9fte.in).
+_WEBMAIL = {"gmail.com", "yahoo.com", "yahoo.co.in", "outlook.com", "hotmail.com",
+            "rediffmail.com", "icloud.com", "proton.me", "protonmail.com"}
 
 # Tokens in the target/query that carry no business IDENTITY — trade descriptors
 # plus instruction filler. A web result that only echoes these is NOT evidence the
@@ -69,13 +99,13 @@ _PROSPECT_NOUNS = (
 # Leadgen reasons over real data from EXACTLY these two tools and no others. A cheap
 # rules-based selection step (below) picks which of them to call per task; every fetch
 # site asserts the tool it's about to hit is in here, so leadgen can never call outside
-# it. "tavily" is the shared pool's Tavily web-search tool (registry name "search");
+# it. "tavily" is the shared pool's Tavily tool (tools/tavily.py, registry "tavily");
 # "places" is Google Places. Leadgen uses each tool's STRUCTURED layer (search_places /
-# web_search return dicts) rather than the registry's string wrapper — it needs the raw
+# tavily.search return dicts) rather than the registry's string wrapper — it needs the raw
 # fields (phone/website/address) for the call sheet — but the two names still name the
 # same tools the registry exposes.
 _PLACES = "places"
-_TAVILY = "search"          # Tavily web search, as named in tools/registry.py
+_TAVILY = "tavily"          # Tavily search + extract, as named in tools/registry.py
 MANIFEST = (_PLACES, _TAVILY)
 
 # Words that mean "hand me the leads as a file" — any of these in a message is an
@@ -143,9 +173,11 @@ _CITY_REGION = {
 
 class LeadgenTeacher(Teacher):
     """Domain expert for lead research. Two modes, real data in both:
-      * PROSPECTING — "find me <category> in <place>" → Google Places returns
-        VERIFIED business rows (name/phone/website/address/rating/reviews). No book
-        in the loop, so nothing can be invented. Empty → an honest not-found flag.
+      * PROSPECTING — "find/research <category> in <place>" → Tavily searches; a book
+        only STRUCTURES the hits into leads, then code verifies every field against
+        the source text (unverifiable → "not found"; no real source URL → dropped).
+        Leads are saved to the `leads` table. Google Places is the fallback when the
+        web search can't run or verifies nothing.
       * SINGLE-BUSINESS RESEARCH — deep web-presence dig on ONE named business →
         Tavily, then a book frames a dossier from the REAL results.
     Never writes the outreach, never adds personality."""
@@ -155,11 +187,11 @@ class LeadgenTeacher(Teacher):
     deliverable = True  # lead research is inherently a structured deliverable
 
     # Leadgen draws Places and Tavily from the SHARED pool itself, via their
-    # STRUCTURED layers (search_places / web_search return dicts — it needs raw
+    # STRUCTURED layers (search_places / tavily.search return dicts — it needs raw
     # phone/website/address fields for the call sheet, not the registry's string
     # wrapper). The generic brain fetch skips these so nothing fires twice; the
     # MANIFEST above stays the hard boundary of what leadgen may reach.
-    owns_tools = ("places", "search")
+    owns_tools = ("places", "search", "tavily")
 
     def reasoning_tier(self, ctx):
         return "fast"  # formats real Places/Tavily data — no heavy reasoning needed
@@ -175,38 +207,24 @@ class LeadgenTeacher(Teacher):
                 and not self._looks_like_fresh_query(message)):
             return self._export_cached(ctx)
 
-        # The brain PICKS its tool(s) for this task — rules only, no LLM call (quota).
-        tools = self._select_tools(message)
-        print(f"[leadgen] tool selection for {message!r}: {tools}")
-
-        if tools == [_PLACES]:
-            return await self._run_prospecting(ctx)      # local directory only
-        if tools == [_TAVILY]:
+        # Rules only, no LLM call (quota).
+        mode = self._select_mode(message)
+        print(f"[leadgen] mode for {message!r}: {mode}")
+        if mode == "single":
             return await self._run_single_research(ctx)  # web dig on one business
-        return await self._run_combined(ctx)             # both: local + web context
+        return await self._run_prospecting(ctx)
 
-    def _select_tools(self, message: str) -> list[str]:
-        """Rules-based (NO LLM — quota) pick of which manifest tool(s) this task needs:
-          * a list/prospecting ask ("find studios in Mumbai")        → [places]
-          * a deep dig on ONE named business ("research Luma Labs")   → [tavily]
-          * an ask that needs a local directory AND web context      → [places, tavily]
-            (e.g. "find studios in Mumbai and research their reputation")
-        Anything ambiguous defaults to Places — the safe superset that returns real data
-        or an honest nothing. The result is intersected with MANIFEST so the boundary is
-        explicit: leadgen can never emit a tool outside it."""
+    def _select_mode(self, message: str) -> str:
+        """'prospect' or 'single'. A plural category ("find/research studios in
+        Mumbai") is a list ask even when it says "research"; a research verb with no
+        category noun is a dig on ONE named business ("research Luma Labs").
+        Anything else defaults to prospecting — real data or an honest nothing."""
         low = (message or "").lower()
-        has_single = any(s in low for s in _SINGLE_RESEARCH_SIGNALS)
-        has_list = (any(re.search(rf"\b{re.escape(v)}", low) for v in _LIST_VERBS)
-                    or any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS))
-
-        if has_single and has_list:
-            selected = [_PLACES, _TAVILY]   # named-business research scoped to a local list
-        elif has_single:
-            selected = [_TAVILY]            # one named business, web presence only
-        else:
-            selected = [_PLACES]            # default / prospecting: real directory data
-
-        return [t for t in selected if t in MANIFEST]
+        if any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS):
+            return "prospect"
+        if any(s in low for s in _SINGLE_RESEARCH_SIGNALS):
+            return "single"
+        return "prospect"
 
     @staticmethod
     def _assert_in_manifest(name: str) -> None:
@@ -223,8 +241,319 @@ class LeadgenTeacher(Teacher):
         low = (message or "").lower()
         return any(re.search(rf"\b{re.escape(n)}\b", low) for n in _PROSPECT_NOUNS)
 
-    # ── PROSPECTING (Google Places) ──
+    # ── PROSPECTING — Tavily first, Places as the fallback ──
     async def _run_prospecting(self, ctx: dict) -> dict:
+        # Privacy routing as before: the orchestrator never hands a secret turn to a
+        # teacher. This is the structural backstop — no web egress for secret.
+        if ctx.get("sensitivity") != "secret":
+            web = await self._run_web_prospecting(ctx)
+            if web is not None:
+                return web
+        return await self._run_places_prospecting(ctx)
+
+    async def _run_web_prospecting(self, ctx: dict) -> dict | None:
+        """Tavily searches → a book structures the hits → code verifies every field.
+        Returns None when the search could not run or nothing verified, so the caller
+        falls back to Places rather than reporting not-found off a dead search."""
+        message = ctx.get("message") or ctx.get("query", "")
+        want = self._lead_count(message)
+        location = self._location_of(message)
+
+        sources = await self._web_sources(message)
+        if not sources:
+            return None
+        leads = await self._structure_leads(ctx, message, sources)
+        leads = self._verified_leads(leads, sources, location)
+        if not leads:
+            print(f"[leadgen] web prospecting: {len(sources)} sources, 0 verified leads "
+                  "-> places fallback")
+            return None
+        # Most-verified first: a lead whose own site carries its contacts beats a bare
+        # name off a directory listing. Stable, so the book's order breaks ties.
+        leads.sort(key=self._evidence, reverse=True)
+        leads = await self._enrich_contacts(leads[:want])
+        print(f"[leadgen] web prospecting query={message!r} -> {len(leads)} verified "
+              f"lead(s) from {len(sources)} sources (wanted {want})")
+
+        saved = self._save_web_leads(leads, message)
+        rows = [self._call_sheet_row(lead) for lead in leads]
+        cache_leadgen_results(ctx.get("session_id", "default"), message, rows)
+        if is_export_request(message):
+            return self._export_call_sheet(message, rows)
+        return self._web_results(leads, want, saved)
+
+    def _lead_count(self, message: str) -> int:
+        m = _COUNT_RE.search(message or "")
+        n = int(m.group(1)) if m else _DEFAULT_LEAD_COUNT
+        return max(1, min(n, _MAX_LEAD_COUNT))
+
+    def _location_of(self, message: str) -> str:
+        m = _LOCATION_RE.search(message or "")
+        return m.group(1).strip().title() if m else ""
+
+    async def _web_sources(self, message: str) -> list:
+        """Two advanced Tavily searches (the ask itself, and the same ask aimed at
+        contact details), merged and de-duplicated by URL. [] when search can't run."""
+        self._assert_in_manifest(_TAVILY)
+        from tools import tavily
+        queries = (message, f"{message} contact phone email")
+        try:
+            batches = await asyncio.gather(
+                *(tavily.search(q, _SEARCH_RESULTS_PER_QUERY, "advanced") for q in queries))
+        except Exception as e:
+            print(f"[leadgen] tavily unavailable: {e}")
+            return []
+        seen, sources = set(), []
+        for hit in (h for batch in batches for h in batch):
+            url = (hit.get("url") or "").strip()
+            if url and url not in seen and (hit.get("title") or hit.get("content")):
+                seen.add(url)
+                sources.append(hit)
+        return sources
+
+    def _structure_prompt(self, message: str, sources: list) -> str:
+        # Each source is clipped for the PROMPT only (16 advanced hits run ~7k tokens,
+        # most of Groq's 8k/min) — verification still checks the full text.
+        blocks = "\n\n".join(
+            f"[S{i}] {h['url']}\nTITLE: {h.get('title', '')}\n"
+            f"TEXT: {(h.get('content') or '')[:_PROMPT_SOURCE_CHARS]}"
+            for i, h in enumerate(sources, start=1))
+        return f"""You extract business leads from web search results. You do NOT research, guess, or use your own knowledge.
+
+REQUEST: {message}
+
+SEARCH RESULTS:
+{blocks}
+
+Return ONLY a JSON array, no prose. One object per distinct business that the results above actually name and that matches the request:
+{{"studio_name": "...", "address": "...", "phone": "...", "email": "...", "website": "...", "source_url": "..."}}
+
+Rules:
+- source_url MUST be copied exactly from the [S#] line of the result that names the business.
+- Copy every field character-for-character from that result's text. If a field is not written there, use "{_NOT_FOUND}".
+- Never complete a masked or partial value (e.g. "98xxxx12", "Register to view") — use "{_NOT_FOUND}".
+- Directories and lead-list sites (Justdial, Clutch, etc.) are not leads themselves — but DO extract the businesses they name.
+- Prefer a business's own website as its source when it appears in the results.
+- Extract EVERY matching business in the results, ignoring any number in the request — up to {_MAX_LEAD_COUNT * 2} objects. Empty array if none."""
+
+    async def _structure_leads(self, ctx: dict, message: str, sources: list) -> list:
+        """The book's only job: turn real hits into JSON rows. Tried down the tier's
+        book list until one returns parseable JSON."""
+        prompt = self._structure_prompt(message, sources)
+        for book in select_book_for_tier("fast", ctx.get("sensitivity", "public")):
+            try:
+                result = await self._traced_book(prompt, book, ctx,
+                                                 max_tokens=_STRUCTURE_MAX_TOKENS)
+            except Exception:
+                continue
+            parsed = self._parse_json_array(result.get("raw_text"))
+            if parsed is not None:
+                print(f"[leadgen] structured by {result['book_used']}: "
+                      f"{len(parsed)} candidate(s)")
+                return parsed
+            print(f"[leadgen] {book} returned no parseable JSON — next book")
+        return []
+
+    @staticmethod
+    def _parse_json_array(text) -> list | None:
+        text = text or ""
+        start, end = text.find("["), text.rfind("]")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except ValueError:
+            return None
+        return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else None
+
+    # ── Verification — the book proposes, the sources decide ──
+    @staticmethod
+    def _norm(text: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+    @staticmethod
+    def _domain(url: str) -> str:
+        url = (url or "").strip().lower()
+        if not url or url == _NOT_FOUND:
+            return ""
+        host = urlparse(url if "//" in url else f"//{url}").hostname or ""
+        return host[4:] if host.startswith("www.") else host
+
+    @staticmethod
+    def _found(value) -> str:
+        v = str(value or "").strip()
+        return "" if v.lower() in ("", _NOT_FOUND, "unknown", "n/a", "none", "-", "—") else v
+
+    def _verify_phone(self, phone: str, text: str) -> str:
+        """The SOURCE's own rendering of the number, or not found. A whole number in
+        the text must match the book's digits (one may carry an extra country/trunk
+        prefix, or a few trailing junk digits) — so a garbled copy is replaced by what
+        the page actually says."""
+        if not phone or "x" in phone.lower():
+            return _NOT_FOUND
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) < 8:
+            return _NOT_FOUND
+        for run in _PHONE_RUN_RE.findall(text):
+            cand = re.sub(r"\D", "", run)
+            short, long_ = sorted((cand, digits), key=len)
+            if (len(short) >= 8 and len(long_) - len(short) <= 3
+                    and (long_.endswith(short) or long_.startswith(short))):
+                return " ".join(run.split())
+        return _NOT_FOUND
+
+    def _verify_email(self, email: str, text: str, own_domains: set) -> str:
+        email = email.lower()
+        if not _EMAIL_RE.fullmatch(email) or email not in text.lower():
+            return _NOT_FOUND
+        dom = email.rsplit("@", 1)[1]
+        if dom in _WEBMAIL or any(d and (dom == d or dom.endswith("." + d)) for d in own_domains):
+            return email
+        return _NOT_FOUND
+
+    def _verified_leads(self, candidates: list, sources: list, location: str) -> list:
+        """Keep a lead only if its source_url is a real search hit whose text names
+        it; every other field survives only if it appears in that source's text."""
+        by_url = {h["url"]: h for h in sources}
+        leads, seen = [], set()
+        for c in candidates:
+            name = self._found(c.get("studio_name"))
+            src = by_url.get(str(c.get("source_url") or "").strip())
+            if not name or src is None:
+                print(f"[leadgen] dropped {name!r}: source_url not a search hit")
+                continue
+            text = f"{src.get('title', '')}\n{src.get('content', '')}"
+            key = self._norm(name)
+            if len(key) < 3 or key not in self._norm(text) or key in seen:
+                print(f"[leadgen] dropped {name!r}: not named in its source (or duplicate)")
+                continue
+            seen.add(key)
+            src_domain = self._domain(src["url"])
+            website = self._found(c.get("website"))
+            web_domain = self._domain(website)
+            if not web_domain or (web_domain not in text.lower() and web_domain != src_domain):
+                website = _NOT_FOUND
+            address = self._found(c.get("address"))
+            if not address or self._norm(address) not in self._norm(text):
+                address = _NOT_FOUND
+            own = {src_domain, self._domain(website)}
+            leads.append({
+                "studio_name": name,
+                "address": address,
+                "location": location or (address if address != _NOT_FOUND else ""),
+                "phone": self._verify_phone(self._found(c.get("phone")), text),
+                "email": self._verify_email(self._found(c.get("email")), text, own),
+                "website": website,
+                "source_urls": [src["url"]],
+                "snippet": (src.get("content") or "")[:500],
+            })
+        return leads
+
+    def _evidence(self, lead: dict) -> int:
+        found = sum(lead[k] != _NOT_FOUND for k in ("phone", "email", "website", "address"))
+        own_site = lead["website"] != _NOT_FOUND and \
+            self._domain(lead["website"]) == self._domain(lead["source_urls"][0])
+        return found + own_site
+
+    async def _enrich_contacts(self, leads: list) -> list:
+        """A lead with a known website but no phone/email: read that page with Tavily
+        extract and take only what is literally on it. The page becomes a second
+        source URL. Fail-soft per lead."""
+        self._assert_in_manifest(_TAVILY)
+        from tools import tavily
+
+        async def enrich(lead):
+            if lead["website"] == _NOT_FOUND or (
+                    lead["phone"] != _NOT_FOUND and lead["email"] != _NOT_FOUND):
+                return
+            url = lead["website"] if "//" in lead["website"] else f"https://{lead['website']}"
+            try:
+                page = (await tavily.extract(url)).get("content") or ""
+            except Exception as e:
+                print(f"[leadgen] extract failed for {url}: {e}")
+                return
+            got = False
+            if lead["email"] == _NOT_FOUND:
+                for email in _EMAIL_RE.findall(page):
+                    if self._verify_email(email, page, {self._domain(url)}) != _NOT_FOUND:
+                        lead["email"], got = email.lower(), True
+                        break
+            if lead["phone"] == _NOT_FOUND:
+                m = _INTL_PHONE_RE.search(page)
+                if m:
+                    lead["phone"], got = " ".join(m.group(0).split()), True
+            if got and url not in lead["source_urls"]:
+                lead["source_urls"].append(url)
+
+        await asyncio.gather(*(enrich(lead) for lead in leads))
+        return leads
+
+    def _save_web_leads(self, leads: list, query: str) -> dict:
+        """Persist through the registry's leads tool — None in public mode, so a public
+        host can never write. Dedup (name + location) lives in save_leads."""
+        from tools.registry import get_tool
+        tool = get_tool("leads")
+        if tool is None:
+            return {"count": 0, "skipped": [], "disabled": True}
+        rows = []
+        for lead in leads:
+            contact = " · ".join(v for v in (lead["phone"], lead["email"], lead["website"])
+                                 if v != _NOT_FOUND) or _NOT_FOUND
+            research = {k: lead[k] for k in
+                        ("address", "phone", "email", "website", "source_urls", "snippet")}
+            research.update(found_via="tavily", query=query)
+            rows.append({"studio_name": lead["studio_name"], "location": lead["location"],
+                         "contact": contact,
+                         "research": json.dumps(research, ensure_ascii=False)})
+        try:
+            return tool.save_many(rows)
+        except Exception as e:
+            print(f"[leadgen] saving leads failed: {e}")
+            return {"count": 0, "skipped": [], "error": str(e)}
+
+    @staticmethod
+    def _call_sheet_row(lead: dict) -> dict:
+        """The cached row shape the call sheet export and the "save those" action read."""
+        def blank(v):
+            return "" if v == _NOT_FOUND else v
+        return {"name": lead["studio_name"], "phone": blank(lead["phone"]),
+                "website": blank(lead["website"]), "address": blank(lead["address"]),
+                "location": lead["location"], "email": blank(lead["email"]),
+                "rating": None, "reviews": 0,
+                "research": json.dumps({"source_urls": lead["source_urls"]})}
+
+    def _web_results(self, leads: list, want: int, saved: dict) -> dict:
+        def where(lead):
+            return lead["address"] if lead["address"] != _NOT_FOUND \
+                else (lead["location"] or _NOT_FOUND)
+        body = "\n\n".join(
+            f"{i}. {lead['studio_name']}\n"
+            f"   Location: {where(lead)}\n"
+            f"   Phone: {lead['phone']}\n"
+            f"   Email: {lead['email']}\n"
+            f"   Website: {lead['website']}\n"
+            f"   Source: {' , '.join(lead['source_urls'])}"
+            for i, lead in enumerate(leads, start=1))
+        short = (f" Only {len(leads)} of the {want} requested could be verified from the "
+                 "web results — say so plainly; do not pad the list.") if len(leads) < want else ""
+        if saved.get("disabled") or saved.get("error"):
+            save_note = "These leads were NOT saved."
+        else:
+            skipped = saved.get("skipped") or []
+            save_note = (f"Saved {saved.get('count', 0)} new lead(s) to the leads table"
+                         + (f"; {len(skipped)} already on file were skipped." if skipped else "."))
+        raw = (
+            f"{_WEB_PREFIX} ({len(leads)} businesses from live web search — every field "
+            "checked against its source page). Present these to Sir exactly as given, "
+            "INCLUDING each Source link. A field marked \"not found\" stays \"not found\" — "
+            "never fill, guess, or alter a name, phone, email, website, or address, and "
+            f"never add leads.{short} {save_note}\n\n" + body
+        )
+        return self._final(raw, book="tavily", deliverable=True,
+                           feedback="verified web leads")
+
+    # ── PROSPECTING FALLBACK (Google Places) ──
+    async def _run_places_prospecting(self, ctx: dict) -> dict:
         message = ctx.get("message") or ctx.get("query", "")
         region = self._detect_region(message)
         rows = await self._safe_places(message, region)
@@ -389,51 +718,11 @@ class LeadgenTeacher(Teacher):
             return False, []
         self._assert_in_manifest(_TAVILY)
         try:
-            from tools.search import web_search
-            return True, await web_search(target)
+            from tools import tavily
+            return True, await tavily.search(target)
         except Exception as e:
             print(f"[leadgen] live research unavailable: {e}")
             return False, []
-
-    # ── COMBINED (Places + Tavily → book) ──
-    async def _run_combined(self, ctx: dict) -> dict:
-        """The ask needs a local directory AND web context (e.g. "find studios in Mumbai
-        and research their reputation"). Fetch BOTH manifest tools, inject both real result
-        sets, and let the book reason a dossier grounded in them. If BOTH come back empty →
-        an honest not-found flag (no book call, nothing fabricated)."""
-        message = ctx.get("message") or ctx.get("query", "")
-        region = self._detect_region(message)
-
-        rows = await self._safe_places(message, region)
-        searched, results = await self._gather_research(ctx)
-        relevant = self._filter_relevant(message, results) if searched else []
-
-        print(f"[leadgen] combined query={message!r} -> {len(rows)} places row(s), "
-              f"{len(relevant)} relevant web result(s)")
-
-        if not rows and not relevant:
-            return self._combined_not_found(message)
-
-        # Real Places rows are still a cacheable lead set — a later "call sheet for those"
-        # exports them without re-querying, same as the pure prospecting path.
-        if rows:
-            cache_leadgen_results(ctx.get("session_id", "default"), message, rows)
-
-        ctx = {**ctx, "live_places": rows, "live_research": relevant}
-        return await super().run(ctx)
-
-    def _combined_not_found(self, message: str) -> dict:
-        """Both Places and the web search ran and returned nothing usable. No book call,
-        no fabrication — an honest not-found flag."""
-        query = (message or "").strip()
-        flag = (
-            f"{_NOT_FOUND_PREFIX} neither Google Places nor a live web search returned "
-            f"anything for \"{query}\". Tell Sir plainly nothing was found. Do NOT fabricate "
-            "any names, contacts, ratings, websites, or web-presence details. Suggest he "
-            "broaden the area/category or try different keywords."
-        )
-        return self._final(flag, book="none", deliverable=False,
-                           feedback="places + web ran, zero results — not-found flag")
 
     def _name_tokens(self, target: str) -> set:
         """Distinctive identity tokens from the target — the business's actual name,

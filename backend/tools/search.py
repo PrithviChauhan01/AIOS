@@ -14,17 +14,10 @@ Two layers, mirroring the rest of the pool:
     generic pool plumbing (registry.fetch_from) calls.
 """
 
-import httpx
-
-from config import Config
 from core.trace import record_tool
+from tools import tavily
 from tools.base import Tool
-
-_SEARCH_URL = "https://api.tavily.com/search"
-
-
-class TavilyKeyMissing(RuntimeError):
-    """Raised by web_search when TAVILY_API_KEY is not configured."""
+from tools.tavily import TavilyKeyMissing  # re-exported: callers catch it from here
 
 
 async def web_search(query: str, max_results: int = 5) -> list[dict]:
@@ -37,30 +30,7 @@ async def web_search(query: str, max_results: int = 5) -> list[dict]:
     # Recorded HERE, not at the registry: leadgen/jobs declare search in owns_tools
     # and call this structured layer directly. Name only — never the query or hits.
     record_tool("search")
-    key = (Config.TAVILY_API_KEY or "").strip()
-    if not key:
-        raise TavilyKeyMissing(
-            "TAVILY_API_KEY is not set — add it to backend/.env to enable web search.")
-
-    payload = {
-        "api_key": key,
-        "query": query,
-        "max_results": max_results,
-        "search_depth": "basic",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(_SEARCH_URL, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    results = []
-    for hit in data.get("results", [])[:max_results]:
-        results.append({
-            "title": hit.get("title", ""),
-            "url": hit.get("url", ""),
-            "content": hit.get("content", ""),
-        })
-    return results
+    return await tavily.search(query, max_results)
 
 
 class SearchTool(Tool):

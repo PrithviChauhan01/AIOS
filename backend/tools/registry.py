@@ -6,6 +6,7 @@ from core.trace import record_tool
 from tools.base import Tool
 from tools.wikipedia import WikipediaTool
 from tools.search import SearchTool
+from tools.tavily import TavilyTool
 from tools.places import PlacesTool
 from tools.reminders import RemindersTool
 from tools.jobs import JobsTool
@@ -20,6 +21,7 @@ from tools.habits import HabitsTool
 _REGISTRY = {
     "wikipedia": WikipediaTool(),   # read-only
     "search": SearchTool(),         # read-only — live web search (Tavily)
+    "tavily": TavilyTool(),         # read-only — Tavily search + extract (leadgen's handle)
     "places": PlacesTool(),         # read-only — real business directory (Google Places)
     "reminders": RemindersTool(),   # ACTION — writes state (first of its kind)
     "jobs": JobsTool(),             # ACTION — logs job applications

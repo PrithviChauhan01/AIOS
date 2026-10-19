@@ -20,6 +20,7 @@ and the real saved/skipped split is returned so cognition confirms what actually
 happened rather than claiming N new rows.
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -346,6 +347,71 @@ def due_follow_ups(today: date = None) -> list:
     return [dict(r) for r in rows]
 
 
+# ── Outreach (Slice B3) ──
+_SENT_NOTE_RE = re.compile(
+    r"^\[(?P<at>[^\]]+)\] (?P<kind>outreach|follow-up) sent: (?P<subject>.+)$", re.MULTILINE)
+_EMAIL_IN_TEXT_RE = re.compile(r"[^@\s,;·<>()]+@[^@\s,;·<>()]+\.[A-Za-z]{2,}")
+
+
+def find_lead(name: str) -> dict:
+    """resolve_lead on its own connection — the read the outreach composer needs."""
+    conn = _conn()
+    try:
+        return resolve_lead(conn, name)
+    finally:
+        conn.close()
+
+
+def lead_email(lead: dict) -> str:
+    """The ONE address on file for a lead — the verified research email first, else
+    the first address in the contact column — or "" when there is none."""
+    try:
+        email = (json.loads(lead.get("research") or "{}") or {}).get("email") or ""
+    except (ValueError, AttributeError):
+        email = ""
+    if _EMAIL_IN_TEXT_RE.fullmatch(email.strip()):
+        return email.strip()
+    m = _EMAIL_IN_TEXT_RE.search(lead.get("contact") or "")
+    return m.group(0) if m else ""
+
+
+def last_sent(lead: dict) -> dict | None:
+    """The most recent outreach/follow-up recorded in the notes log, or None:
+    {"at", "kind", "subject"}."""
+    hits = list(_SENT_NOTE_RE.finditer(lead.get("notes") or ""))
+    return hits[-1].groupdict() if hits else None
+
+
+def record_send(lead_id: int, subject: str, kind: str = "outreach") -> dict:
+    """After a REAL send only: stage → contacted (a found lead; one already further
+    along is never demoted), last contact now, follow-up +3 days (none for a closed
+    lead), and an "<kind> sent: <subject>" note. One transaction."""
+    label = "follow-up" if kind == "follow_up" else "outreach"
+    conn = _conn()
+    try:
+        row = conn.execute(f"SELECT {_LEAD_COLS} FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        if row is None:
+            return {"ok": False, "error": f"lead #{lead_id} no longer exists"}
+        lead = dict(row)
+        before = lead["stage"] or "found"
+        stage = "contacted" if before in ("found", "contacted") else before
+        follow = None if stage in CLOSED_STAGES else \
+            (_now().date() + timedelta(days=_CONTACTED_FOLLOW_UP_DAYS)).isoformat()
+        conn.execute(
+            "UPDATE leads SET stage = ?, last_contact_at = ?, next_follow_up_at = ?, "
+            "outreach_sent = 1 WHERE id = ?",
+            (stage, _now().strftime("%Y-%m-%d %H:%M:%S"), follow, lead_id))
+        if stage != before:
+            _append_note_sql(conn, lead_id, f"stage: {before} → {stage}")
+        _append_note_sql(conn, lead_id, f"{label} sent: {subject}")
+        conn.commit()
+        updated = _fetch(conn, lead_id)
+        print(f"[leads] WRITE {label} sent #{lead_id} stage={stage} follow_up={follow}")
+    finally:
+        conn.close()
+    return {"ok": True, "lead": updated, "from_stage": before, "follow_up": follow}
+
+
 # ── Pool wrapper ──
 class LeadsTool(Tool):
     """Shared-pool handle for the leads action tool. is_action=True marks it as
@@ -396,3 +462,9 @@ class LeadsTool(Tool):
 
     def due_follow_ups(self, today=None) -> list:
         return due_follow_ups(today)
+
+    def find(self, name: str) -> dict:
+        return find_lead(name)
+
+    def record_send(self, lead_id: int, subject: str, kind: str = "outreach") -> dict:
+        return record_send(lead_id, subject, kind)

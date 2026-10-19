@@ -220,6 +220,8 @@ _EMAIL_FN_NAME = {
     "reconfirm": "reconfirm_email",
     "need_address": "draft_email",
     "cancel_awaiting": "cancel_email",
+    "lead_draft": "draft_lead_email",   # outreach / follow-up to a saved lead (Slice B3)
+    "set_to": "set_email_recipient",
 }
 
 # A bare email address — to recognise the recipient on the turn AFTER we asked for it.
@@ -748,6 +750,13 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
     # 0. CONFIRM GATE — a STAGED draft (complete, awaiting yes/no) owns the turn.
     etool = get_tool("email")
     if etool is not None and etool.has_pending(session_id):
+        # A lead draft staged with no address on file: a reply carrying an address
+        # fills it in and re-shows the draft — it never sends on this turn.
+        addr = _ADDR_RE.search(msg)
+        if (addr and not (etool.get_pending(session_id) or {}).get("to")
+                and not _NEGATE.search(msg)):
+            return {"tool": "email", "action": "set_to", "to": addr.group(0),
+                    "session_id": session_id, "raw_message": msg}
         return {"tool": "email", "action": _classify_confirm(msg),
                 "session_id": session_id, "raw_message": msg}
 
@@ -784,7 +793,13 @@ def _detect(message: str, session_id: str = "default") -> dict | None:
     # today?") — deterministic, parsed by the leadgen teacher, which owns the language.
     # Ahead of the jobs/leads gates: "add note to 8K: …" must not reach an extractor.
     # Local import: agents.leadgen pulls the teacher stack, which imports core.
-    from agents.leadgen import parse_pipeline_command
+    from agents.leadgen import parse_outreach_command, parse_pipeline_command
+    # "draft outreach / follow-up to <studio>" → a lead email staged through the
+    # mailer's confirm gate (Slice B3). Drafting only; sending needs a later "send it".
+    outreach = parse_outreach_command(msg)
+    if outreach is not None:
+        return {"tool": "email", "action": "lead_draft", **outreach,
+                "session_id": session_id}
     pipeline = parse_pipeline_command(msg)
     if pipeline is not None:
         return {"tool": "leads", **pipeline, "session_id": session_id}
@@ -895,7 +910,7 @@ _WRITE_VERBS = {
     "fitness": {"log"},
     "study": {"log"},
     "habits": {"mark"},
-    "email": {"draft", "send", "revise", "cancel", "cancel_awaiting"},
+    "email": {"draft", "send", "revise", "cancel", "cancel_awaiting", "lead_draft", "set_to"},
 }
 
 _WS_RE = re.compile(r"\s+")
@@ -1120,8 +1135,17 @@ def _run_email(action: dict) -> dict:
         if verb == "cancel_awaiting":
             _AWAITING_EMAIL.pop(session, None)
             return {"ok": True, "cancelled": True, "had_draft": False}
+        if verb == "lead_draft":
+            return _draft_lead_email(tool, session, action)
+        if verb == "set_to":
+            return tool.set_recipient(session, action.get("to"))
         if verb == "send":
-            return tool.confirm_send(session)      # sends ONLY here, after explicit yes
+            # Read the lead link BEFORE sending: a successful send clears the draft.
+            pending = dict(tool.get_pending(session) or {})
+            res = tool.confirm_send(session)      # sends ONLY here, after explicit yes
+            if res.get("ok") and res.get("sent") and pending.get("lead_id"):
+                res = {**res, **_after_lead_send(pending)}
+            return res
         if verb == "revise":
             return tool.revise(session, action.get("raw_message"))
         if verb == "cancel":
@@ -1132,6 +1156,54 @@ def _run_email(action: dict) -> dict:
         print(f"[orch] email action {verb} failed: {e}")
         return {"ok": False, "error": str(e)}
     return {"ok": False, "error": f"unknown email verb {verb}"}
+
+
+def _draft_lead_email(tool, session: str, action: dict) -> dict:
+    """Compose an outreach / follow-up for a SAVED lead from its own research, then
+    stage it like any draft. A lead with no email on file is still drafted — staged
+    with no recipient, so it cannot send until Sir supplies one address."""
+    leads_tool = get_tool("leads")
+    if leads_tool is None:
+        return {"ok": False, "error": "leads unavailable", "stage": "draft"}
+    found = leads_tool.find(action.get("name"))
+    if not found.get("ok"):
+        return {**found, "stage": "draft"}
+    lead = found["lead"]
+    kind = action.get("kind") or "outreach"
+    from agents.leadgen import compose_lead_email  # local: avoids the core↔agents cycle
+    composed = compose_lead_email(lead, kind)
+    if not composed.get("ok"):
+        return {**composed, "stage": "draft"}
+    from tools.leads import lead_email
+    to = lead_email(lead)
+    draft = {"ok": True, "to": to, "to_name": lead["studio_name"],
+             "subject": composed["subject"], "body": composed["body"],
+             "lead_id": lead["id"], "kind": kind}
+    _AWAITING_EMAIL.pop(session, None)
+    tool.stage(session, draft)                 # staged, awaiting explicit confirm
+    print(f"[email] lead {kind} draft for #{lead['id']} -> awaiting confirm "
+          f"({'address on file' if to else 'NO address'})")
+    return {**draft, "stage": "draft", "missing_address": not to}
+
+
+def _after_lead_send(pending: dict) -> dict:
+    """Runs ONLY after a real, successful send of a lead draft: update the lead
+    (stage/last contact/follow-up/note) and set a reminder for the follow-up date.
+    A failure here never un-sends anything — it is reported alongside the send."""
+    out = {"lead_update": None, "reminder": None}
+    try:
+        upd = get_tool("leads").record_send(pending["lead_id"], pending["subject"],
+                                            pending.get("kind") or "outreach")
+        out["lead_update"] = upd
+        if upd.get("ok") and upd.get("follow_up"):
+            studio = upd["lead"]["studio_name"]
+            out["reminder"] = get_tool("reminders").set(
+                f"Follow up with {studio} (re: {pending['subject']})",
+                f"{upd['follow_up']} 10:00")
+    except Exception as e:
+        print(f"[email] post-send lead update failed: {e}")
+        out["lead_update"] = out["lead_update"] or {"ok": False, "error": str(e)}
+    return out
 
 
 def _run_documents(action: dict) -> dict:
@@ -1400,14 +1472,27 @@ def _email_material(verb: str, res: dict) -> str:
     def _draft_view(r):
         return (f"TO: {r.get('to')}\nSUBJECT: {r.get('subject')}\n\n{r.get('body')}")
 
-    if verb in ("draft", "revise", "reconfirm", "need_address"):
+    if verb in ("draft", "revise", "reconfirm", "need_address", "lead_draft", "set_to"):
+        if not res.get("ok") and verb == "set_to" and res.get("subject"):
+            return ("ACTION NOT DONE — the address wasn't accepted; the draft is unchanged "
+                    f"and nothing was sent. Put this to Sir: {res.get('ask')}")
         if not res.get("ok"):
             # draft not built yet (missing recipient/topic) — relay the ask, nothing staged.
             return (f"ACTION NOT DONE — no draft is staged yet ({res.get('needs') or res.get('error')}). "
                     f"Do NOT claim anything was sent or drafted. Put this to Sir: {res.get('ask')}")
         lead = {"draft": "Here is the draft — NOT sent yet",
+                "lead_draft": "Here is the draft — NOT sent yet",
                 "revise": "Here is the revised draft — still NOT sent",
+                "set_to": "The address is set; here is the draft again — still NOT sent",
                 "reconfirm": "This email is still staged, NOT sent"}[verb]
+        if not res.get("to"):
+            return (
+                f"ACTION STAGED (NOT SENT) — {lead}. There is NO email address on file for "
+                f"{res.get('to_name') or 'this lead'}: tell Sir plainly the address is "
+                "missing and nothing can send until he gives you one address. Show the "
+                "draft EXACTLY as below (do not rewrite it). Do NOT claim it was sent."
+                "\n\n" + _draft_view({**res, "to": "(missing — no email on file)"})
+            )
         return (
             f"ACTION STAGED (NOT SENT) — {lead}. Show Sir the draft EXACTLY as below "
             "(do not rewrite the body — this is what will actually send), then ask him "
@@ -1417,8 +1502,9 @@ def _email_material(verb: str, res: dict) -> str:
 
     if verb == "send":
         if res.get("ok") and res.get("sent"):
-            return (f"ACTION EXECUTED — the email was ACTUALLY SENT to {res.get('to')} "
-                    f"(subject {res.get('subject')!r}). This really happened. Confirm to Sir, minimally.")
+            sent = (f"ACTION EXECUTED — the email was ACTUALLY SENT to {res.get('to')} "
+                    f"(subject {res.get('subject')!r}). This really happened.")
+            return sent + _lead_send_lines(res) + " Confirm to Sir, minimally."
         # not sent — config missing or send error; draft may still be pending.
         return (f"ACTION NOT DONE — the email was NOT sent ({res.get('error')}). Do NOT "
                 f"claim it sent. Relay to Sir: {res.get('ask')}")
@@ -1431,6 +1517,25 @@ def _email_material(verb: str, res: dict) -> str:
         return ("ACTION EXECUTED — there was no draft to cancel; nothing was sent. "
                 "Tell Sir there was nothing pending.")
     return "ACTION NOT DONE — nothing to cancel."
+
+
+def _lead_send_lines(res: dict) -> str:
+    """What the post-send lead update actually did — stated from the real results."""
+    upd = res.get("lead_update")
+    if upd is None:
+        return ""
+    if not upd.get("ok"):
+        return (f" BUT the lead record was NOT updated ({upd.get('error')}) — tell Sir "
+                "so he can mark it by hand.")
+    lead = upd["lead"]
+    line = f" Lead {lead['studio_name']} is now '{lead['stage']}'"
+    line += f", next follow-up {upd['follow_up']}." if upd.get("follow_up") else "."
+    rem = res.get("reminder")
+    if rem and rem.get("ok"):
+        line += f" A follow-up reminder is set for {rem.get('due_at')}."
+    elif upd.get("follow_up"):
+        line += " The follow-up reminder could NOT be set — say so."
+    return line
 
 
 def _documents_material(verb: str, res: dict) -> str:

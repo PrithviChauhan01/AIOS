@@ -342,7 +342,8 @@ async def _handle_message(message: str, session_id: str, voice_flag: bool,
         # An email draft / revision / re-show is a structured block (to/subject/body)
         # she must present in full — give cognition deliverable room, not the 60-token
         # confirmation cap.
-        if action.get("tool") == "email" and action["action"] in ("draft", "revise", "reconfirm"):
+        if action.get("tool") == "email" and action["action"] in (
+                "draft", "revise", "reconfirm", "lead_draft", "set_to"):
             ctx["deliverable"] = True
         # The leads pipeline / follow-up list is a table — same deliverable room.
         if action.get("tool") == "leads" and action["action"] in LEADS_TABLE_VERBS:

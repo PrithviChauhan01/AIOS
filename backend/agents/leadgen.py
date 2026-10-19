@@ -170,12 +170,29 @@ def _clean_when(when: str) -> str:
                   flags=re.IGNORECASE)
 
 
+# Outreach drafts (Slice B3) — staged through the mailer's confirm gate.
+_P_DRAFT = re.compile(
+    rf"^\s*(?:please\s+)?(?:draft|write|prepare|compose)\s+(?:an?\s+|the\s+)?"
+    rf"(?P<kind>outreach|cold|intro|{_FU})(?:\s+(?:email|e-mail|mail|message|note))?"
+    rf"\s+(?:to|for)\s+(?P<name>.+?)\s*[.!]?\s*$", re.IGNORECASE)
+
+
+def parse_outreach_command(message: str) -> dict | None:
+    """'draft outreach to <studio>' / 'draft follow-up to <studio>' →
+    {"kind": "outreach"|"follow_up", "name"}, else None."""
+    m = _P_DRAFT.search(message or "")
+    if not m or not _clean_lead_name(m.group("name")):
+        return None
+    kind = "follow_up" if m.group("kind").lower().startswith("follow") else "outreach"
+    return {"kind": kind, "name": _clean_lead_name(m.group("name"))}
+
+
 def parse_pipeline_command(message: str) -> dict | None:
     """A pipeline command → {"action": stage|note|follow_up|due|pipeline|list_stage,
     ...fields}, or None. Reads are checked before writes so "who should I follow up
     with today?" can never parse as setting a follow-up for "who"."""
     msg = (message or "").strip()
-    if not msg:
+    if not msg or parse_outreach_command(msg):
         return None
     if _P_DUE.search(msg):
         return {"action": "due"}
@@ -200,6 +217,115 @@ def parse_pipeline_command(message: str) -> dict | None:
         return {"action": "follow_up", "name": _clean_lead_name(m.group("name")),
                 "when": _clean_when(m.group("when"))}
     return None
+
+
+# ── Outreach composition (Slice B3) ──
+# The book writes; code decides what it may say. Facts come only from the lead's
+# saved row (name, location, website, the source snippet) and Config.STUDIO_OS_PITCH.
+# A draft that carries a URL, email or phone number not in those facts is thrown
+# away for the deterministic template — the cheapest reliable no-invention check.
+_OUTREACH_PROMPT = """You write a short, personalised cold email from Prithvi to a studio.
+Return ONLY a JSON object: {"subject": "...", "body": "..."}
+Rules:
+- Use ONLY the facts provided. Do not invent clients, projects, awards, numbers, names, prices, links or anything else about the studio.
+- Describe Studio OS ONLY with the pitch line provided — no extra features or claims.
+- Body: 3-5 short sentences: one specific line about the studio from the facts, what Studio OS is, one low-pressure ask (a short call or reply).
+- Subject: short and specific, no clickbait.
+- Address the studio by name ("Hi <studio> team,"). Sign off exactly as "Prithvi".
+JSON only."""
+
+_FOLLOW_UP_PROMPT = """You write a brief follow-up email from Prithvi to a studio he already emailed.
+Return ONLY a JSON object: {"subject": "...", "body": "..."}
+Rules:
+- 2-3 short sentences. Reference the previous email by its subject. Polite, no guilt-tripping.
+- Use ONLY the facts provided — invent nothing about the studio or the product.
+- Subject: "Re: <previous subject>".
+- Sign off exactly as "Prithvi".
+JSON only."""
+
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+|\b[a-z0-9-]+\.(?:com|in|co|io|net|org|ai)\b",
+                     re.IGNORECASE)
+_DIGIT_RUN_RE = re.compile(r"\+?\d[\d\s-]{6,}\d")
+
+
+def _lead_facts(lead: dict) -> dict:
+    try:
+        research = json.loads(lead.get("research") or "{}") or {}
+    except ValueError:
+        research = {}
+    def known(v):
+        return v if v and str(v).strip().lower() != _NOT_FOUND else ""
+    return {
+        "studio": lead["studio_name"],
+        "location": known(lead.get("location")) or known(research.get("address")),
+        "website": known(research.get("website")),
+        "source_excerpt": (research.get("snippet") or "")[:600],
+    }
+
+
+def _invents(body: str, allowed: str) -> bool:
+    """True if the body carries a URL, email or phone number the facts don't."""
+    low = allowed.lower()
+    tokens = _URL_RE.findall(body) + _EMAIL_RE.findall(body)
+    if any(t.lower().rstrip(".,)") not in low for t in tokens):
+        return True
+    digits_allowed = re.sub(r"\D", "", allowed)
+    return any(re.sub(r"\D", "", d) not in digits_allowed for d in _DIGIT_RUN_RE.findall(body))
+
+
+def _signed(body: str) -> str:
+    body = body.rstrip()
+    return body if body.splitlines()[-1].strip().lower().endswith("prithvi") \
+        else f"{body}\n\nBest,\nPrithvi"
+
+
+def _outreach_fallback(facts: dict, pitch: str) -> tuple:
+    where = f" in {facts['location']}" if facts["location"] else ""
+    body = (f"Hi {facts['studio']} team,\n\n"
+            f"I came across {facts['studio']}{where} while looking at studios doing "
+            f"video work. I'm Prithvi — I'm building {pitch}.\n\n"
+            "Would you be open to a short call, or a quick reply if it sounds relevant?\n\n"
+            "Best,\nPrithvi")
+    return f"{facts['studio']} x Studio OS", body
+
+
+def _follow_up_fallback(facts: dict, prev: dict) -> tuple:
+    body = (f"Hi {facts['studio']} team,\n\n"
+            f"Just following up on my email \"{prev['subject']}\". Happy to share more "
+            "or set up a short call whenever suits you.\n\nBest,\nPrithvi")
+    return f"Re: {prev['subject']}", body
+
+
+def compose_lead_email(lead: dict, kind: str = "outreach") -> dict:
+    """{"ok": True, "subject", "body"} for a lead outreach / follow-up, or a clarify
+    when a follow-up has no earlier email on record. Never raises."""
+    from config import Config
+    from tools import leads as leads_tool
+    from tools.mailer import compose_with
+
+    facts = _lead_facts(lead)
+    pitch = (Config.STUDIO_OS_PITCH or "").strip() or "Studio OS"
+    if kind == "follow_up":
+        prev = leads_tool.last_sent(lead)
+        if prev is None:
+            return {"ok": False, "needs": "previous_email",
+                    "ask": f"I have no earlier email to {facts['studio']} on record, Sir — "
+                           "draft the outreach first."}
+        facts["previous_email"] = {"subject": prev["subject"], "sent": prev["at"]}
+        system, fallback = _FOLLOW_UP_PROMPT, _follow_up_fallback(facts, prev)
+    else:
+        facts["studio_os_pitch"] = pitch
+        system, fallback = _OUTREACH_PROMPT, _outreach_fallback(facts, pitch)
+
+    allowed = json.dumps(facts, ensure_ascii=False) + " " + pitch
+    composed = compose_with(system, "FACTS:\n" + json.dumps(facts, ensure_ascii=False, indent=1))
+    if composed and not _invents(composed[1], allowed) and not _invents(composed[0], allowed):
+        subject, body = composed
+    else:
+        if composed:
+            print(f"[leadgen] {kind} draft carried a detail not in the facts — template used")
+        subject, body = fallback
+    return {"ok": True, "subject": subject.strip(), "body": _signed(body)}
 
 
 def is_export_request(message: str) -> bool:

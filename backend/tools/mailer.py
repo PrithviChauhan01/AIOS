@@ -25,10 +25,20 @@ from config import Config
 from core.net import CLOUD_TIMEOUT, with_retry
 from tools.base import Tool
 
-# session_id -> {"to", "to_name", "subject", "body"} pending an explicit confirm.
+# session_id -> {"to", "to_name", "subject", "body"} pending an explicit confirm, plus
+# "lead_id"/"kind" when the draft is lead outreach (so a REAL send can update the lead).
+# "to" may be "" for a lead with no email on file — such a draft can never send until
+# set_recipient fills it.
 _PENDING = {}
 
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+# What a confirmation may send to: exactly ONE address. No separators, no spaces —
+# "a@x.com, b@y.com" or "a@x.com;b@y.com" is refused, never split and sent twice.
+_SINGLE_RECIPIENT_RE = re.compile(r"[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+")
+
+
+def is_single_recipient(to: str) -> bool:
+    return bool(_SINGLE_RECIPIENT_RE.fullmatch((to or "").strip()))
 
 _client = None
 
@@ -101,6 +111,21 @@ def _compose(recipient: str, topic: str, instruction: str):
     return subject, body
 
 
+def compose_with(system_prompt: str, user_content: str):
+    """(subject, body) from a caller-supplied prompt — leadgen's outreach composer —
+    or None if the book is unavailable or returns no usable JSON. The caller owns
+    the fallback, because only it knows which facts a fallback may use."""
+    try:
+        r = _compose_call([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ])
+        return _parse_subject_body(r.choices[0].message.content)
+    except Exception as e:
+        print(f"[email] compose_with failed ({e})")
+        return None
+
+
 def _compose_revise(current: dict, instruction: str):
     """Recompose an existing draft per a change request. On failure, leaves it as-is."""
     try:
@@ -167,8 +192,26 @@ def make_draft(to: str, recipient: str, topic: str, instruction: str) -> dict:
 
 
 def stage(session_id: str, draft: dict) -> None:
-    _PENDING[session_id] = {"to": draft["to"], "to_name": draft.get("to_name", ""),
+    _PENDING[session_id] = {"to": draft.get("to") or "", "to_name": draft.get("to_name", ""),
                             "subject": draft["subject"], "body": draft["body"]}
+    for key in ("lead_id", "kind"):
+        if draft.get(key) is not None:
+            _PENDING[session_id][key] = draft[key]
+
+
+def set_recipient(session_id: str, to: str) -> dict:
+    """Fill in the address of a staged draft that had none (a lead with no email on
+    file). Never sends — the draft is re-shown and still needs an explicit yes."""
+    d = _PENDING.get(session_id)
+    if not d:
+        return {"ok": False, "error": "no_pending"}
+    to = (to or "").strip()
+    if not is_single_recipient(to):
+        return {"ok": False, "needs": "to", "stage": "reconfirm", **d,
+                "ask": "I can send to exactly one address, Sir — which one?"}
+    d["to"] = to
+    print("[email] recipient set -> awaiting confirm")
+    return {"ok": True, "stage": "reconfirm", **d}
 
 
 def has_pending(session_id: str) -> bool:
@@ -209,6 +252,18 @@ def confirm_send(session_id: str) -> dict:
     if not d:
         return {"ok": False, "error": "no_pending",
                 "ask": "There's no email waiting to send, Sir."}
+    # One confirmation sends to one recipient — checked here, at the only door to
+    # SMTP, so no draft path (lead outreach, a revise, a typed address) can widen it.
+    if not d.get("to"):
+        return {"ok": False, "error": "no_recipient", "sent": False, "pending": True,
+                "subject": d["subject"],
+                "ask": "There's no email address for this one yet, Sir — tell me the "
+                       "address and I'll show the draft again before sending."}
+    if not is_single_recipient(d["to"]):
+        return {"ok": False, "error": "multiple_recipients", "sent": False, "pending": True,
+                "to": d["to"], "subject": d["subject"],
+                "ask": "That draft isn't addressed to exactly one recipient, Sir — "
+                       "I won't send it. Give me the one address to use."}
     res = _send_smtp(d["to"], d["subject"], d["body"])
     if res.get("ok"):
         _PENDING.pop(session_id, None)
@@ -263,3 +318,6 @@ class EmailTool(Tool):
 
     def reconfirm(self, session_id):
         return reconfirm(session_id)
+
+    def set_recipient(self, session_id, to):
+        return set_recipient(session_id, to)

@@ -63,6 +63,10 @@ class Config:
     # Empty → the email tool drafts but refuses to send, with a clear instruction.
     GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
     GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+    # The one line outreach emails may say about Studio OS. The composer is told to
+    # describe the product ONLY with this text, so set it to what Studio OS really is.
+    STUDIO_OS_PITCH = os.getenv(
+        "STUDIO_OS_PITCH", "Studio OS, software I'm building for creative studios")
 
     # Anchored to backend/ so writer and scheduler (and every other consumer)
     # always open the same file, independent of CWD.

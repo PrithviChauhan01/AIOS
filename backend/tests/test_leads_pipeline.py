@@ -49,6 +49,8 @@ class PipelineCase(unittest.TestCase):
             self.addCleanup(p.stop)
         leads._SCHEMA_READY.discard(leads._db_path())
         action_dispatch._idem_store.clear()
+        from tools import mailer
+        mailer._PENDING.clear()  # a staged draft would own this session's turns
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
     def lead(self, name):

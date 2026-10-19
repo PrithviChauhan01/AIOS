@@ -174,6 +174,25 @@ class ProjectTest(BusinessCase):
                          [("Deadline: Brand film (Verve Media)", "2026-10-30 10:00:00")])
         self.assertIn("A reminder is set for 2026-10-30 10:00:00", material)
 
+    def test_title_containing_for_resolves_against_real_client(self):
+        business.add_client("Verve Media")
+        _, res, _ = self.turn("add project Content for socials for Verve Media, fee 20000")
+        self.assertTrue(res["ok"])
+        self.assertEqual((res["project"]["title"], res["project"]["client"]),
+                         ("Content for socials", "Verve Media"))
+
+    def test_title_resplit_never_guesses(self):
+        # "X for Y for A for B": both "A for B" and "B" are real clients → ambiguous.
+        business.add_client("A for B")
+        business.add_client("B")
+        res = business.add_project("Y for A for B", "X")
+        self.assertFalse(res["ok"])
+        self.assertIn("no client called", res["ask"])
+        self.assertFalse(business.add_project("nobody for anyone", "Edit")["ok"])
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0)
+        conn.close()
+
     def test_unknown_client_changes_nothing(self):
         _, res, _ = self.turn("add project Brand film for Nobody Co")
         self.assertFalse(res["ok"])

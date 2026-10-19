@@ -213,6 +213,24 @@ def _deadline_reminder(project: dict) -> dict | None:
                          project.get("deadline"))
 
 
+def _resplit_title(conn, title: str, client: str, not_found: dict) -> tuple:
+    """The parser splits "add project X for Y" at the FIRST " for ", so a title that
+    itself contains "for" ("Content for socials for Verve Media") arrives as
+    title="Content", client="socials for Verve Media". Rejoin and try every " for "
+    split; use the one whose remainder is EXACTLY one existing client. None or
+    several → the original not-found clarify, never a guess."""
+    full = f"{title} for {client}"
+    names = {_norm(c["name"]): c for c in _clients(conn)}
+    hits = []
+    for m in re.finditer(r"\s+for\s+", full, re.IGNORECASE):
+        head, tail = full[:m.start()].strip(), full[m.end():].strip()
+        if head and _norm(tail) in names:
+            hits.append((head, names[_norm(tail)]))
+    if len(hits) == 1:
+        return hits[0][0], {"ok": True, "client": hits[0][1]}
+    return title, not_found
+
+
 def add_project(client: str, title: str, deadline=None, fee=None, notes: str = None) -> dict:
     title = " ".join((title or "").split())
     if not title:
@@ -225,6 +243,8 @@ def add_project(client: str, title: str, deadline=None, fee=None, notes: str = N
     conn = _conn()
     try:
         found = resolve_client(conn, client)
+        if not found["ok"] and found.get("not_found"):
+            title, found = _resplit_title(conn, title, client, found)
         if not found["ok"]:
             return found
         cl = found["client"]

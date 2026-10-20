@@ -16,6 +16,8 @@ from core.provider_health import provider_of
 
 # ── Capability map — exact values from LLD §4 ──
 CAPABILITY_MAP = {
+    # Kimi K2.5 on Amazon Bedrock — the MAIN book. Paid (instance-role billed), hence 'ltd'.
+    "bedrock_kimi": {"speed": "med", "reasoning": "frontier", "context": "huge", "cost": "ltd", "tier": "cloud"},
     "groq":     {"speed": "high", "reasoning": "good",   "context": "med",   "cost": "free", "tier": "cloud"},
     "cerebras": {"speed": "high", "reasoning": "good",   "context": "med",   "cost": "free", "tier": "cloud"},
     "mistral":  {"speed": "med",  "reasoning": "good",   "context": "huge",  "cost": "free", "tier": "cloud"},
@@ -33,6 +35,7 @@ _CONTEXT   = {"small": 0, "med": 1, "large": 2, "huge": 3}
 _COST      = {"free": 0, "ltd": 1}  # lower is cheaper, cheaper preferred
 
 _MODELS = {
+    "bedrock_kimi": "moonshotai.kimi-k2.5",
     # Groq retired the llama-3.x models on 2026-08-16 — gpt-oss replaces both tiers.
     "groq":     "openai/gpt-oss-120b",
     "groq_fast":"openai/gpt-oss-20b",
@@ -143,26 +146,50 @@ def _fit_key(book: str, spec: dict):
             overprovision += max(0, scale[caps[field]] - scale[spec[field]])
     return (overprovision, _COST[caps["cost"]], -_SPEED[caps["speed"]])
 
-# ── Hard-reasoning preference ──
-# Some turns want raw reasoning horsepower regardless of how modest the capability
-# spec is. loop_worthy (the hardest reasoning) prefers the 550B Nemotron Ultra; a
-# merely complex turn prefers the 120B Nemotron Super. Either way the tail is the
-# proven free chain: groq 70b → cerebras. Books that are benched/unavailable are
-# dropped here and the caller simply falls through to the next one.
-def _hard_reasoning_order(loop_worthy, complexity) -> list:
-    if loop_worthy:
-        return ["nemotron_ultra", "nemotron_super", "groq", "groq_qwen", "cerebras"]
-    if complexity == "complex":
-        return ["nemotron_super", "groq", "groq_qwen", "cerebras"]
-    return []
+# ── Main chain ──
+# The fixed order every selector leads with: Kimi K2.5 on Bedrock → Groq gpt-oss-120b
+# → Cerebras gpt-oss-120b → ollama (local, always LAST). Benched/disabled books are
+# dropped and the caller simply falls through to the next one.
+_MAIN_CHAIN = ["bedrock_kimi", "groq", "cerebras"]
+_LOCAL_BOOK = "ollama"
+
+
+def _with_local_tail(books) -> list:
+    """ollama goes last — after every cloud book, never ahead of one — and only
+    while its circuit is closed."""
+    books = [b for b in books if b != _LOCAL_BOOK]
+    if _closed(_LOCAL_BOOK):
+        books.append(_LOCAL_BOOK)
+    return books
+
+
+def _why_unusable(book: str):
+    """Why selection dropped a book, or None when it didn't. An unconfigured book
+    returns None too: that was logged once at startup and must not repeat per turn."""
+    if book not in _CONFIGURED:
+        return None
+    if not health.allow_book(book):
+        return f"{provider_of(book)} circuit {health.circuit_of(provider_of(book))}"
+    if not _available(book):
+        return "rate-limit cooldown"
+    return None
+
+
+def _log_skipped(books, picked) -> None:
+    for b in books:
+        if b not in picked:
+            why = _why_unusable(b)
+            if why:
+                print(f"[books] skipping {b} — {why}")
 
 def select_book(capability_spec: dict, sensitivity_tier: str,
                 complexity: str = None, loop_worthy: bool = None) -> list:
     """Return books ordered best→worst. Caller calls call_book down the list,
     falling back to the next candidate on failure.
 
-    complexity / loop_worthy steer the hard-reasoning preference (Nemotron). They may
-    be passed explicitly or ride inside capability_spec — explicit args win."""
+    The main chain (bedrock_kimi → groq → cerebras) always leads, other fitting
+    books trail, ollama is last. complexity / loop_worthy are still accepted for
+    callers but no longer change the order."""
     # secret → ollama only, hard filter, no exception. Neither bench applies: there is
     # nowhere else to go BY DESIGN. If ollama's circuit is open the call is refused at
     # the choke point and the turn FAILS to the degradation line — a secret turn never
@@ -170,11 +197,6 @@ def select_book(capability_spec: dict, sensitivity_tier: str,
     # circuit, always.
     if sensitivity_tier == "secret":
         return ["ollama"]
-
-    if complexity is None:
-        complexity = capability_spec.get("complexity")
-    if loop_worthy is None:
-        loop_worthy = capability_spec.get("loop_worthy")
 
     # Cooldowns relax when everything is benched; open circuits never do. ollama is
     # in CAPABILITY_MAP, so an all-cloud-open pool naturally leaves the local book as
@@ -195,27 +217,21 @@ def select_book(capability_spec: dict, sensitivity_tier: str,
             -_SPEED[CAPABILITY_MAP[b]["speed"]],
         ))
 
-    # Promote the hard-reasoning chain to the front when the turn calls for it. Only
-    # books that are actually available (not benched) lead; the rest of the fit-ordered
-    # list trails as further fallback.
-    front = [b for b in _hard_reasoning_order(loop_worthy, complexity) if b in pool]
-    if front:
-        ordered = front + [b for b in ordered if b not in front]
-    return ordered
+    # The main chain leads whatever the spec. Only books that are actually available
+    # (not benched) lead; the rest of the fit-ordered list trails, ollama last.
+    front = [b for b in _MAIN_CHAIN if b in pool]
+    _log_skipped(_MAIN_CHAIN, front)
+    return _with_local_tail(front + [b for b in ordered if b not in front])
 
 # ── Reasoning tiers — teachers declare one; selection honors it ──
-# A teacher names the reasoning tier it wants and we map that to an ordered book pool
-# with the proven free chain (groq 70b → cerebras) as the tail. This REPLACES the old
-# dependence on triage's complexity guess to fire Nemotron: a 'strong' teacher gets
-# Nemotron Super on the FIRST pass regardless of how the local 3B triage rated the turn.
+# A teacher names the reasoning tier it wants and we map that to an ordered book pool.
+# Every tier currently runs the main chain (Kimi K2.5 on Bedrock → groq → cerebras,
+# ollama appended last); the tiers are kept so teachers can diverge again later.
 # Availability/cooldown aware — benched books are dropped and the caller falls through.
-# Nemotron is the DEFAULT for real reasoning (Super leads, Ultra is the reasoning
-# fallback); Groq 70b → Cerebras is the quota-fallback tail once Nemotron is exhausted
-# or benched. 'fast' stays Groq-only — formats/light reasoning don't need Nemotron.
 _TIER_BOOKS = {
-    "fast":     ["groq", "groq_qwen", "cerebras"],                                     # formats/light reasoning
-    "strong":   ["nemotron_super", "nemotron_ultra", "groq", "groq_qwen", "cerebras"], # real reasoning
-    "frontier": ["nemotron_super", "nemotron_ultra", "groq", "groq_qwen", "cerebras"], # hardest
+    "fast":     list(_MAIN_CHAIN),
+    "strong":   list(_MAIN_CHAIN),
+    "frontier": list(_MAIN_CHAIN),
 }
 _TIER_ORDER = ["fast", "strong", "frontier"]
 _DEFAULT_TIER = "fast"
@@ -244,15 +260,12 @@ def select_book_for_tier(tier: str, sensitivity_tier: str,
         return ["ollama"]
     eff = upgrade_tier(tier, complexity, loop_worthy)
     order = _TIER_BOOKS.get(eff, _TIER_BOOKS[_DEFAULT_TIER])
-    # Nemotron on cooldown (recent quota/429) → demote to Groq for this turn. _available
-    # already drops the benched Nemotron books; this just surfaces it in the log.
-    if _nemotron_cooling() and any(b in _NEMOTRON_BOOKS for b in order):
-        print("[books] nemotron cooling → groq")
     avail = _pool(order)
+    _log_skipped(order, avail)
     # A tier list is cloud-only, so an empty one means every cloud circuit in this
     # tier is open — that is exactly the fall-to-local case, not a reason to hand
-    # back dead candidates.
-    return avail if avail else _local_fallback()
+    # back dead candidates. Otherwise ollama trails the cloud books as the last resort.
+    return _with_local_tail(avail) if avail else _local_fallback()
 
 
 # ── Ensemble book pairing — two DIFFERENT books when the brain decides ensemble=true ──
@@ -282,6 +295,8 @@ def select_ensemble_books(tier: str, sensitivity_tier: str,
     degrades to a single pass. secret → ['ollama'] (one local book; caller must not ensemble)."""
     ordered = select_book_for_tier(tier, sensitivity_tier,
                                    complexity=complexity, loop_worthy=loop_worthy)
+    # The local tail is a last resort, not an ensemble partner — unless it is all there is.
+    ordered = [b for b in ordered if b != _LOCAL_BOOK] or ordered
     picked, seen = [], set()
     for b in ordered:
         fam = _book_family(b)
@@ -358,6 +373,30 @@ def nvidia_client():
                                     timeout=LONG_TIMEOUT, max_retries=0)
     return _clients["nvidia"]
 
+# Amazon Bedrock — credentials come from boto3's default chain (the EC2 instance role
+# on the server; nothing in .env). The long read budget is the client default because
+# Kimi K2.5 reasons before it answers. botocore's own retries are off: with_retry is
+# the only retry authority, exactly as for the SDK clients above.
+_BEDROCK_REGION = "ap-south-1"
+
+def bedrock_client():
+    if "bedrock" not in _clients:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        _clients["bedrock"] = boto3.client(
+            "bedrock-runtime", region_name=_BEDROCK_REGION,
+            config=BotoConfig(connect_timeout=LONG_TIMEOUT.connect,
+                              read_timeout=LONG_TIMEOUT.read,
+                              retries={"total_max_attempts": 1, "mode": "standard"}))
+    return _clients["bedrock"]
+
+
+def _bedrock_converse(prompt: str, max_tokens: int) -> dict:
+    return bedrock_client().converse(
+        modelId=_MODELS["bedrock_kimi"],
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": max_tokens})
+
 # ── Deterministic reachability probe (/health/deep) ──
 # Lists the provider's MODELS: a real HTTP round trip on the real key, no completion,
 # no tokens, no model asked to judge anything. Two deliberate properties:
@@ -371,6 +410,9 @@ def nvidia_client():
 #   assistant runs on. /health/deep answers from recorded call outcomes by default and
 #   only pings when explicitly asked to.
 _PING_CLIENTS = {
+    # bedrock-runtime has no model list — the ping is a tiny converse. Opt-in at
+    # /health/deep, so it only costs when asked.
+    "bedrock": lambda: _bedrock_converse("ping", _BEDROCK_PROBE_TOKENS),
     "groq": lambda: groq_client().models.list(),
     "cerebras": lambda: _cerebras_client().models.list(),
     "nvidia": lambda: nvidia_client().models.list(),
@@ -382,6 +424,8 @@ _PING_CLIENTS = {
 # Which key each provider needs — reported so a "down" provider that simply has no
 # key configured reads as unconfigured rather than broken.
 _PROVIDER_KEY = {
+    # No key: the instance role. "Configured" means the startup probe passed.
+    "bedrock": lambda: "iam-role" if "bedrock_kimi" in _CONFIGURED else "",
     "groq": lambda: Config.GROQ_API_KEY,
     "cerebras": lambda: Config.CEREBRAS_API_KEY,
     "nvidia": lambda: Config.NVIDIA_API_KEY,
@@ -401,6 +445,7 @@ def key_configured(provider: str) -> bool:
 # mistral on most installs). Decide once at import, log once, and keep it out of
 # selection entirely instead of spending a turn rediscovering it.
 _PROVIDER_PACKAGE = {
+    "bedrock": "boto3",
     "groq": "groq",
     "cerebras": "cerebras.cloud.sdk",
     "nvidia": "openai",
@@ -422,6 +467,8 @@ def _configured_books() -> set:
     ok = set()
     for book in _MODELS:
         provider = provider_of(book)
+        if provider == "bedrock":
+            continue  # no key to check — probe_bedrock() decides it at startup
         if not key_configured(provider):
             print(f"[books] {book} disabled — no API key for {provider}")
         elif not _package_present(_PROVIDER_PACKAGE.get(provider, provider)):
@@ -432,6 +479,45 @@ def _configured_books() -> set:
 
 
 _CONFIGURED = _configured_books()
+
+
+# ── Bedrock startup probe ──
+# The laptop has no AWS credentials; the server has an instance role. Probe ONCE at
+# startup (main.py's lifespan) with a tiny real converse — that proves credentials,
+# region and model access in one go. Pass → bedrock_kimi joins _CONFIGURED. Fail →
+# it stays out for the life of the process, logged once, and the chain starts at groq.
+# Like ping_provider, the probe never reports to provider_health.
+_BEDROCK_PROBE_TOKENS = 16
+_bedrock_probe_result = None
+
+
+def probe_bedrock() -> bool:
+    """BLOCKING, idempotent. Returns whether bedrock_kimi is enabled."""
+    global _bedrock_probe_result
+    if _bedrock_probe_result is not None:
+        return _bedrock_probe_result
+    book, reason = "bedrock_kimi", None
+    t0 = time.monotonic()
+    if not _package_present("boto3"):
+        reason = "boto3 not installed"
+    else:
+        try:
+            import boto3
+            if boto3.Session().get_credentials() is None:
+                reason = "no AWS credentials in the default chain"
+            else:
+                _bedrock_converse("ping", _BEDROCK_PROBE_TOKENS)
+        except Exception as e:
+            reason = f"probe failed — {type(e).__name__}: {e}"[:240]
+    _bedrock_probe_result = reason is None
+    if reason:
+        _CONFIGURED.discard(book)
+        print(f"[books] {book} disabled — {reason}")
+    else:
+        _CONFIGURED.add(book)
+        print(f"[books] {book} enabled — {_MODELS[book]} in {_BEDROCK_REGION} "
+              f"answered the probe ({int((time.monotonic() - t0) * 1000)}ms)")
+    return _bedrock_probe_result
 
 
 def ping_provider(provider: str) -> dict:
@@ -470,6 +556,38 @@ def _usage(u) -> tuple:
 # only) and passes an explicit per-call timeout sized to its output — a deliverable
 # asking for 4096 tokens legitimately needs longer than a 150-token confirmation.
 # A retry re-runs THIS function against THIS book, so it can never cross a tier.
+class BedrockError(Exception):
+    """A botocore ClientError re-raised with the HTTP status as `status_code` — the
+    shape net.py reads. ClientError keeps it in a dict (response['ResponseMetadata']),
+    which would hide throttling (429) and AccessDenied (403) from retry and circuit."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+# Kimi K2.5 reasons before it answers and the reasoning counts against maxTokens, so a
+# tiny caller cap (the 150-token fast lane) could be spent thinking with no answer left.
+# Floor the cap; reasoningContent blocks are dropped, only text blocks are returned.
+_KIMI_MIN_TOKENS = 1024
+
+@with_retry(provider="bedrock")
+def _call_bedrock_kimi(prompt: str, max_tokens: int = _MAX_TOKENS):
+    try:
+        r = _bedrock_converse(prompt, max(max_tokens, _KIMI_MIN_TOKENS))
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        if not isinstance(resp, dict):
+            raise  # transport failure (EndpointConnectionError, ReadTimeoutError …)
+        err = resp.get("Error", {})
+        raise BedrockError(f"{err.get('Code')}: {err.get('Message')}",
+                           resp.get("ResponseMetadata", {}).get("HTTPStatusCode")) from e
+    blocks = r["output"]["message"]["content"]
+    answer = "".join(b["text"] for b in blocks if "text" in b)
+    answer = _THINK_BLOCK_RE.sub("", answer).strip()
+    u = r.get("usage", {})
+    return answer, u.get("totalTokens") or 0, u.get("inputTokens"), u.get("outputTokens")
+
 @with_retry(provider="groq")
 def _call_groq(prompt: str, max_tokens: int = _MAX_TOKENS):
     r = groq_client().chat.completions.create(
@@ -584,6 +702,7 @@ def _call_ollama(prompt: str, max_tokens: int = _MAX_TOKENS):
     return r["message"]["content"], tokens, prompt_tokens, completion_tokens
 
 _DISPATCH = {
+    "bedrock_kimi": _call_bedrock_kimi,
     "groq": _call_groq,
     "groq_fast": _call_groq_fast,
     "groq_qwen": _call_groq_qwen,
@@ -605,12 +724,16 @@ async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> di
         # prompt/completion split, or None where a provider doesn't report one.
         raw_text, tokens, tokens_in, tokens_out = await asyncio.to_thread(
             fn, prompt, max_tokens)
+        if (raw_text or "").strip():
+            print(f"[books] answered by {book} ({model_for(book)}, {tokens} tokens)")
+        else:
+            print(f"[books] {book} returned an empty reply → caller falls back")
         return {"raw_text": raw_text, "book_used": book, "tokens": tokens,
                 "tokens_in": tokens_in, "tokens_out": tokens_out}
     except health.CircuitOpen as e:
         # Refused before the wire, not failed on it. Nothing to bench (the circuit
         # IS the bench) and nothing to record — this call never happened.
-        print(f"[books] {book} skipped — {e}")
+        print(f"[books] {book} skipped — {e} → falling back to next book")
         raise  # caller falls to the next candidate, exactly as for a failure
     except Exception as e:
         if _is_rate_limit(e):
@@ -622,7 +745,8 @@ async def call_book(prompt: str, book: str, max_tokens: int = _MAX_TOKENS) -> di
                 _nemotron_cooldown_until = time.time() + _NEMOTRON_COOLDOWN_SECONDS
                 print(f"[books] nemotron quota → groq (cooldown {_NEMOTRON_COOLDOWN_SECONDS // 60}m)")
             else:
-                print(f"[books] {book} rate-limited — benched {_COOLDOWN_SECONDS}s")
+                print(f"[books] {book} rate-limited — benched {_COOLDOWN_SECONDS}s"
+                      " → falling back to next book")
         else:
-            print(f"[books] {book} failed: {e}")
+            print(f"[books] {book} failed ({type(e).__name__}: {e}) → falling back to next book")
         raise  # let caller fall back to the next candidate

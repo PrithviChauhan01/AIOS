@@ -91,6 +91,7 @@ _RATE_LIMIT_STATUS = 429
 # The provider is the thing that actually fails: one key, one endpoint, one quota.
 # Books sharing one are deliberately collapsed onto a single circuit.
 _PROVIDER_OF_BOOK = {
+    "bedrock_kimi": "bedrock",    # AWS Bedrock — instance-role credentials, no key
     "groq": "groq",
     "groq_fast": "groq",          # same api.groq.com key as groq
     "groq_qwen": "groq",
@@ -104,7 +105,7 @@ _PROVIDER_OF_BOOK = {
 
 # Providers that live outside this process. `ollama` is deliberately NOT here: it is
 # the local fallback and the only book a secret turn may use.
-CLOUD_PROVIDERS = ("groq", "cerebras", "mistral", "openai", "nvidia")
+CLOUD_PROVIDERS = ("bedrock", "groq", "cerebras", "mistral", "openai", "nvidia")
 LOCAL_PROVIDER = "ollama"
 
 

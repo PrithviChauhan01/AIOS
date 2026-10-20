@@ -19,6 +19,7 @@ from db.chroma_init import init_chroma
 from core.auth import generate_token
 from core import owner_auth
 from core.scheduler import start_scheduler, stop_scheduler
+from core.books import probe_bedrock
 
 
 class TokenRequest(BaseModel):
@@ -28,6 +29,9 @@ class TokenRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Main book: probe Bedrock once. Without AWS credentials (the laptop) it is
+    # disabled for this process and the chain starts at groq.
+    await run_in_threadpool(probe_bedrock)
     if Config.PUBLIC_MODE:
         # Nothing to open: public turns persist nothing, and no reminders fire.
         print("[aios] PUBLIC_MODE — anonymous /chat only; no stores, no scheduler")

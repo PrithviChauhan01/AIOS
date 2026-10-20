@@ -16,6 +16,9 @@ httpx
 tenacity
 groq
 cerebras-cloud-sdk
+# Bedrock (Kimi K2.5, the main book). Credentials come from the default chain —
+# the EC2 instance role on the server; nothing in .env.
+boto3
 dateparser
 apscheduler
 win11toast
